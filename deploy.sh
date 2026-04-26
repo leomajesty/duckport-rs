@@ -20,7 +20,7 @@ set -euo pipefail
 # ─── 可配置项 ─────────────────────────────────────────────────────────────────
 
 # GitHub 仓库（自动从 git remote 读取，也可手动指定）
-GITHUB_REPO="${GITHUB_REPO:-}"
+GITHUB_REPO="${GITHUB_REPO:-leomajesty/duckport-rs}"
 
 # release tag（默认下载最新 release）
 RELEASE_TAG="${RELEASE_TAG:-latest}"
@@ -79,14 +79,6 @@ REPO_DIR="$SCRIPT_DIR"
 
 # ─── 获取 GitHub 仓库名 ───────────────────────────────────────────────────────
 
-if [[ -z "$GITHUB_REPO" ]]; then
-  REMOTE_URL=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || echo "")
-  if [[ "$REMOTE_URL" =~ github\.com[:/](.+/.+?)(\.git)?$ ]]; then
-    GITHUB_REPO="${BASH_REMATCH[1]}"
-  else
-    fail "无法从 git remote 推断 GitHub 仓库，请设置 GITHUB_REPO=owner/repo"
-  fi
-fi
 info "GitHub 仓库：$GITHUB_REPO"
 
 # ─── 构造 binary 下载 URL ─────────────────────────────────────────────────────
