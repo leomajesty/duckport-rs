@@ -1,0 +1,21 @@
+from .filter_symbol import TradingSpotFilter, TradingCoinFuturesFilter, TradingUsdtFuturesFilter
+
+DELIVERY_TYPES = ['CURRENT_QUARTER', 'NEXT_QUARTER']
+
+TRADE_TYPE_MAP = {
+    # spot
+    'usdt_spot': (TradingSpotFilter(quote_asset='USDT', keep_stablecoins=False), 'spot'),
+    'usdc_spot': (TradingSpotFilter(quote_asset='USDC', keep_stablecoins=False), 'spot'),
+    'btc_spot': (TradingSpotFilter(quote_asset='BTC', keep_stablecoins=False), 'spot'),
+
+    # usdt_futures
+    'usdt_perp': (TradingUsdtFuturesFilter(quote_asset='USDT', types=['PERPETUAL', 'TRADIFI_PERPETUAL']), 'um'),
+    'usdt_deli': (TradingUsdtFuturesFilter(quote_asset='USDT', types=DELIVERY_TYPES), 'um'),
+    'usdc_perp': (TradingUsdtFuturesFilter(quote_asset='USDC', types=['PERPETUAL', 'TRADIFI_PERPETUAL']), 'um'),
+
+    'btc_perp': (TradingUsdtFuturesFilter(quote_asset='BTC', types=['PERPETUAL']), 'um'),
+
+    # coin_futures
+    'coin_perp': (TradingCoinFuturesFilter(types=['PERPETUAL']), 'um'),
+    'coin_deli': (TradingCoinFuturesFilter(types=DELIVERY_TYPES), 'um'),
+}

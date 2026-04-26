@@ -1,0 +1,89 @@
+[package]
+name = "airport"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust library for building Apache Arrow Flight servers compatible with the DuckDB Airport Extension"
+license = "MIT"
+repository = "https://github.com/hugr-lab/airport-rs"
+keywords = ["arrow", "flight", "duckdb", "grpc", "olap"]
+categories = ["database", "network-programming"]
+
+[features]
+default = ["tls"]
+tls = ["tonic/tls-ring"]
+geometry = ["geo-types"]
+
+[dependencies]
+# Apache Arrow
+arrow = { version = "58", features = ["ipc"] }
+arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+arrow-schema = "58"
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-buffer = "58"
+
+# gRPC
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# Serialization
+rmp = "0.8"
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Compression
+zstd = "0.13"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+
+# Cryptography (for SHA256 in catalog hashing)
+sha2 = "0.10"
+hex = "0.4"
+
+# Geometry (optional)
+geo-types = { version = "0.7", optional = true }
+
+# Tower middleware (auth interceptors)
+tower = { version = "0.4", features = ["util"] }
+tower-layer = "0.3"
+tower-service = "0.3"
+http = "1"
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "basic"
+path = "examples/basic/src/main.rs"
+
+[[example]]
+name = "auth"
+path = "examples/auth/src/main.rs"
+
+[[example]]
+name = "unified"
+path = "examples/unified/src/main.rs"
+
+[[bin]]
+name = "airport"
+path = "src/main.rs"

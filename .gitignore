@@ -1,0 +1,11 @@
+/target/
+**/target/
+Cargo.lock.bak
+.DS_Store
+*.db
+*.db.wal
+/data/
+.idea/
+.vscode/
+/ingestor/data/**
+/ingestor/data/hist/

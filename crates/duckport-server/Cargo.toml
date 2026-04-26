@@ -1,0 +1,39 @@
+[package]
+name = "duckport-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "gRPC database service wrapping DuckDB with Airport + custom Flight write plane"
+
+[[bin]]
+name = "duckport-server"
+path = "src/main.rs"
+
+[dependencies]
+airport.workspace = true
+duckdb.workspace = true
+
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-flight.workspace = true
+tonic.workspace = true
+
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+
+# Connection pool
+r2d2 = "0.8"
+chrono.workspace = true

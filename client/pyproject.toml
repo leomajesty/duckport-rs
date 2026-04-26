@@ -1,0 +1,16 @@
+[project]
+name = "duckport-consumer"
+version = "0.1.0"
+description = "Python consumer client for duckport-rs gRPC database service"
+requires-python = ">=3.10"
+dependencies = [
+    "pyarrow>=15.0",
+    "pandas>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["duckport_consumer*"]

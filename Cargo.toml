@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/airport",
+    "crates/duckport-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.1"
+license = "MIT"
+
+[workspace.dependencies]
+# DuckDB pinned to 1.5.1 (crate 1.10501.0 bundles DuckDB 1.5.1 and uses arrow 58.1.0)
+duckdb = { version = "=1.10501.0", features = [
+    "bundled",
+    "vtab-arrow",
+    "appender-arrow",
+    "r2d2",
+] }
+
+# Arrow / Flight / RPC stack (all aligned to the versions duckdb 1.5.1 pulls in)
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+arrow-ipc = "58"
+arrow-buffer = "58"
+arrow-flight = "58"
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Logging / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Misc
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Local crate
+airport = { path = "crates/airport", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
