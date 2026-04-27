@@ -8,14 +8,14 @@
 
 1. [架构概览](#1-架构概览)
 2. [环境要求](#2-环境要求)
-3. [构建 duckport-server](#3-构建-duckport-server)
+3. [一键部署](#3-一键部署)
 4. [服务端配置](#4-服务端配置)
 5. [数据目录规划](#5-数据目录规划)
-6. [部署 duckport-server](#6-部署-duckport-server)
-7. [部署 binance-ingestor](#7-部署-binance-ingestor)
+6. [手动构建与部署](#6-手动构建与部署)
+7. [安装 Ingestor 插件](#7-安装-ingestor-插件)
 8. [部署 consumer-client](#8-部署-consumer-client)
 9. [历史数据导入 (loadhist)](#9-历史数据导入-loadhist)
-10. [进程管理 (systemd)](#10-进程管理-systemd)
+10. [服务管理 (duckport CLI)](#10-服务管理-duckport-cli)
 11. [日志与监控](#11-日志与监控)
 12. [备份与恢复](#12-备份与恢复)
 13. [升级流程](#13-升级流程)
@@ -85,9 +85,57 @@ pip install uv
 
 ---
 
-## 3. 构建 duckport-server
+## 3. 一键部署
 
-### 3.1 Release 编译
+### 3.1 快速安装
+
+在目标 Linux 服务器上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+```
+
+脚本自动完成：
+
+1. 克隆仓库到 `/w/code/duckport-rs`（可用 `DUCKPORT_INSTALL_DIR` 覆盖）
+2. 从 GitHub Release 下载预构建的 `duckport-server` binary（MD5 比对，已安装且未变化时跳过）
+3. 无 Release 时自动回落到本机 `cargo build --release`
+4. 写入 `/opt/duckport/server.env`（已存在时跳过，不会覆盖已有配置）
+5. 注册 `duckport-server.service` 和 `duckport-ingestor@.service` (template)
+6. 安装 `duckport` 命令行工具到 `/usr/local/bin/duckport`
+7. 确保 `uv`（Python 环境管理器）可用
+
+### 3.2 安装后步骤
+
+```bash
+# 查看可用插件
+duckport list
+
+# 安装数据插件（交互式填写配置）
+duckport install binance_ingestor
+
+# 启动服务
+duckport start
+
+# 查看状态
+duckport status
+```
+
+### 3.3 重新执行安装（升级 / 修复）
+
+```bash
+# 拉取最新代码并重新配置环境（不重启服务）
+duckport upgrade
+
+# 手动重新执行
+bash /w/code/duckport-rs/deploy.sh
+```
+
+## 6. 手动构建与部署
+
+如不使用 GitHub Release，或需要在本地编译：
+
+### 6.1 Release 编译
 
 ```bash
 cd duckport-rs
@@ -96,28 +144,19 @@ cargo build --release --bin duckport-server
 
 产物路径：`target/release/duckport-server`
 
-> **注意**：首次编译会从源码构建 DuckDB 1.5.1（bundled 模式），耗时约 5–10 分钟。后续增量编译很快。
+> **注意**：首次编译会从源码构建 DuckDB 1.5.1（bundled 模式），耗时约 5–10 分钟。
 
-### 3.2 交叉编译（可选）
-
-如需在 macOS 上为 Linux 构建：
+### 6.2 交叉编译（可选）
 
 ```bash
-# 安装 cargo-zigbuild + zig
-cargo install cargo-zigbuild
-brew install zig
-
-# 编译 Linux x86_64
+cargo install cargo-zigbuild && brew install zig
 cargo zigbuild --release --bin duckport-server --target x86_64-unknown-linux-gnu
 ```
 
-### 3.3 部署二进制
+### 6.3 手动部署二进制
 
 ```bash
-# 复制到目标服务器
 scp target/release/duckport-server user@prod-server:/opt/duckport/bin/
-
-# 设置可执行权限
 ssh user@prod-server 'chmod +x /opt/duckport/bin/duckport-server'
 ```
 
@@ -231,85 +270,50 @@ for action in client.list_actions():
 
 ---
 
-## 7. 部署 binance-ingestor
+## 7. 安装 Ingestor 插件
 
-### 7.1 安装
-
-```bash
-cd duckport-rs/ingestor
-
-# 方式一：uv（推荐）
-uv venv --python 3.11 .venv
-source .venv/bin/activate
-uv pip install -e .
-
-# 方式二：pip
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-### 7.2 配置
-
-创建 `/opt/duckport/ingestor/config.env`：
+### 7.1 通过 duckport CLI 安装（推荐）
 
 ```bash
-# duckport-rs 服务地址
-DUCKPORT_ADDR=localhost:50051
-DUCKPORT_SCHEMA=data
+# 查看注册表中的可用插件
+duckport list
 
-# K 线周期
-KLINE_INTERVAL=5m
-
-# Parquet 归档目录（loadhist / 可选旧版周期 retention 使用）
-PARQUET_DIR=/data/duckport/pqt
-
-# 启用的数据源
-DATA_SOURCES=usdt_perp,usdt_spot
-
-# 并发度
-CONCURRENCY=2
-
-# Plan A: 不注册 data.retention_tasks。若需热库周期导出+删除，设 true 且服务端 DUCKPORT_RETENTION_ENABLED=true
-RETENTION_ENABLED=false
-
-# 仅当 RETENTION_ENABLED=true 时与周期任务一起使用
-RETENTION_DAYS=7
-
-# 历史数据起始日期
-START_DATE=2024-01-01
-
-# Binance API 代理（留空直连）
-PROXY_URL=
-
-# WebSocket 模式（false=REST 轮询，true=WebSocket 实时推送）
-ENABLE_WS=false
+# 安装（交互式，输入实例名、周期、数据源等）
+duckport install binance_ingestor
 ```
 
-### 7.3 启动
+`install` 会自动：
+- 创建实例目录 `/opt/duckport/ingestors/<实例名>/`
+- 创建 Python venv（优先检测本地源码目录，否则从 git 安装）
+- 写入 `config.env`
+- Enable systemd `duckport-ingestor@<实例名>` unit
+
+### 7.2 实例配置
+
+安装完成后用 `duckport config <实例名>` 编辑配置，或直接修改：
+
+```
+/opt/duckport/ingestors/<实例名>/config.env
+```
+
+配置项（仅 5 个环境变量）：
 
 ```bash
-# 指定配置文件
-export INGESTOR_ENV_FILE=/opt/duckport/ingestor/config.env
-
-# 方式一：CLI 入口
-binance-ingestor
-
-# 方式二：模块入口
-python -m binance_ingestor.main
-
-# 方式三：便捷脚本
-python start_ingestor.py
+KLINE_INTERVAL=5m              # K 线周期
+DATA_SOURCES=usdt_perp,usdt_spot  # 启用的市场
+CONCURRENCY=2                  # 采集并发数
+START_DATE=2021-01-01          # 历史数据起始日期
+PROXY_URL=                     # HTTP 代理（留空直连）
 ```
 
-### 7.4 启动顺序
+> `DUCKPORT_ADDR` 由 ingestor 自动从 `server.env` 推导，`ENABLE_WS` 默认为 `true`（WebSocket 推送模式）。
 
-1. **必须先启动 duckport-server** — ingestor 启动时会执行 `ping` 检测 server 可达性
-2. ingestor 启动后自动执行：
-   - `init_schema`：确保远端 DuckDB 存在所需的 schema 和表
-   - `init_history_data`：从 `duck_time` 水位线补齐缺失的 K 线数据
-   - 进入周期采集循环（REST 5 分钟轮询 / WebSocket 实时推送）
-   - **Plan A**：不注册周期 retention；**旧版**需同时设 `RETENTION_ENABLED=true` 与 `DUCKPORT_RETENTION_ENABLED=true`，由 duckport-server 侧按 8h 周期执行 `COPY+DELETE`（见 `retention.rs`）
+### 7.3 启动顺序
+
+1. `duckport start server` — 先启动 duckport-server
+2. `duckport start <实例名>` — 再启动 ingestor
+
+ingestor 启动后自动执行 `init_schema`（建表）和 `init_history_data`（从水位线补齐缺失 K 线），然后进入周期采集循环。
 
 ---
 
@@ -375,16 +379,14 @@ RESOURCE_PATH=/data/duckport/hist
 ### 9.2 执行
 
 ```bash
-# 1. 必须先停止 ingestor（避免 staging 表争用）
-sudo systemctl stop binance-ingestor
+# 使用 duckport CLI（自动停止 → loadhist → 恢复）
+duckport loadhist binance-5m
 
-# 2. 执行历史导入
-export INGESTOR_ENV_FILE=/opt/duckport/ingestor/config.env
-loadhist
-# 或: python -m binance_ingestor.loadhist
-
-# 3. 导入完成后启动 ingestor
-sudo systemctl start binance-ingestor
+# 或手动执行
+sudo systemctl stop duckport-ingestor@binance-5m
+INGESTOR_ENV_FILE=/opt/duckport/ingestors/binance-5m/config.env \
+  /opt/duckport/ingestors/binance-5m/.venv/bin/loadhist
+sudo systemctl start duckport-ingestor@binance-5m
 ```
 
 ### 9.3 执行流程
@@ -399,87 +401,43 @@ sudo systemctl start binance-ingestor
 
 ---
 
-## 10. 进程管理 (systemd)
+## 10. 服务管理 (duckport CLI)
 
-### 10.1 duckport-server.service
+`deploy.sh` 安装完成后，所有服务管理通过 `duckport` CLI 完成。
 
-创建 `/etc/systemd/system/duckport-server.service`：
-
-```ini
-[Unit]
-Description=duckport-rs gRPC Database Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=duckport
-Group=duckport
-WorkingDirectory=/opt/duckport
-EnvironmentFile=/opt/duckport/server.env
-ExecStart=/opt/duckport/bin/duckport-server
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-
-# 安全加固
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/data/duckport
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 10.2 binance-ingestor.service
-
-创建 `/etc/systemd/system/binance-ingestor.service`：
-
-```ini
-[Unit]
-Description=Binance Data Ingestor for duckport-rs
-After=duckport-server.service
-Requires=duckport-server.service
-
-[Service]
-Type=simple
-User=duckport
-Group=duckport
-WorkingDirectory=/opt/duckport/ingestor
-Environment=INGESTOR_ENV_FILE=/opt/duckport/ingestor/config.env
-ExecStart=/opt/duckport/ingestor/.venv/bin/binance-ingestor
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 10.3 启用并启动
+### 10.1 常用命令
 
 ```bash
-# 创建服务用户
-sudo useradd -r -s /sbin/nologin -d /opt/duckport duckport
-sudo chown -R duckport:duckport /opt/duckport /data/duckport
-
-# 加载 & 启动
-sudo systemctl daemon-reload
-sudo systemctl enable duckport-server binance-ingestor
-sudo systemctl start duckport-server
-
-# 等 server 就绪后启动 ingestor
-sleep 3
-sudo systemctl start binance-ingestor
-
-# 查看状态
-sudo systemctl status duckport-server binance-ingestor
-
-# 查看日志
-sudo journalctl -u duckport-server -f
-sudo journalctl -u binance-ingestor -f
+duckport status                  # 服务总览 + 各实例数据水位
+duckport start                   # 启动所有（server 优先，pause 2s 后启动 ingestors）
+duckport stop                    # 停止所有（先停 ingestors，再停 server）
+duckport restart                 # 重启所有
+duckport start binance-5m        # 启动单个实例
+duckport stop  server            # 仅停止 duckport-server
+duckport logs  binance-5m        # 实时日志（journalctl -f）
+duckport logs  server            # server 日志
+duckport logs  all               # 所有服务合并日志
 ```
+
+### 10.2 插件管理
+
+```bash
+duckport list                    # 查看注册表中的可用插件
+duckport install binance_ingestor # 安装插件（交互式）
+duckport config  binance-5m      # 编辑实例 config.env
+duckport rm      binance-5m      # 删除实例（stop + disable + rm -rf）
+```
+
+### 10.3 systemd unit 结构
+
+`deploy.sh` 自动注册的 unit 文件：
+
+| 文件 | 说明 |
+|------|------|
+| `duckport-server.service` | duckport-rs gRPC 服务（固定） |
+| `duckport-ingestor@.service` | 实例模板，`%i` = 实例名 |
+
+template unit 的 `ExecStart` 调用 `/opt/duckport/bin/ingestor-run %i`，后者读取实例目录下的 `config.env` 并启动对应 venv 里的可执行文件，因此新插件无需额外创建 systemd 文件。
 
 ---
 
@@ -618,43 +576,43 @@ sudo systemctl start binance-ingestor
 
 ## 13. 升级流程
 
-### 13.1 duckport-server 升级
+### 13.1 一键升级
 
 ```bash
-# 1. 编译新版本
-cd duckport-rs && git pull && cargo build --release --bin duckport-server
+# git pull + 重新配置环境（不重启服务）
+duckport upgrade
 
-# 2. 停止服务
-sudo systemctl stop binance-ingestor
-sudo systemctl stop duckport-server
-
-# 3. 替换二进制
-sudo cp target/release/duckport-server /opt/duckport/bin/duckport-server
-
-# 4. 重启
-sudo systemctl start duckport-server
-sleep 3
-sudo systemctl start binance-ingestor
-
-# 5. 验证
-sudo systemctl status duckport-server binance-ingestor
+# 确认 binary 已更新后重启
+duckport restart
 ```
 
-### 13.2 binance-ingestor 升级
+`duckport upgrade` 内部执行：`git pull --ff-only && bash deploy.sh`。`deploy.sh` 对 binary 做 MD5 比对，相同则跳过替换；`server.env` 已存在时也跳过，不覆盖用户自定义配置。
+
+### 13.2 仅更新 duckport-server binary
 
 ```bash
-# 1. 更新代码
-cd duckport-rs/ingestor && git pull
-
-# 2. 更新依赖
-source .venv/bin/activate
-pip install -e .
-
-# 3. 重启
-sudo systemctl restart binance-ingestor
+# 手动下载最新 Release 并替换（deploy.sh 会自动做，也可手动）
+duckport stop
+curl -fsSL <release-url> -o /opt/duckport/bin/duckport-server
+chmod +x /opt/duckport/bin/duckport-server
+duckport start
 ```
 
-> **注意**：DuckDB 版本已锁定为 1.5.1（Rust crate `=1.10501.0`）。升级 DuckDB 版本需同步更新 `Cargo.toml` 中的 pin 并重新编译，且需评估数据库文件兼容性。
+### 13.3 更新 Ingestor 插件
+
+```bash
+# 如果插件以本地 checkout 安装（editable 模式）
+cd /path/to/duckport-binance-ingestor && git pull
+duckport restart binance-5m
+
+# 如果从 git URL 安装，重新安装以获取最新版
+duckport stop binance-5m
+uv pip install --reinstall "git+https://github.com/leomajesty/duckport-binance-ingestor" \
+  --python /opt/duckport/ingestors/binance-5m/.venv/bin/python3
+duckport start binance-5m
+```
+
+> **注意**：DuckDB 版本已锁定为 1.5.1（Rust crate `=1.10501.0`，Python `duckdb==1.5.1`）。升级 DuckDB 版本需同步更新 `Cargo.toml` 并重新编译，且需评估数据库文件兼容性。
 
 ---
 
@@ -743,23 +701,19 @@ DuckDB 单写模型意味着**同一个数据库文件只能被一个 duckport-s
 | `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 否 |
 | `RUST_LOG` | `info` | 否 |
 
-### binance-ingestor
+### Ingestor 实例（`/opt/duckport/ingestors/<name>/config.env`）
 
 | 变量 | 默认 | 必填 |
 |------|------|------|
-| `INGESTOR_ENV_FILE` | `config.env` | 否 |
-| `DUCKPORT_ADDR` | `localhost:50051` | 否 |
-| `DUCKPORT_SCHEMA` | `data` | 否 |
 | `KLINE_INTERVAL` | `5m` | 否 |
-| `PARQUET_DIR` | `data/pqt` | 生产必填 |
 | `DATA_SOURCES` | `usdt_perp,usdt_spot` | 否 |
 | `CONCURRENCY` | `2` | 否 |
-| `RETENTION_ENABLED` | `false` | 否 |
-| `RETENTION_DAYS` | `7` | 否（仅与旧版周期 retention 同开时有效） |
-| `START_DATE` | *(未设则回退极早)* | 生产必填 |
+| `START_DATE` | *(回退到比特币创世块)* | 生产必填 |
 | `PROXY_URL` | *(空)* | 否 |
-| `ENABLE_WS` | `false` | 否 |
-| `RESOURCE_PATH` | `data/hist` | loadhist 时需要 |
+| `PARQUET_DIR` | `/data/duckport/pqt` | 否（可覆盖） |
+| `RESOURCE_PATH` | `/data/duckport/hist` | 否（可覆盖） |
+
+> `DUCKPORT_ADDR` 由 ingestor 自动从 `server.env` 推导（`DUCKPORT_LISTEN_ADDR` → `0.0.0.0` 转换为 `localhost`），`ENABLE_WS` 默认为 `true`，均无需在实例 config.env 中配置。
 
 ---
 
