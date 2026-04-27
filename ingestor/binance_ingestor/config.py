@@ -36,10 +36,10 @@ KLINE_INTERVAL = os.getenv("KLINE_INTERVAL", "5m")
 KLINE_INTERVAL_MINUTES = int(KLINE_INTERVAL.replace('m', ''))
 SUFFIX = f"_{KLINE_INTERVAL_MINUTES}m"
 
-# ── Parquet & hist paths (fixed layout, not configurable) ────────────
-PARQUET_DIR = "/data/duckport/pqt"
+# ── Parquet & hist paths ─────────────────────────────────────────────
+PARQUET_DIR = os.getenv("PARQUET_DIR", "/data/duckport/pqt")
 PARQUET_FILE_PERIOD = 1
-RESOURCE_PATH = "/data/duckport/hist"
+RESOURCE_PATH = os.getenv("RESOURCE_PATH", "/data/duckport/hist")
 
 # ── Concurrency ───────────────────────────────────────────────────────
 CONCURRENCY = int(os.getenv('CONCURRENCY', 2))
