@@ -23,7 +23,6 @@ from binance_ingestor.utils.log_kit import logger, divider
 from binance_ingestor.config import (
     KLINE_INTERVAL_MINUTES, KLINE_INTERVAL,
     START_DATE, GENESIS_TIME, DATA_SOURCES, FETCH_CONCURRENCY,
-    RETENTION_ENABLED, RETENTION_DAYS, PARQUET_DIR, PARQUET_FILE_PERIOD,
 )
 from binance_ingestor.component.candle_fetcher import BinanceFetcher, OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
@@ -57,38 +56,8 @@ class DataJobs:
 
         logger.info(f'binance ingestor 启用市场: {self._enabled_kline_markets}')
 
-        self._register_retention_tasks()
         self.init_history_data()
         self.update_recent_data()
-
-    # ── Retention task registration ─────────────────────────────────
-
-    def _register_retention_tasks(self):
-        if not RETENTION_ENABLED:
-            logger.info(
-                "Plan A: RETENTION_ENABLED=false — 不注册 data.retention_tasks；"
-                "热数据保留在 DuckDB。若需旧版周期导出+删除，请设 RETENTION_ENABLED=true 且"
-                " duckport-server 设置 DUCKPORT_RETENTION_ENABLED=true"
-            )
-            return
-        start_date_str = (
-            START_DATE.strftime("%Y-%m-%d")
-            if hasattr(START_DATE, "strftime")
-            else str(START_DATE)
-        )
-        for market in self._enabled_kline_markets:
-            try:
-                self._client.register_retention_task(
-                    market=market,
-                    interval=KLINE_INTERVAL,
-                    parquet_dir=PARQUET_DIR,
-                    retention_days=RETENTION_DAYS,
-                    start_date=start_date_str,
-                    file_period=PARQUET_FILE_PERIOD,
-                    enabled=True,
-                )
-            except Exception as e:
-                logger.error(f"register_retention_task failed for {market}: {e}")
 
     # ── duck_time initialisation ────────────────────────────────────
 

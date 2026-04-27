@@ -301,61 +301,6 @@ class DuckportClient:
         ])
         logger.info(f"save_exginfo: {market}, {len(df)} records")
 
-    def execute_retention(
-        self,
-        market: str,
-        interval: str,
-        pqt_file_path: str,
-        period_start: str,
-        period_end: str,
-    ):
-        from binance_ingestor.config import RETENTION_ENABLED
-
-        if not RETENTION_ENABLED:
-            logger.info(
-                "execute_retention: skipped (RETENTION_ENABLED=false, Plan A — "
-                "hot data stays in DuckDB)"
-            )
-            return
-
-        s = self.schema
-        target = f"{s}.{market}_{interval}"
-        self.execute(
-            f"COPY (SELECT * FROM {target} "
-            f"WHERE open_time >= '{period_start}' AND open_time < '{period_end}' "
-            f"ORDER BY open_time) "
-            f"TO '{pqt_file_path}' (FORMAT parquet)"
-        )
-        self.execute(
-            f"DELETE FROM {target} "
-            f"WHERE open_time < ('{period_end}'::timestamp - INTERVAL '1 day')"
-        )
-        logger.info(f"retention: {market} exported {pqt_file_path}")
-
-    def register_retention_task(
-        self,
-        market: str,
-        interval: str,
-        parquet_dir: str,
-        retention_days: int = 7,
-        start_date: str = '2009-01-03',
-        file_period: int = 1,
-        enabled: bool = True,
-    ):
-        """Upsert a row in ``data.retention_tasks`` (server-side scheduler must also be on)."""
-        s = self.schema
-        en = "true" if enabled else "false"
-        self.execute(
-            f"INSERT OR REPLACE INTO {s}.retention_tasks "
-            f"(market, interval, schema_name, retention_days, parquet_dir, "
-            f"start_date, file_period, enabled, updated_at) "
-            f"VALUES ('{market}', '{interval}', '{s}', {retention_days}, "
-            f"'{parquet_dir}', '{start_date}', {file_period}, {en}, CURRENT_TIMESTAMP)"
-        )
-        logger.info(
-            f"retention_task registered: {market}/{interval} → {parquet_dir} (enabled={enabled})"
-        )
-
     # ── Read helpers ────────────────────────────────────────────────
 
     def read_duck_time(self, market: str) -> Optional[pd.Timestamp]:

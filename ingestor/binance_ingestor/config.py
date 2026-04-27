@@ -14,30 +14,32 @@ from datetime import datetime, timezone
 import pandas as pd
 from dotenv import load_dotenv
 
-# Load .env if present (no-op if missing)
+# Load instance env (INGESTOR_ENV_FILE set by ingestor-run) then local config.env
 _env_file = os.getenv("INGESTOR_ENV_FILE", "config.env")
 load_dotenv(_env_file, override=False)
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+# Also load server.env to inherit DUCKPORT_LISTEN_ADDR (no-op if absent)
+load_dotenv("/opt/duckport/server.env", override=False)
 
 # ── duckport-rs server ────────────────────────────────────────────────
-DUCKPORT_ADDR = os.getenv("DUCKPORT_ADDR", "localhost:50051")
-DUCKPORT_SCHEMA = os.getenv("DUCKPORT_SCHEMA", "data")
+def _derive_duckport_addr() -> str:
+    raw = os.getenv("DUCKPORT_LISTEN_ADDR", "0.0.0.0:50051")
+    host, _, port = raw.rpartition(":")
+    host = "localhost" if host in ("0.0.0.0", "", "*") else host
+    return f"{host}:{port}"
+
+DUCKPORT_ADDR = _derive_duckport_addr()
+DUCKPORT_SCHEMA = "data"
 
 # ── Kline settings ────────────────────────────────────────────────────
 KLINE_INTERVAL = os.getenv("KLINE_INTERVAL", "5m")
 KLINE_INTERVAL_MINUTES = int(KLINE_INTERVAL.replace('m', ''))
 SUFFIX = f"_{KLINE_INTERVAL_MINUTES}m"
 
-# ── Parquet archive directory (must be accessible to duckport-rs) ─────
-PARQUET_DIR = os.getenv("PARQUET_DIR", "data/pqt")
-if not os.path.isabs(PARQUET_DIR):
-    PARQUET_DIR = os.path.join(os.getcwd(), PARQUET_DIR)
+# ── Parquet & hist paths (fixed layout, not configurable) ────────────
+PARQUET_DIR = "/data/duckport/pqt"
+PARQUET_FILE_PERIOD = 1
+RESOURCE_PATH = "/data/duckport/hist"
 
 # ── Concurrency ───────────────────────────────────────────────────────
 CONCURRENCY = int(os.getenv('CONCURRENCY', 2))
@@ -50,14 +52,6 @@ DATA_SOURCES = set(s.strip() for s in DATA_SOURCES_STR.split(','))
 # ── Platform ──────────────────────────────────────────────────────────
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-# ── Retention (Plan A: off by default; no COPY+DELETE from hot DB) ──────
-# Set RETENTION_ENABLED=true to register retention_tasks and use execute_retention.
-RETENTION_ENABLED = _env_bool("RETENTION_ENABLED", False)
-# Only used when RETENTION_ENABLED; kept for backward-compatible env files.
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", 7))
-if RETENTION_DAYS <= 0:
-    RETENTION_DAYS = 7
 
 # ── Start date ────────────────────────────────────────────────────────
 GENESIS_TIME = pd.to_datetime('2009-01-03 00:00:00').tz_localize(tz=timezone.utc)
@@ -73,21 +67,9 @@ else:
 proxy = os.getenv('PROXY_URL', '')
 
 # ── WebSocket mode ────────────────────────────────────────────────────
-ENABLE_WS = os.getenv("ENABLE_WS", "false").lower() == "true"
+ENABLE_WS = os.getenv("ENABLE_WS", "true").lower() == "true"
 
-# ── Parquet file period (months) ──────────────────────────────────────
-PARQUET_FILE_PERIOD = int(os.getenv('PARQUET_FILE_PERIOD', 1))
-
-# ── loadhist → hot DuckDB (Plan A) ────────────────────────────────────
-LOADHIST_FULL_HOT_LOAD = _env_bool("LOADHIST_FULL_HOT_LOAD", True)
-LOADHIST_DELETE_PARQUET_AFTER_LOAD = _env_bool("LOADHIST_DELETE_PARQUET_AFTER_LOAD", False)
-
-# ── hist download settings ───────────────────────────────────────────
-RESOURCE_PATH = os.getenv("RESOURCE_PATH", "data/hist")
-if not os.path.isabs(RESOURCE_PATH):
-    RESOURCE_PATH = os.path.join(os.getcwd(), RESOURCE_PATH)
-
-BASE_URL = 'https://data.binance.vision/'
+BASE_URL = "https://data.binance.vision/"
 root_center_url = 'https://s3-ap-northeast-1.amazonaws.com/data.binance.vision'
 
 use_proxy_download_file = False

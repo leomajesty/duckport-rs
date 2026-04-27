@@ -12,10 +12,8 @@
 # 环境变量（可覆盖默认值）：
 #   GITHUB_REPO, RELEASE_TAG
 #   INSTANCE_NAME                      # 默认实例名，默认 binance-5m
-#   KLINE_INTERVAL, DATA_SOURCES, MEMORY_LIMIT
-#   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE
-#   START_DATE, PROXY_URL, ENABLE_WS
-#   OLD_DB_PATH, OLD_PQT_DIR
+#   KLINE_INTERVAL, DATA_SOURCES, START_DATE, PROXY_URL
+#   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE, MEMORY_LIMIT
 
 set -euo pipefail
 
@@ -40,10 +38,6 @@ READ_POOL_SIZE="${READ_POOL_SIZE:-4}"
 MEMORY_LIMIT="${MEMORY_LIMIT:-8GB}"
 START_DATE="${START_DATE:-2021-01-01}"
 PROXY_URL="${PROXY_URL:-}"
-ENABLE_WS="${ENABLE_WS:-false}"
-
-OLD_DB_PATH="${OLD_DB_PATH:-/w/data/5m/duckdb.db}"
-OLD_PQT_DIR="${OLD_PQT_DIR:-/w/data/5m/pqt}"
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
 
@@ -221,17 +215,11 @@ EOF
 _write_if_missing "$INST_DIR/config.env" << EOF
 # 实例：${INSTANCE_NAME}
 INGESTOR_EXEC=binance-ingestor
-DUCKPORT_ADDR=localhost:50051
-DUCKPORT_SCHEMA=data
 KLINE_INTERVAL=${KLINE_INTERVAL}
-PARQUET_DIR=${OLD_PQT_DIR}
 DATA_SOURCES=${DATA_SOURCES}
 CONCURRENCY=2
-RETENTION_ENABLED=false
 START_DATE=${START_DATE}
 PROXY_URL=${PROXY_URL}
-ENABLE_WS=${ENABLE_WS}
-RESOURCE_PATH=${DEPLOY_DATA}/hist
 EOF
 
 # ─── Step 4：安装 Python 包 ───────────────────────────────────────────────────

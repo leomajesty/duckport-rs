@@ -101,17 +101,15 @@ cmd_status() {
     [[ -x "$py" && -f "$cfg" ]] || continue
 
     "$py" - "$inst" "$cfg" << 'PYEOF' 2>/dev/null || true
-import sys
+import sys, os
+os.environ.setdefault("INGESTOR_ENV_FILE", sys.argv[2])
+from binance_ingestor.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, DATA_SOURCES
 from binance_ingestor.duckport_client import DuckportClient
 from datetime import datetime, timezone
 
-inst, cfg = sys.argv[1], sys.argv[2]
-sources = []
-for line in open(cfg):
-    if line.startswith("DATA_SOURCES="):
-        sources = [s.strip() for s in line.split("=",1)[1].strip().split(",")]
-
-dc = DuckportClient(addr="localhost:50051", schema="data")
+inst = sys.argv[1]
+sources = list(DATA_SOURCES)
+dc = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)
 now = datetime.now(timezone.utc)
 for mkt in sources:
     dt = dc.read_duck_time(mkt)
@@ -250,26 +248,20 @@ cmd_ingestor_add() {
   IV="${IV:-5m}"
   read -rp "  DATA_SOURCES    (默认 usdt_perp,usdt_spot): " DS
   DS="${DS:-usdt_perp,usdt_spot}"
+  read -rp "  并发数          (默认 2): " CONC
+  CONC="${CONC:-2}"
   read -rp "  START_DATE      (默认 2021-01-01): " SD
   SD="${SD:-2021-01-01}"
   read -rp "  PROXY_URL       (留空跳过): " PX
-  read -rp "  ENABLE_WS       (默认 false): " WS
-  WS="${WS:-false}"
 
   cat > "$cfg" << EOF
 # 实例：$name
 INGESTOR_EXEC=${EXEC_CMD}
-DUCKPORT_ADDR=localhost:50051
-DUCKPORT_SCHEMA=data
 KLINE_INTERVAL=${IV}
-PARQUET_DIR=/data/duckport/pqt
 DATA_SOURCES=${DS}
-CONCURRENCY=2
-RETENTION_ENABLED=false
+CONCURRENCY=${CONC}
 START_DATE=${SD}
 PROXY_URL=${PX}
-ENABLE_WS=${WS}
-RESOURCE_PATH=/data/duckport/hist
 EOF
 
   # 安装 Python 包
