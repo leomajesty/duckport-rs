@@ -2,14 +2,15 @@
 # duckport — 服务管理 CLI
 #
 # 用法：
+#   duckport list                        # 列出可用插件
+#   duckport install <插件名>            # 安装插件实例
+#   duckport rm      <实例名>            # 删除实例
+#   duckport config  <实例名>            # 编辑实例配置
 #   duckport status                      # 服务总览 + 水位
 #   duckport start   [<实例>|all]        # 启动（默认 all）
 #   duckport stop    [<实例>|all]        # 停止（默认 all）
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
-#   duckport ingestor list               # 列出所有实例
-#   duckport ingestor add  <实例>        # 新增实例
-#   duckport ingestor rm   <实例>        # 删除实例
 #   duckport loadhist [<实例>]           # 补历史数据
 #   duckport upgrade                     # 更新环境
 
@@ -270,7 +271,7 @@ cmd_install() {
 
   if [[ -d "$inst_dir" ]]; then
     echo -e "${YELLOW}实例 '$INST_NAME' 已存在：$inst_dir${NC}"
-    echo "如需重建，请先执行: duckport ingestor rm $INST_NAME"
+    echo "如需重建，请先执行: duckport rm $INST_NAME"
     exit 1
   fi
   mkdir -p "$inst_dir"
@@ -337,107 +338,13 @@ cmd_config() {
   ${EDITOR:-nano} "$cfg"
 }
 
-# ─── ingestor list ────────────────────────────────────────────────────────────
+# ─── rm（删除实例）───────────────────────────────────────────────────────────
 
-cmd_ingestor_list() {
-  echo -e "\n${BOLD}已注册的 Ingestor 实例${NC}"
-  local instances
-  instances=$(_list_instances)
-  if [[ -z "$instances" ]]; then
-    echo -e "  ${DIM}（无）${NC}\n"; return
-  fi
-
-  printf "  ${BOLD}%-22s %-18s %-20s %s${NC}\n" "实例名" "状态" "执行程序" "数据源"
-  while IFS= read -r inst; do
-    local cfg="$INGESTORS_DIR/$inst/config.env"
-    local exec_name sources
-    exec_name=$(_instance_exec "$inst")
-    sources=$(grep '^DATA_SOURCES=' "$cfg" 2>/dev/null | cut -d= -f2 || echo "-")
-    printf "  %-22s %-28s %-20s %s\n" \
-      "$inst" "$(_svc_status_label "$inst")" "$exec_name" "$sources"
-  done <<< "$instances"
-  echo ""
-}
-
-# ─── ingestor add ─────────────────────────────────────────────────────────────
-
-cmd_ingestor_add() {
+cmd_rm() {
   _require_root
   local name="${1:-}"
-  [[ -n "$name" ]] || { echo "用法: duckport ingestor add <实例名>"; exit 1; }
-
-  local inst_dir="$INGESTORS_DIR/$name"
-  local cfg="$inst_dir/config.env"
-
-  if [[ -d "$inst_dir" ]]; then
-    echo -e "${YELLOW}实例 '$name' 已存在：$inst_dir${NC}"
-    echo "如需重建，请先执行: duckport ingestor rm $name"
-    exit 1
-  fi
-
-  mkdir -p "$inst_dir"
-  echo -e "${BOLD}创建实例：$name${NC}"
-
-  # 询问基本配置
-  read -rp "  交易所 / 包名   (默认 binance-ingestor): " PKG
-  PKG="${PKG:-binance-ingestor}"
-  read -rp "  可执行命令名    (默认 ${PKG##*/}): " EXEC_CMD
-  EXEC_CMD="${EXEC_CMD:-${PKG##*/}}"
-  read -rp "  K 线周期        (默认 5m): " IV
-  IV="${IV:-5m}"
-  read -rp "  DATA_SOURCES    (默认 usdt_perp,usdt_spot): " DS
-  DS="${DS:-usdt_perp,usdt_spot}"
-  read -rp "  并发数          (默认 2): " CONC
-  CONC="${CONC:-2}"
-  read -rp "  START_DATE      (默认 2021-01-01): " SD
-  SD="${SD:-2021-01-01}"
-  read -rp "  PROXY_URL       (留空跳过): " PX
-
-  cat > "$cfg" << EOF
-# 实例：$name
-INGESTOR_EXEC=${EXEC_CMD}
-KLINE_INTERVAL=${IV}
-DATA_SOURCES=${DS}
-CONCURRENCY=${CONC}
-START_DATE=${SD}
-PROXY_URL=${PX}
-EOF
-
-  # 安装 Python 包
-  echo -e "\n  安装 Python 环境..."
-  export PATH="$HOME/.local/bin:$PATH"
-  PYTHON_BIN=$(command -v python3.12 2>/dev/null || command -v python3)
-  PYTHON_VER=$("$PYTHON_BIN" --version | grep -oP '\d+\.\d+')
-  uv venv --python "$PYTHON_VER" "$inst_dir/.venv" -q
-
-  local local_src
-  local_src="$(dirname "$REPO_DIR")/duckport-${PKG}"
-  if [[ -f "$local_src/pyproject.toml" ]]; then
-    uv pip install -e "$local_src" --python "$inst_dir/.venv/bin/python3" -q
-  else
-    local repo
-    repo=$(_registry_get "$PKG" repo)
-    if [[ -n "$repo" ]]; then
-      uv pip install "git+${repo}" --python "$inst_dir/.venv/bin/python3" -q
-    else
-      uv pip install "$PKG" --python "$inst_dir/.venv/bin/python3" -q
-    fi
-  fi
-
-  # 注册并 enable systemd 实例
-  systemctl daemon-reload
-  systemctl enable "duckport-ingestor@$name"
-  echo -e "\n  ${GREEN}✓${NC} 实例 '$name' 已创建"
-  echo -e "  配置文件：$cfg"
-  echo -e "  启动：${BOLD}duckport start $name${NC}"
-}
-
-# ─── ingestor rm ──────────────────────────────────────────────────────────────
-
-cmd_ingestor_rm() {
-  _require_root
-  local name="${1:-}"
-  [[ -n "$name" ]] || { echo "用法: duckport ingestor rm <实例名>"; exit 1; }
+  [[ -n "$name" ]] || { echo "用法: duckport rm <实例名>"; exit 1; }
+  name="${name//_/-}"
 
   local inst_dir="$INGESTORS_DIR/$name"
   [[ -d "$inst_dir" ]] || { echo -e "${RED}实例 '$name' 不存在${NC}"; exit 1; }
@@ -445,7 +352,7 @@ cmd_ingestor_rm() {
   read -rp "确认删除实例 '$name'？[y/N] " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
 
-  systemctl stop "duckport-ingestor@$name"  2>/dev/null || true
+  systemctl stop    "duckport-ingestor@$name" 2>/dev/null || true
   systemctl disable "duckport-ingestor@$name" 2>/dev/null || true
   rm -rf "$inst_dir"
   echo -e "  ${GREEN}✓${NC} 实例 '$name' 已删除"
@@ -507,6 +414,7 @@ ${BOLD}duckport${NC} — duckport-rs 服务管理
 ${BOLD}插件管理：${NC}
   duckport ${CYAN}list${NC}                           列出 registry 中的可用插件
   duckport ${CYAN}install${NC} <插件名>               从 registry 安装插件（交互式）
+  duckport ${CYAN}rm${NC}      <实例名>               删除实例
   duckport ${CYAN}config${NC}  <实例名>               编辑实例配置文件
 
 ${BOLD}服务控制：${NC}
@@ -515,10 +423,6 @@ ${BOLD}服务控制：${NC}
   duckport ${CYAN}stop${NC}    [实例名|all]           停止（默认 all）
   duckport ${CYAN}restart${NC} [实例名|all]           重启（默认 all）
   duckport ${CYAN}logs${NC}    <实例名|server|all>    实时日志
-
-${BOLD}实例管理：${NC}
-  duckport ${CYAN}ingestor list${NC}                  列出已安装的实例
-  duckport ${CYAN}ingestor rm${NC}   <实例名>          删除实例
 
 ${BOLD}数据操作：${NC}
   duckport ${CYAN}loadhist${NC} [实例名]              补历史数据（默认所有实例）
@@ -530,6 +434,7 @@ ${BOLD}示例：${NC}
   duckport list                       # 查看可安装的插件
   duckport install binance_ingestor   # 安装 Binance 插件
   duckport config binance-5m          # 编辑 binance-5m 实例配置
+  duckport rm binance-5m              # 删除 binance-5m 实例
   duckport start binance-5m           # 启动单个实例
   duckport logs binance-5m            # 查看该实例日志
   duckport loadhist binance-5m        # 补历史数据
@@ -544,20 +449,13 @@ shift || true
 case "$CMD" in
   list)     cmd_list ;;
   install)  cmd_install "${1:-}" ;;
+  rm)       cmd_rm      "${1:-}" ;;
   config)   cmd_config  "${1:-}" ;;
   status)   cmd_status ;;
-  start)    cmd_start  "${1:-all}" ;;
-  stop)     cmd_stop   "${1:-all}" ;;
+  start)    cmd_start   "${1:-all}" ;;
+  stop)     cmd_stop    "${1:-all}" ;;
   restart)  cmd_restart "${1:-all}" ;;
-  logs)     cmd_logs   "${1:-}" ;;
-  ingestor)
-    SUB="${1:-list}"; shift || true
-    case "$SUB" in
-      list) cmd_ingestor_list ;;
-      add)  cmd_ingestor_add  "${1:-}" ;;
-      rm)   cmd_ingestor_rm   "${1:-}" ;;
-      *)    echo -e "${RED}未知子命令：$SUB${NC}"; cmd_help; exit 1 ;;
-    esac ;;
+  logs)     cmd_logs    "${1:-}" ;;
   loadhist) cmd_loadhist "${1:-}" ;;
   upgrade)  cmd_upgrade ;;
   help|-h|--help) cmd_help ;;
