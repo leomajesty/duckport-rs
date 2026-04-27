@@ -1,0 +1,8 @@
+{
+  "binance-ingestor": {
+    "repo": "https://github.com/leomajesty/duckport-binance-ingestor",
+    "description": "Binance Spot + USDT-Perp K-line ingestor",
+    "exec": "binance-ingestor",
+    "default_instance": "binance-5m"
+  }
+}

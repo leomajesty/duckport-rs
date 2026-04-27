@@ -198,6 +198,145 @@ cmd_logs() {
   esac
 }
 
+# ─── list（registry 插件列表）────────────────────────────────────────────────
+
+_registry_file() { echo "$REPO_DIR/ingestor/registry.json"; }
+
+_registry_get() {
+  local plugin="${1//_/-}"
+  local field="$2"
+  local reg
+  reg=$(_registry_file)
+  python3 -c "
+import json
+try:
+    data = json.load(open('$reg'))
+    print(data.get('$plugin', {}).get('$field', ''))
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+cmd_list() {
+  local reg
+  reg=$(_registry_file)
+  if [[ ! -f "$reg" ]]; then
+    echo -e "${RED}未找到插件注册表：$reg${NC}"; exit 1
+  fi
+  echo -e "\n${BOLD}可用插件${NC}  (注册表: $reg)\n"
+  python3 -c "
+import json
+data = json.load(open('$reg'))
+for name, info in data.items():
+    installed = ''
+    print(f'  \033[1m{name}\033[0m')
+    print(f'    {info.get(\"description\",\"\")}')
+    print(f'    repo: {info.get(\"repo\",\"\")}')
+    print()
+" 2>/dev/null || echo "  （无）"
+  echo -e "用法: ${BOLD}duckport install <插件名>${NC}"
+  echo ""
+}
+
+# ─── install（从 registry 安装插件实例）──────────────────────────────────────
+
+cmd_install() {
+  _require_root
+  local plugin="${1:-}"
+  [[ -n "$plugin" ]] || { echo "用法: duckport install <插件名>"; cmd_list; exit 1; }
+  plugin="${plugin//_/-}"
+
+  local reg
+  reg=$(_registry_file)
+  [[ -f "$reg" ]] || { echo -e "${RED}未找到插件注册表：$reg${NC}"; exit 1; }
+
+  local repo exec_cmd default_inst desc
+  repo=$(_registry_get "$plugin" repo)
+  exec_cmd=$(_registry_get "$plugin" exec)
+  default_inst=$(_registry_get "$plugin" default_instance)
+  desc=$(_registry_get "$plugin" description)
+
+  [[ -n "$repo" ]] || { echo -e "${RED}未知插件：$plugin${NC}\n"; cmd_list; exit 1; }
+
+  echo -e "\n${BOLD}安装插件：$plugin${NC}"
+  echo -e "  $desc"
+  echo -e "  repo: $repo\n"
+
+  read -rp "  实例名          (默认 ${default_inst:-$plugin}): " INST_NAME
+  INST_NAME="${INST_NAME:-${default_inst:-$plugin}}"
+
+  local inst_dir="$INGESTORS_DIR/$INST_NAME"
+  local cfg="$inst_dir/config.env"
+
+  if [[ -d "$inst_dir" ]]; then
+    echo -e "${YELLOW}实例 '$INST_NAME' 已存在：$inst_dir${NC}"
+    echo "如需重建，请先执行: duckport ingestor rm $INST_NAME"
+    exit 1
+  fi
+  mkdir -p "$inst_dir"
+
+  read -rp "  K 线周期        (默认 5m): " IV;   IV="${IV:-5m}"
+  read -rp "  DATA_SOURCES    (默认 usdt_perp,usdt_spot): " DS; DS="${DS:-usdt_perp,usdt_spot}"
+  read -rp "  并发数          (默认 2): " CONC;  CONC="${CONC:-2}"
+  read -rp "  START_DATE      (默认 2021-01-01): " SD; SD="${SD:-2021-01-01}"
+  read -rp "  PROXY_URL       (留空跳过): " PX
+
+  cat > "$cfg" << EOF
+# 实例：$INST_NAME  插件：$plugin
+INGESTOR_EXEC=${exec_cmd:-$plugin}
+KLINE_INTERVAL=${IV}
+DATA_SOURCES=${DS}
+CONCURRENCY=${CONC}
+START_DATE=${SD}
+PROXY_URL=${PX}
+EOF
+
+  # 安装 Python 包
+  echo -e "\n  安装 Python 环境..."
+  export PATH="$HOME/.local/bin:$PATH"
+  local python_bin python_ver
+  python_bin=$(command -v python3.12 2>/dev/null || command -v python3)
+  python_ver=$("$python_bin" --version | grep -oP '\d+\.\d+')
+  uv venv --python "$python_ver" "$inst_dir/.venv" -q
+
+  local inst_py="$inst_dir/.venv/bin/python3"
+  # 优先本地 checkout（开发模式），否则从 git 安装
+  local local_src
+  local_src="$(dirname "$REPO_DIR")/duckport-${plugin}"
+  if [[ -f "$local_src/pyproject.toml" ]]; then
+    echo -e "  使用本地源码：$local_src"
+    uv pip install -e "$local_src" --python "$inst_py" -q
+  else
+    uv pip install "git+${repo}" --python "$inst_py" -q
+  fi
+
+  systemctl daemon-reload
+  systemctl enable "duckport-ingestor@$INST_NAME" 2>/dev/null || true
+
+  echo -e "\n  ${GREEN}✓${NC} 实例 '${INST_NAME}' 安装完成"
+  echo -e "  配置文件：$cfg"
+  echo -e "  编辑配置：${BOLD}duckport config $INST_NAME${NC}"
+  echo -e "  启动服务：${BOLD}duckport start $INST_NAME${NC}"
+}
+
+# ─── config（打开实例配置文件）───────────────────────────────────────────────
+
+cmd_config() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "用法: duckport config <实例名>"; exit 1; }
+  name="${name//_/-}"
+
+  local cfg="$INGESTORS_DIR/$name/config.env"
+  if [[ ! -f "$cfg" ]]; then
+    echo -e "${RED}未找到实例配置：$cfg${NC}"
+    echo "已注册实例："
+    _list_instances | sed 's/^/  /'
+    exit 1
+  fi
+
+  ${EDITOR:-nano} "$cfg"
+}
+
 # ─── ingestor list ────────────────────────────────────────────────────────────
 
 cmd_ingestor_list() {
@@ -271,10 +410,18 @@ EOF
   PYTHON_VER=$("$PYTHON_BIN" --version | grep -oP '\d+\.\d+')
   uv venv --python "$PYTHON_VER" "$inst_dir/.venv" -q
 
-  if [[ "$PKG" == "binance-ingestor" && -d "$REPO_DIR/ingestor" ]]; then
-    uv pip install -e "$REPO_DIR/ingestor/" --python "$inst_dir/.venv/bin/python3" -q
+  local local_src
+  local_src="$(dirname "$REPO_DIR")/duckport-${PKG}"
+  if [[ -f "$local_src/pyproject.toml" ]]; then
+    uv pip install -e "$local_src" --python "$inst_dir/.venv/bin/python3" -q
   else
-    uv pip install "$PKG" --python "$inst_dir/.venv/bin/python3" -q
+    local repo
+    repo=$(_registry_get "$PKG" repo)
+    if [[ -n "$repo" ]]; then
+      uv pip install "git+${repo}" --python "$inst_dir/.venv/bin/python3" -q
+    else
+      uv pip install "$PKG" --python "$inst_dir/.venv/bin/python3" -q
+    fi
   fi
 
   # 注册并 enable systemd 实例
@@ -357,6 +504,11 @@ cmd_help() {
   echo -e "
 ${BOLD}duckport${NC} — duckport-rs 服务管理
 
+${BOLD}插件管理：${NC}
+  duckport ${CYAN}list${NC}                           列出 registry 中的可用插件
+  duckport ${CYAN}install${NC} <插件名>               从 registry 安装插件（交互式）
+  duckport ${CYAN}config${NC}  <实例名>               编辑实例配置文件
+
 ${BOLD}服务控制：${NC}
   duckport ${CYAN}status${NC}                        服务总览 + 数据水位
   duckport ${CYAN}start${NC}   [实例名|all]           启动（默认 all）
@@ -364,9 +516,8 @@ ${BOLD}服务控制：${NC}
   duckport ${CYAN}restart${NC} [实例名|all]           重启（默认 all）
   duckport ${CYAN}logs${NC}    <实例名|server|all>    实时日志
 
-${BOLD}Ingestor 管理：${NC}
-  duckport ${CYAN}ingestor list${NC}                  列出所有实例
-  duckport ${CYAN}ingestor add${NC}  <实例名>          新增实例（交互式）
+${BOLD}实例管理：${NC}
+  duckport ${CYAN}ingestor list${NC}                  列出已安装的实例
   duckport ${CYAN}ingestor rm${NC}   <实例名>          删除实例
 
 ${BOLD}数据操作：${NC}
@@ -376,10 +527,12 @@ ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
 
 ${BOLD}示例：${NC}
-  duckport ingestor add okx-5m        # 新增 OKX 5m 实例
-  duckport start okx-5m               # 启动单个实例
-  duckport logs okx-5m                # 查看该实例日志
-  duckport loadhist binance-5m        # 对 binance-5m 补历史
+  duckport list                       # 查看可安装的插件
+  duckport install binance_ingestor   # 安装 Binance 插件
+  duckport config binance-5m          # 编辑 binance-5m 实例配置
+  duckport start binance-5m           # 启动单个实例
+  duckport logs binance-5m            # 查看该实例日志
+  duckport loadhist binance-5m        # 补历史数据
 "
 }
 
@@ -389,6 +542,9 @@ CMD="${1:-status}"
 shift || true
 
 case "$CMD" in
+  list)     cmd_list ;;
+  install)  cmd_install "${1:-}" ;;
+  config)   cmd_config  "${1:-}" ;;
   status)   cmd_status ;;
   start)    cmd_start  "${1:-all}" ;;
   stop)     cmd_stop   "${1:-all}" ;;

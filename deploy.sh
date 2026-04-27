@@ -11,8 +11,6 @@
 #
 # 环境变量（可覆盖默认值）：
 #   GITHUB_REPO, RELEASE_TAG
-#   INSTANCE_NAME                      # 默认实例名，默认 binance-5m
-#   KLINE_INTERVAL, DATA_SOURCES, START_DATE, PROXY_URL
 #   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE, MEMORY_LIMIT
 
 set -euo pipefail
@@ -27,17 +25,10 @@ DEPLOY_OPT="/opt/duckport"
 DEPLOY_DATA="/data/duckport"
 INGESTORS_DIR="/opt/duckport/ingestors"
 
-# 默认实例：以「交易所-周期」命名
-INSTANCE_NAME="${INSTANCE_NAME:-binance-5m}"
-
-KLINE_INTERVAL="${KLINE_INTERVAL:-5m}"
-DATA_SOURCES="${DATA_SOURCES:-usdt_perp,usdt_spot}"
 DB_PATH="${DB_PATH:-${DEPLOY_DATA}/duckport.db}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:50051}"
 READ_POOL_SIZE="${READ_POOL_SIZE:-4}"
 MEMORY_LIMIT="${MEMORY_LIMIT:-8GB}"
-START_DATE="${START_DATE:-2021-01-01}"
-PROXY_URL="${PROXY_URL:-}"
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
 
@@ -47,7 +38,6 @@ LOADHIST_INSTANCE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --loadhist)  MODE="loadhist"; LOADHIST_INSTANCE="${2:-}"; [[ -n "${2:-}" ]] && shift ;;
-    --instance)  INSTANCE_NAME="$2"; shift ;;
     --tag)       RELEASE_TAG="$2"; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -109,7 +99,6 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 
 info "GitHub 仓库：$GITHUB_REPO  tag：$RELEASE_TAG"
-info "默认实例：$INSTANCE_NAME"
 
 # ─── 辅助：获取 Release binary URL ───────────────────────────────────────────
 
@@ -146,9 +135,8 @@ _build_from_source() {
 # ─── Step 1：目录结构 ─────────────────────────────────────────────────────────
 
 step "创建目录结构"
-INST_DIR="$INGESTORS_DIR/$INSTANCE_NAME"
-mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INST_DIR"
-ok "目录就绪（实例目录：$INST_DIR）"
+mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INGESTORS_DIR"
+ok "目录就绪"
 
 # ─── Step 2：获取 binary（MD5 比对决定是否替换）──────────────────────────────
 
@@ -212,44 +200,17 @@ DUCKPORT_RETENTION_ENABLED=false
 RUST_LOG=info
 EOF
 
-_write_if_missing "$INST_DIR/config.env" << EOF
-# 实例：${INSTANCE_NAME}
-INGESTOR_EXEC=binance-ingestor
-KLINE_INTERVAL=${KLINE_INTERVAL}
-DATA_SOURCES=${DATA_SOURCES}
-CONCURRENCY=2
-START_DATE=${START_DATE}
-PROXY_URL=${PROXY_URL}
-EOF
+# ─── Step 4：确保 uv 可用（duckport install 依赖它）─────────────────────────
 
-# ─── Step 4：安装 Python 包 ───────────────────────────────────────────────────
-
-step "安装 binance-ingestor（实例：$INSTANCE_NAME）"
-
+step "检查 uv（Python 环境管理器）"
 export PATH="$HOME/.local/bin:$PATH"
-if ! command -v uv &>/dev/null; then
+if command -v uv &>/dev/null; then
+  skip "uv 已安装：$(uv --version)"
+else
   info "安装 uv..."
   curl -fsSL https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
-fi
-
-PYTHON_BIN=$(command -v python3.12 2>/dev/null || command -v python3)
-PYTHON_VER=$("$PYTHON_BIN" --version 2>&1 | grep -oP '\d+\.\d+')
-info "Python $PYTHON_VER"
-
-uv venv --python "$PYTHON_VER" "$INST_DIR/.venv" -q 2>/dev/null || true
-
-INST_PY="$INST_DIR/.venv/bin/python3"
-INSTALLED_VER=$("$INST_DIR/.venv/bin/pip" show binance-ingestor 2>/dev/null \
-  | grep '^Version:' | awk '{print $2}' || echo "")
-REPO_VER=$(grep '^version' "$REPO_DIR/ingestor/pyproject.toml" \
-  | head -1 | grep -oP '[\d.]+')
-
-if [[ "$INSTALLED_VER" == "$REPO_VER" ]]; then
-  skip "binance-ingestor $REPO_VER 已是最新"
-else
-  uv pip install -e "$REPO_DIR/ingestor/" --python "$INST_PY" -q 2>&1 | grep -v "^$" || true
-  ok "binance-ingestor 已安装/更新至 $REPO_VER"
+  ok "uv 已安装：$(uv --version)"
 fi
 
 # ─── Step 5：注册 systemd unit（不启动）──────────────────────────────────────
@@ -322,10 +283,9 @@ RUNEOF
 chmod +x "$DEPLOY_BIN/ingestor-run"
 
 systemctl daemon-reload
-systemctl enable duckport-server "duckport-ingestor@${INSTANCE_NAME}" 2>/dev/null || true
-ok "duckport-server.service 已注册"
+systemctl enable duckport-server 2>/dev/null || true
+ok "duckport-server.service 已注册并 enable"
 ok "duckport-ingestor@.service (template) 已注册"
-ok "duckport-ingestor@${INSTANCE_NAME} 已 enable"
 
 # ─── Step 6：注册 duckport CLI ────────────────────────────────────────────────
 
@@ -339,26 +299,22 @@ ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
 # ─── 完成摘要 ─────────────────────────────────────────────────────────────────
 
 SV_ACTIVE=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
-INST_ACTIVE=$(systemctl is-active "duckport-ingestor@$INSTANCE_NAME" 2>/dev/null || echo "inactive")
 
 echo ""
 echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
 echo -e "${BOLD}${GREEN}  环境配置完成${NC}"
 echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
-printf "  %-20s %s\n" "binary："        "$INSTALLED_BIN"
-printf "  %-20s %s\n" "server.env："    "$DEPLOY_OPT/server.env"
-printf "  %-20s %s\n" "默认实例："      "$INSTANCE_NAME"
-printf "  %-20s %s\n" "实例配置："      "$INST_DIR/config.env"
-printf "  %-20s %s\n" "数据库："        "$DB_PATH"
+printf "  %-20s %s\n" "binary："      "$INSTALLED_BIN"
+printf "  %-20s %s\n" "server.env：" "$DEPLOY_OPT/server.env"
+printf "  %-20s %s\n" "数据库："      "$DB_PATH"
 echo ""
-echo -e "${BOLD}服务管理（使用 duckport CLI）：${NC}"
-if [[ "$SV_ACTIVE" == "inactive" && "$INST_ACTIVE" == "inactive" ]]; then
-  echo "  duckport start                   # 启动所有服务"
-  echo "  duckport ingestor add <名称>     # 新增其他交易所实例"
+echo -e "${BOLD}后续步骤：${NC}"
+echo "  duckport list                    # 查看可用插件"
+echo "  duckport install binance-ingestor # 安装 Binance 数据插件"
+echo ""
+if [[ "$SV_ACTIVE" == "inactive" ]]; then
+  echo "  duckport start server            # 启动 duckport-server"
 else
-  echo "  duckport restart                 # 重启所有服务"
+  echo "  duckport status                  # 查看服务状态和数据水位"
 fi
-echo ""
-echo "  duckport status                  # 查看状态和水位"
-echo "  duckport ingestor list           # 列出所有实例"
-echo "  duckport logs <实例名>|server    # 查看日志"
+echo "  duckport logs server             # 查看服务日志"
