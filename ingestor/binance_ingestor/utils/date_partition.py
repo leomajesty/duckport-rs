@@ -23,16 +23,21 @@ def get_available_years_months(period_month: int = 6):
             current = current.replace(month=current.month + period_month)
 
     first = f'{START_DATE.year}-{START_DATE.month:02d}'
-    yms = [[ym for ym in yms if ym <= first][-1]] + [ym for ym in yms if ym > first]
+    earlier = [ym for ym in yms if ym <= first]
+    # 若 START_DATE 早于 init_date（2019-01），earlier 为空，直接从最早分区开始
+    anchor = [earlier[-1]] if earlier else []
+    yms = anchor + [ym for ym in yms if ym > first]
+
     yms_dict = {}
     for ym in yms:
         month = int(ym.split('-')[1])
         yms_values = []
         for range_ym in range(month, month + period_month):
-            yms_value = f'{ym.split('-')[0]}-{range_ym:02d}'
+            yms_value = f'{ym.split("-")[0]}-{range_ym:02d}'
             if yms_value >= first:
                 yms_values.append(yms_value)
-        yms_dict[ym] = yms_values
+        if yms_values:  # 跳过全部早于 START_DATE 的分区
+            yms_dict[ym] = yms_values
 
     return yms_dict
 

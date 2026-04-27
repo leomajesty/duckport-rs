@@ -2,7 +2,7 @@
 name = "binance-ingestor"
 version = "0.1.0"
 description = "Standalone Binance data ingestor for duckport-rs"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pandas>=2.0",
     "pyarrow>=15.0",
@@ -11,7 +11,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "colorama>=0.4",
     "pytz",
-    "duckdb>=1.0",
+    "duckdb==1.5.1",
     "lxml>=5.0",
     "aiofiles>=24.0",
     "tqdm>=4.60",

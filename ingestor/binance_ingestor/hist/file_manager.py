@@ -85,6 +85,8 @@ def read_symbol_csv(symbol, zip_path, interval='5m', ydashm=None):
 
 
 def to_pqt(yms: list[str], interval: str = '5m', market: str = 'usdt_perp'):
+    if not yms:
+        return
     filename = f'{market}_{yms[0]}_{len(yms)}M.parquet'
     latest_pqt = get_latest_parquet(market, interval)
     if os.path.exists(os.path.join(PARQUET_DIR, f'{market}_{interval}', filename)) and filename != latest_pqt:

@@ -1,37 +1,37 @@
 #!/usr/bin/env bash
-# duckport-rs 一键部署脚本（在目标服务器上直接运行）
+# duckport-rs 环境配置脚本
+#
+# 职责：配置环境（目录、binary、Python 包、systemd unit）
+#       不启动、不停止任何服务
 #
 # 用法：
-#   ./deploy.sh                   # 首次完整部署（含数据迁移）
-#   ./deploy.sh --upgrade         # 仅升级二进制 + 重启服务
-#   ./deploy.sh --no-migrate      # 首次部署，跳过旧数据迁移
+#   ./deploy.sh                        # 安装 / 升级（自动 MD5 检测）
+#   ./deploy.sh --instance <名称>      # 指定默认实例名（默认 binance-5m）
+#   ./deploy.sh --loadhist [<实例>]    # 补历史数据
 #
-# 前置条件：
-#   - 已通过 git clone 获取本仓库
-#   - 私有仓库需先执行 gh auth login 或设置 GITHUB_TOKEN
-#
-# 示例（私有仓库）：
-#   export GITHUB_TOKEN=ghp_xxxx
-#   git clone https://x-token:${GITHUB_TOKEN}@github.com/OWNER/duckport-rs /w/code/duckport-rs
-#   cd /w/code/duckport-rs && ./deploy.sh
+# 环境变量（可覆盖默认值）：
+#   GITHUB_REPO, RELEASE_TAG
+#   INSTANCE_NAME                      # 默认实例名，默认 binance-5m
+#   KLINE_INTERVAL, DATA_SOURCES, MEMORY_LIMIT
+#   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE
+#   START_DATE, PROXY_URL, ENABLE_WS
+#   OLD_DB_PATH, OLD_PQT_DIR
 
 set -euo pipefail
 
-# ─── 可配置项 ─────────────────────────────────────────────────────────────────
+# ─── 默认配置 ─────────────────────────────────────────────────────────────────
 
-# GitHub 仓库（自动从 git remote 读取，也可手动指定）
 GITHUB_REPO="${GITHUB_REPO:-leomajesty/duckport-rs}"
-
-# release tag（默认下载最新 release）
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 
-# 部署路径
 DEPLOY_BIN="/opt/duckport/bin"
 DEPLOY_OPT="/opt/duckport"
 DEPLOY_DATA="/data/duckport"
-DEPLOY_INGESTOR="/opt/duckport/ingestor"
+INGESTORS_DIR="/opt/duckport/ingestors"
 
-# duckport-server 运行配置
+# 默认实例：以「交易所-周期」命名
+INSTANCE_NAME="${INSTANCE_NAME:-binance-5m}"
+
 KLINE_INTERVAL="${KLINE_INTERVAL:-5m}"
 DATA_SOURCES="${DATA_SOURCES:-usdt_perp,usdt_spot}"
 DB_PATH="${DB_PATH:-${DEPLOY_DATA}/duckport.db}"
@@ -42,20 +42,19 @@ START_DATE="${START_DATE:-2021-01-01}"
 PROXY_URL="${PROXY_URL:-}"
 ENABLE_WS="${ENABLE_WS:-false}"
 
-# 旧版数据路径（策略 B 迁移用；不存在时自动跳过）
 OLD_DB_PATH="${OLD_DB_PATH:-/w/data/5m/duckdb.db}"
 OLD_PQT_DIR="${OLD_PQT_DIR:-/w/data/5m/pqt}"
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
 
-MODE="full"
-RUN_MIGRATE=true
+MODE="install"
+LOADHIST_INSTANCE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --upgrade)    MODE="upgrade";  RUN_MIGRATE=false ;;
-    --no-migrate) MODE="full";     RUN_MIGRATE=false ;;
-    --tag)        RELEASE_TAG="$2"; shift ;;
+    --loadhist)  MODE="loadhist"; LOADHIST_INSTANCE="${2:-}"; [[ -n "${2:-}" ]] && shift ;;
+    --instance)  INSTANCE_NAME="$2"; shift ;;
+    --tag)       RELEASE_TAG="$2"; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
   shift
@@ -63,97 +62,152 @@ done
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
-BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-step() { echo -e "\n${BOLD}${GREEN}▶ $*${NC}"; }
-info() { echo -e "  ${YELLOW}$*${NC}"; }
-ok()   { echo -e "  ${GREEN}✓ $*${NC}"; }
-fail() { echo -e "  ${RED}✗ $*${NC}"; exit 1; }
+BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'; NC='\033[0m'
+step()  { echo -e "\n${BOLD}${GREEN}▶ $*${NC}"; }
+info()  { echo -e "  ${YELLOW}$*${NC}"; }
+ok()    { echo -e "  ${GREEN}✓ $*${NC}"; }
+skip()  { echo -e "  ${CYAN}– $*${NC}"; }
+fail()  { echo -e "  ${RED}✗ $*${NC}"; exit 1; }
+
+md5_of() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
 # ─── 确定仓库根目录 ───────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ ! -f "$SCRIPT_DIR/Cargo.toml" ]]; then
-  fail "请在 duckport-rs 仓库根目录下运行此脚本"
-fi
+[[ -f "$SCRIPT_DIR/Cargo.toml" ]] || fail "请在 duckport-rs 仓库根目录下运行此脚本"
 REPO_DIR="$SCRIPT_DIR"
 
-# ─── 获取 GitHub 仓库名 ───────────────────────────────────────────────────────
+# ─── loadhist 模式 ────────────────────────────────────────────────────────────
 
-info "GitHub 仓库：$GITHUB_REPO"
+if [[ "$MODE" == "loadhist" ]]; then
+  step "loadhist${LOADHIST_INSTANCE:+ — $LOADHIST_INSTANCE}"
 
-# ─── 构造 binary 下载 URL ─────────────────────────────────────────────────────
+  _run_loadhist() {
+    local inst="$1"
+    local inst_dir="$INGESTORS_DIR/$inst"
+    local cfg="$inst_dir/config.env"
+    local py="$inst_dir/.venv/bin/python3"
+    [[ -x "$py" && -f "$cfg" ]] || { info "实例 $inst 环境不完整，跳过"; return; }
 
-GH_API="https://api.github.com/repos/${GITHUB_REPO}"
-AUTH_HEADER=""
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  AUTH_HEADER="-H \"Authorization: Bearer ${GITHUB_TOKEN}\""
+    info "⚠ 停止 duckport-ingestor@$inst 以独占 staging 表"
+    systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
+
+    INGESTOR_ENV_FILE="$cfg" "$inst_dir/.venv/bin/loadhist" && \
+      ok "loadhist 完成" || { info "loadhist 失败"; }
+
+    systemctl start "duckport-ingestor@$inst"
+    ok "duckport-ingestor@$inst 已恢复"
+  }
+
+  if [[ -n "$LOADHIST_INSTANCE" ]]; then
+    _run_loadhist "$LOADHIST_INSTANCE"
+  else
+    # 对所有实例逐一执行
+    find "$INGESTORS_DIR" -maxdepth 2 -name "config.env" 2>/dev/null \
+      | sed "s|$INGESTORS_DIR/||;s|/config.env||" | sort \
+      | while IFS= read -r inst; do _run_loadhist "$inst"; done
+  fi
+  exit 0
 fi
 
-get_binary_url() {
+# ═══════════════════════════════════════════════════════════════════════════════
+# install 模式
+# ═══════════════════════════════════════════════════════════════════════════════
+
+info "GitHub 仓库：$GITHUB_REPO  tag：$RELEASE_TAG"
+info "默认实例：$INSTANCE_NAME"
+
+# ─── 辅助：获取 Release binary URL ───────────────────────────────────────────
+
+_get_binary_url() {
   local api_url
   if [[ "$RELEASE_TAG" == "latest" ]]; then
-    api_url="${GH_API}/releases/latest"
+    api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
   else
-    api_url="${GH_API}/releases/tags/${RELEASE_TAG}"
+    api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${RELEASE_TAG}"
   fi
-  curl -fsSL ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} "$api_url" \
+  curl -fsSL \
+    ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
+    "$api_url" 2>/dev/null \
     | grep '"browser_download_url"' \
     | grep 'duckport-server-linux-x86_64' \
     | cut -d'"' -f4
 }
 
-# ─── Step 0：git pull（保持代码最新）─────────────────────────────────────────
+# ─── 辅助：本机编译回落 ───────────────────────────────────────────────────────
 
-step "更新代码 (git pull)"
-git -C "$REPO_DIR" pull --ff-only 2>/dev/null || info "git pull 失败（可能是 detached HEAD），继续..."
-ok "代码已是最新"
+_build_from_source() {
+  info "回落：在本机编译（首次含 DuckDB bundled，约需 2-5 分钟）..."
+  export PATH="$HOME/.cargo/bin:$PATH"
+  if ! command -v cargo &>/dev/null; then
+    info "安装 Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  ok "Rust: $(rustc --version)"
+  cargo build --release --bin duckport-server --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
+  echo "$REPO_DIR/target/release/duckport-server"
+}
 
-# ─── Step 1：下载预构建二进制 ─────────────────────────────────────────────────
-
-step "从 GitHub Releases 下载 duckport-server 二进制"
-info "仓库：$GITHUB_REPO，tag：$RELEASE_TAG"
-
-mkdir -p "$DEPLOY_BIN"
-
-BINARY_URL=$(get_binary_url)
-[[ -z "$BINARY_URL" ]] && fail "未找到 duckport-server-linux-x86_64 资产，请确认 release 已上传"
-
-info "下载：$BINARY_URL"
-curl -fL ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
-  "$BINARY_URL" -o "$DEPLOY_BIN/duckport-server"
-chmod +x "$DEPLOY_BIN/duckport-server"
-
-BIN_SIZE=$(ls -lh "$DEPLOY_BIN/duckport-server" | awk '{print $5}')
-ok "已下载：$DEPLOY_BIN/duckport-server ($BIN_SIZE)"
-
-# ─── 升级模式：仅替换二进制并重启 ────────────────────────────────────────────
-
-if [[ "$MODE" == "upgrade" ]]; then
-  step "升级模式：停止服务 → 替换二进制 → 重启"
-  systemctl stop binance-ingestor 2>/dev/null || true
-  systemctl stop duckport-server  2>/dev/null || true
-  sleep 2
-  systemctl start duckport-server
-  sleep 4
-  systemctl start binance-ingestor
-  sleep 2
-  systemctl is-active duckport-server  && ok "duckport-server: active"  || fail "duckport-server 启动失败"
-  systemctl is-active binance-ingestor && ok "binance-ingestor: active" || fail "binance-ingestor 启动失败"
-  echo -e "\n${BOLD}${GREEN}升级完成！${NC}"
-  exit 0
-fi
-
-# ─── Step 2：创建目录结构 ─────────────────────────────────────────────────────
+# ─── Step 1：目录结构 ─────────────────────────────────────────────────────────
 
 step "创建目录结构"
-mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$DEPLOY_INGESTOR"
-ok "目录就绪"
+INST_DIR="$INGESTORS_DIR/$INSTANCE_NAME"
+mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INST_DIR"
+ok "目录就绪（实例目录：$INST_DIR）"
 
-# ─── Step 3：写配置文件 ───────────────────────────────────────────────────────
+# ─── Step 2：获取 binary（MD5 比对决定是否替换）──────────────────────────────
 
-step "写入配置文件"
+step "获取 duckport-server binary"
 
-cat > "$DEPLOY_OPT/server.env" << EOF
+INSTALLED_BIN="$DEPLOY_BIN/duckport-server"
+TMP_BIN="$(mktemp)"
+trap 'rm -f "$TMP_BIN"' EXIT
+
+BINARY_URL=$(_get_binary_url || true)
+
+if [[ -n "$BINARY_URL" ]]; then
+  info "下载：$BINARY_URL"
+  curl -fsSL \
+    ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
+    "$BINARY_URL" -o "$TMP_BIN"
+else
+  info "GitHub Release 暂无预构建包，尝试本机编译..."
+  SRC_BIN=$(_build_from_source)
+  cp "$SRC_BIN" "$TMP_BIN"
+fi
+
+chmod +x "$TMP_BIN"
+
+if [[ -f "$INSTALLED_BIN" ]]; then
+  OLD_MD5=$(md5_of "$INSTALLED_BIN")
+  NEW_MD5=$(md5_of "$TMP_BIN")
+  if [[ "$OLD_MD5" == "$NEW_MD5" ]]; then
+    skip "binary 未变化（MD5 相同），跳过替换"
+    rm -f "$TMP_BIN"; trap - EXIT
+  else
+    mv "$TMP_BIN" "$INSTALLED_BIN"; trap - EXIT
+    ok "binary 已升级（${OLD_MD5:0:8}… → ${NEW_MD5:0:8}…）"
+  fi
+else
+  mv "$TMP_BIN" "$INSTALLED_BIN"; trap - EXIT
+  ok "binary 已安装：$INSTALLED_BIN ($(ls -lh "$INSTALLED_BIN" | awk '{print $5}'))"
+fi
+
+# ─── Step 3：写配置文件（已存在则跳过）──────────────────────────────────────
+
+step "配置文件"
+
+_write_if_missing() {
+  local path="$1"; shift
+  if [[ -f "$path" ]]; then
+    skip "$(basename "$path") 已存在，跳过"
+  else
+    cat > "$path"; ok "已写入 $path"
+  fi
+}
+
+_write_if_missing "$DEPLOY_OPT/server.env" << EOF
 DUCKPORT_DB_PATH=${DB_PATH}
 DUCKPORT_LISTEN_ADDR=${LISTEN_ADDR}
 DUCKPORT_CATALOG_NAME=duckport
@@ -164,7 +218,9 @@ DUCKPORT_RETENTION_ENABLED=false
 RUST_LOG=info
 EOF
 
-cat > "$DEPLOY_INGESTOR/config.env" << EOF
+_write_if_missing "$INST_DIR/config.env" << EOF
+# 实例：${INSTANCE_NAME}
+INGESTOR_EXEC=binance-ingestor
 DUCKPORT_ADDR=localhost:50051
 DUCKPORT_SCHEMA=data
 KLINE_INTERVAL=${KLINE_INTERVAL}
@@ -172,182 +228,47 @@ PARQUET_DIR=${OLD_PQT_DIR}
 DATA_SOURCES=${DATA_SOURCES}
 CONCURRENCY=2
 RETENTION_ENABLED=false
-RETENTION_DAYS=7
 START_DATE=${START_DATE}
 PROXY_URL=${PROXY_URL}
 ENABLE_WS=${ENABLE_WS}
 RESOURCE_PATH=${DEPLOY_DATA}/hist
 EOF
 
-ok "server.env 和 ingestor/config.env 已写入"
+# ─── Step 4：安装 Python 包 ───────────────────────────────────────────────────
 
-# ─── Step 4：安装 binance-ingestor ───────────────────────────────────────────
+step "安装 binance-ingestor（实例：$INSTANCE_NAME）"
 
-step "安装 binance-ingestor"
-
-# 安装 uv（如未安装）
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv &>/dev/null; then
   info "安装 uv..."
-  pip3 install uv --break-system-packages -q || pip3 install uv -q
+  curl -fsSL https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
 fi
 
-PYTHON_BIN=$(command -v python3.11 || command -v python3.12 || command -v python3)
+PYTHON_BIN=$(command -v python3.12 2>/dev/null || command -v python3)
 PYTHON_VER=$("$PYTHON_BIN" --version 2>&1 | grep -oP '\d+\.\d+')
-info "使用 Python $PYTHON_VER ($PYTHON_BIN)"
+info "Python $PYTHON_VER"
 
-cd "$DEPLOY_INGESTOR"
-uv venv --python "$PYTHON_VER" .venv -q 2>/dev/null || true
-uv pip install -e "$REPO_DIR/ingestor/" -q 2>&1 | grep -v "^$" || true
-INSTALLED=$(ls .venv/bin/ | grep -E 'binance-ingestor|loadhist' | tr '\n' ' ')
-ok "已安装：$INSTALLED"
-cd "$REPO_DIR"
+uv venv --python "$PYTHON_VER" "$INST_DIR/.venv" -q 2>/dev/null || true
 
-# ─── Step 5：停止旧服务 ───────────────────────────────────────────────────────
+INST_PY="$INST_DIR/.venv/bin/python3"
+INSTALLED_VER=$("$INST_DIR/.venv/bin/pip" show binance-ingestor 2>/dev/null \
+  | grep '^Version:' | awk '{print $2}' || echo "")
+REPO_VER=$(grep '^version' "$REPO_DIR/ingestor/pyproject.toml" \
+  | head -1 | grep -oP '[\d.]+')
 
-step "停止现有服务（如有）"
-systemctl stop binance-ingestor 2>/dev/null || true
-systemctl stop duckport-server  2>/dev/null || true
-# 确保没有残留进程占用 DB 文件
-pkill -f duckport-server 2>/dev/null || true
-sleep 1
-ok "已停止"
-
-# ─── Step 6：初始化 schema ────────────────────────────────────────────────────
-
-step "启动 duckport-server 初始化 schema"
-
-DUCKPORT_DB_PATH="$DB_PATH" \
-DUCKPORT_LISTEN_ADDR=0.0.0.0:50051 \
-DUCKPORT_CATALOG_NAME=duckport \
-DUCKPORT_READ_POOL_SIZE=4 \
-RUST_LOG=warn \
-  nohup "$DEPLOY_BIN/duckport-server" > /tmp/duckport-init.log 2>&1 &
-SERVER_PID=$!
-
-# 等待端口就绪
-RETRY=0
-until nc -z localhost 50051 2>/dev/null; do
-  sleep 1; RETRY=$((RETRY+1))
-  [[ $RETRY -ge 15 ]] && { cat /tmp/duckport-init.log; fail "duckport-server 启动超时"; }
-done
-
-"$DEPLOY_INGESTOR/.venv/bin/python3" - << PYEOF
-import sys
-sys.path.insert(0, "$REPO_DIR/ingestor")
-from binance_ingestor.duckport_client import DuckportClient
-markets = [m.strip() for m in "$DATA_SOURCES".split(",")]
-dc = DuckportClient(addr="127.0.0.1:50051", schema="data")
-dc.init_schema(markets=markets, interval="$KLINE_INTERVAL", data_sources=set(markets))
-dc.verify_kline_interval("$KLINE_INTERVAL")
-dc.close()
-print("schema initialized")
-PYEOF
-
-ok "Schema 初始化完成"
-kill $SERVER_PID 2>/dev/null || true
-sleep 2
-
-# ─── Step 7：数据迁移 ─────────────────────────────────────────────────────────
-
-if [[ "$RUN_MIGRATE" == "true" ]]; then
-  if [[ -f "$OLD_DB_PATH" ]]; then
-    step "数据迁移：$OLD_DB_PATH → $DB_PATH"
-    info "迁移热库 + Parquet，数据量较大，请耐心等待..."
-
-    "$DEPLOY_INGESTOR/.venv/bin/python3" - << PYEOF
-import glob, os, duckdb
-
-old_db = "$OLD_DB_PATH"
-new_db = "$DB_PATH"
-iv     = "$KLINE_INTERVAL"
-mkts   = [m.strip() for m in "$DATA_SOURCES".split(",")]
-
-con = duckdb.connect(new_db)
-con.execute(f"ATTACH '{old_db}' AS old_db (READ_ONLY)")
-print(f"Attached old DB: {old_db}")
-
-for mkt in mkts:
-    tbl = f"{mkt}_{iv}"
-    try:
-        print(f"  Migrating {tbl} (hot) ...")
-        con.execute(f"""
-            INSERT INTO data.{tbl}
-            SELECT open_time, symbol, open, high, low, close,
-                   volume, quote_volume, trade_num,
-                   taker_buy_base_asset_volume, taker_buy_quote_asset_volume,
-                   avg_price
-            FROM old_db.{tbl} ON CONFLICT DO NOTHING
-        """)
-        n = con.execute(f"SELECT count(*) FROM data.{tbl}").fetchone()[0]
-        print(f"  {tbl}: {n:,} rows")
-    except Exception as e:
-        print(f"  {tbl}: skip ({e})")
-
-try:
-    con.execute("""
-        INSERT INTO data.config_dict (key, value)
-        SELECT key, value FROM old_db.config_dict
-        WHERE NOT ends_with(key, '_pqt_time')
-        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
-    """)
-    rows = con.execute("SELECT key, value FROM data.config_dict").fetchall()
-    for k, v in rows:
-        print(f"  config_dict: {k} = {v}")
-except Exception as e:
-    print(f"  config_dict: {e}")
-
-try:
-    con.execute("""
-        INSERT INTO data.exginfo
-        SELECT market, symbol, status, base_asset, quote_asset,
-               price_tick, lot_size, min_notional_value,
-               contract_type, margin_asset, pre_market, created_time
-        FROM old_db.exginfo ON CONFLICT DO NOTHING
-    """)
-    n = con.execute("SELECT count(*) FROM data.exginfo").fetchone()[0]
-    print(f"  exginfo: {n:,} rows")
-except Exception as e:
-    print(f"  exginfo: {e}")
-
-con.execute("DETACH old_db")
-
-old_pqt = "$OLD_PQT_DIR"
-for mkt in mkts:
-    tbl     = f"{mkt}_{iv}"
-    pattern = os.path.join(old_pqt, f"{mkt}_{iv}", f"{mkt}_*.parquet")
-    files   = glob.glob(pattern)
-    if not files:
-        print(f"  parquet: no files for {pattern}, skip")
-        continue
-    print(f"  Importing {len(files)} parquet files for {tbl} ...")
-    try:
-        con.execute(f"""
-            INSERT INTO data.{tbl}
-            SELECT open_time, symbol, open, high, low, close,
-                   volume, quote_volume, trade_num,
-                   taker_buy_base_asset_volume, taker_buy_quote_asset_volume,
-                   avg_price
-            FROM read_parquet('{pattern}') ON CONFLICT DO NOTHING
-        """)
-        n = con.execute(f"SELECT count(*) FROM data.{tbl}").fetchone()[0]
-        print(f"  merged {tbl}: {n:,} rows total")
-    except Exception as e:
-        print(f"  parquet {tbl}: {e}")
-
-con.execute("CHECKPOINT")
-con.close()
-print("Migration done!")
-PYEOF
-    ok "数据迁移完成"
-  else
-    info "未找到旧库 $OLD_DB_PATH，跳过数据迁移"
-  fi
+if [[ "$INSTALLED_VER" == "$REPO_VER" ]]; then
+  skip "binance-ingestor $REPO_VER 已是最新"
+else
+  uv pip install -e "$REPO_DIR/ingestor/" --python "$INST_PY" -q 2>&1 | grep -v "^$" || true
+  ok "binance-ingestor 已安装/更新至 $REPO_VER"
 fi
 
-# ─── Step 8：注册 systemd 服务 ────────────────────────────────────────────────
+# ─── Step 5：注册 systemd unit（不启动）──────────────────────────────────────
 
-step "配置 systemd 服务"
+step "注册 systemd unit 文件"
 
+# duckport-server.service（固定）
 cat > /etc/systemd/system/duckport-server.service << 'SVCEOF'
 [Unit]
 Description=duckport-rs gRPC Database Service
@@ -369,9 +290,10 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SVCEOF
 
-cat > /etc/systemd/system/binance-ingestor.service << SVCEOF
+# duckport-ingestor@.service（template，%i = 实例名）
+cat > /etc/systemd/system/duckport-ingestor@.service << 'SVCEOF'
 [Unit]
-Description=Binance Data Ingestor for duckport-rs
+Description=duckport Ingestor (%i)
 After=duckport-server.service
 Requires=duckport-server.service
 
@@ -379,9 +301,10 @@ Requires=duckport-server.service
 Type=simple
 User=root
 Group=root
-WorkingDirectory=${DEPLOY_INGESTOR}
-Environment=INGESTOR_ENV_FILE=${DEPLOY_INGESTOR}/config.env
-ExecStart=${DEPLOY_INGESTOR}/.venv/bin/binance-ingestor
+WorkingDirectory=/opt/duckport/ingestors/%i
+EnvironmentFile=/opt/duckport/ingestors/%i/config.env
+Environment=INGESTOR_ENV_FILE=/opt/duckport/ingestors/%i/config.env
+ExecStart=/opt/duckport/bin/ingestor-run %i
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -390,56 +313,64 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SVCEOF
 
+# 通用启动器：读取实例 config.env 中的 INGESTOR_EXEC
+cat > "$DEPLOY_BIN/ingestor-run" << 'RUNEOF'
+#!/usr/bin/env bash
+# 通用 ingestor 启动器（由 duckport-ingestor@.service 调用）
+INSTANCE="${1:?实例名不能为空}"
+INST_DIR="/opt/duckport/ingestors/$INSTANCE"
+CFG="$INST_DIR/config.env"
+
+[[ -f "$CFG" ]] || { echo "找不到配置：$CFG"; exit 1; }
+
+EXEC_CMD=$(grep '^INGESTOR_EXEC=' "$CFG" | cut -d= -f2 | tr -d '"' || echo "binance-ingestor")
+EXEC_BIN="$INST_DIR/.venv/bin/$EXEC_CMD"
+
+[[ -x "$EXEC_BIN" ]] || { echo "找不到可执行文件：$EXEC_BIN"; exit 1; }
+
+export INGESTOR_ENV_FILE="$CFG"
+exec "$EXEC_BIN"
+RUNEOF
+chmod +x "$DEPLOY_BIN/ingestor-run"
+
 systemctl daemon-reload
-systemctl enable duckport-server binance-ingestor
-ok "systemd 服务已注册"
+systemctl enable duckport-server "duckport-ingestor@${INSTANCE_NAME}" 2>/dev/null || true
+ok "duckport-server.service 已注册"
+ok "duckport-ingestor@.service (template) 已注册"
+ok "duckport-ingestor@${INSTANCE_NAME} 已 enable"
 
-# ─── Step 9：启动并验证 ───────────────────────────────────────────────────────
+# ─── Step 6：注册 duckport CLI ────────────────────────────────────────────────
 
-step "启动服务"
-systemctl start duckport-server
-sleep 4
-systemctl start binance-ingestor
-sleep 3
+step "注册 duckport 命令行工具"
+# 将仓库路径持久化，供 duckport CLI 读取（upgrade / ingestor add 需要）
+echo "$REPO_DIR" > "$DEPLOY_OPT/repo_dir"
+install -m 755 "$REPO_DIR/duckport" /usr/local/bin/duckport
+ok "已安装：/usr/local/bin/duckport"
+ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
 
-systemctl is-active duckport-server  && ok "duckport-server: active"  || fail "duckport-server 启动失败"
-systemctl is-active binance-ingestor && ok "binance-ingestor: active" || fail "binance-ingestor 启动失败"
+# ─── 完成摘要 ─────────────────────────────────────────────────────────────────
 
-step "健康验证"
-"$DEPLOY_INGESTOR/.venv/bin/python3" - << PYEOF
-import sys, json
-sys.path.insert(0, "$REPO_DIR/ingestor")
-import pyarrow.flight as flight
-from binance_ingestor.duckport_client import DuckportClient
-
-c = flight.connect("grpc://localhost:50051")
-res = list(c.do_action(flight.Action("duckport.ping", b"{}")))
-info = json.loads(res[0].body.to_pybytes())
-print(f"  ping: server={info['server']}, duckdb={info['duckdb_version']}")
-
-dc = DuckportClient(addr="localhost:50051", schema="data")
-for mkt in [m.strip() for m in "$DATA_SOURCES".split(",")]:
-    tbl = f"{mkt}_$KLINE_INTERVAL"
-    try:
-        t  = dc.read_table("data", tbl)
-        dt = dc.read_duck_time(mkt)
-        print(f"  {tbl}: {t.num_rows:,} rows, duck_time={dt}")
-    except Exception as e:
-        print(f"  {tbl}: {e}")
-dc.close()
-PYEOF
-
-# ─── 完成 ─────────────────────────────────────────────────────────────────────
+SV_ACTIVE=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
+INST_ACTIVE=$(systemctl is-active "duckport-ingestor@$INSTANCE_NAME" 2>/dev/null || echo "inactive")
 
 echo ""
-echo -e "${BOLD}${GREEN}========================================${NC}"
-echo -e "${BOLD}${GREEN}  部署完成！${NC}"
-echo -e "${BOLD}${GREEN}========================================${NC}"
-printf "  %-16s %s\n" "监听地址："   "$LISTEN_ADDR"
-printf "  %-16s %s\n" "数据库："     "$DB_PATH"
-printf "  %-16s %s\n" "K 线周期："   "$KLINE_INTERVAL"
-printf "  %-16s %s\n" "数据源："     "$DATA_SOURCES"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+echo -e "${BOLD}${GREEN}  环境配置完成${NC}"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+printf "  %-20s %s\n" "binary："        "$INSTALLED_BIN"
+printf "  %-20s %s\n" "server.env："    "$DEPLOY_OPT/server.env"
+printf "  %-20s %s\n" "默认实例："      "$INSTANCE_NAME"
+printf "  %-20s %s\n" "实例配置："      "$INST_DIR/config.env"
+printf "  %-20s %s\n" "数据库："        "$DB_PATH"
 echo ""
-echo "  查看日志："
-echo "    journalctl -u duckport-server  -f"
-echo "    journalctl -u binance-ingestor -f"
+echo -e "${BOLD}服务管理（使用 duckport CLI）：${NC}"
+if [[ "$SV_ACTIVE" == "inactive" && "$INST_ACTIVE" == "inactive" ]]; then
+  echo "  duckport start                   # 启动所有服务"
+  echo "  duckport ingestor add <名称>     # 新增其他交易所实例"
+else
+  echo "  duckport restart                 # 重启所有服务"
+fi
+echo ""
+echo "  duckport status                  # 查看状态和水位"
+echo "  duckport ingestor list           # 列出所有实例"
+echo "  duckport logs <实例名>|server    # 查看日志"
