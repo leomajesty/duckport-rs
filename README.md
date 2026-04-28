@@ -177,7 +177,8 @@ curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install
 ```bash
 duckport list                       # 查看可安装的插件
 duckport install binance_ingestor   # 安装 Binance 数据插件（交互式）
-duckport start                      # 启动 duckport-server + 所有已安装的 ingestor
+duckport start                      # 启动 duckport-server
+duckport start all                  # 启动 duckport-server + 所有已安装的 ingestor
 duckport status                     # 查看服务状态和数据水位
 duckport config binance-5m          # 编辑实例配置文件
 duckport logs binance-5m            # 实时查看日志
@@ -473,6 +474,7 @@ duckport-my-ingestor/           # 仓库名建议以 duckport- 为前缀
 |------|------|
 | [`roadmap.md`](./roadmap.md) | 阶段进度 + 未完成待办 |
 | [`deploy.md`](./deploy.md) | 生产部署、systemd、备份恢复、故障排查 |
+| [`ingestor-dev-guide.md`](./ingestor-dev-guide.md) | Ingestor 插件开发规范（参考 binance-ingestor） |
 | [`migration-guide.md`](./migration-guide.md) | 从旧版 Python duckport 迁移数据 |
 | [`extra-enhancement.md`](./extra-enhancement.md) | 并发模型决策（D1a per-table actor vs D1b 单写者） |
 | [`path-b-retention-plan.md`](./path-b-retention-plan.md) | Parquet 归档透明化改造方案（大数据量路径） |

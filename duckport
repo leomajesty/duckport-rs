@@ -7,7 +7,7 @@
 #   duckport rm      <实例名>            # 删除实例
 #   duckport config  <实例名>            # 编辑实例配置
 #   duckport status                      # 服务总览 + 水位
-#   duckport start   [<实例>|all]        # 启动（默认 all）
+#   duckport start   [<实例>|all]        # 启动（默认 server）
 #   duckport stop    [<实例>|all]        # 停止（默认 all）
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
@@ -102,28 +102,32 @@ cmd_status() {
     [[ -x "$py" && -f "$cfg" ]] || continue
 
     "$py" - "$inst" "$cfg" << 'PYEOF' 2>/dev/null || true
-import sys, os
+import sys, os, pandas as pd
 os.environ.setdefault("INGESTOR_ENV_FILE", sys.argv[2])
-from binance_ingestor.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, DATA_SOURCES
+from binance_ingestor.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, KLINE_INTERVAL
 from binance_ingestor.duckport_client import DuckportClient
 from datetime import datetime, timezone
 
 inst = sys.argv[1]
-sources = list(DATA_SOURCES)
-dc = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)
+dc = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA, interval=KLINE_INTERVAL)
 now = datetime.now(timezone.utc)
-for mkt in sources:
-    dt = dc.read_duck_time(mkt)
-    if dt is None:
-        print(f"  [{inst}] {mkt:<18}: None")
-        continue
-    age = now - dt
-    h, r = divmod(int(age.total_seconds()), 3600)
-    m = r // 60
-    age_str = f"{h}h{m:02d}m" if h else f"{m}m"
-    mark = "\033[0;32m✓\033[0m" if age.total_seconds() < 900 else "\033[1;33m⚠\033[0m"
-    print(f"  [{inst}] {mkt:<18}: {dt.strftime('%Y-%m-%d %H:%M')} UTC  {mark} {age_str} ago")
-dc.close()
+try:
+    wm = dc.read_table(DUCKPORT_SCHEMA, "watermark").to_pandas()
+    for _, row in wm.iterrows():
+        tname = row["table_name"]
+        val = row["duck_time"]
+        if pd.isna(val):
+            print(f"  [{inst}] {tname:<22}: None")
+            continue
+        dt = pd.to_datetime(val).tz_localize(timezone.utc)
+        age = now - dt
+        h, r = divmod(int(age.total_seconds()), 3600)
+        m = r // 60
+        age_str = f"{h}h{m:02d}m" if h else f"{m}m"
+        mark = "\033[0;32m✓\033[0m" if age.total_seconds() < 900 else "\033[1;33m⚠\033[0m"
+        print(f"  [{inst}] {tname:<22}: {dt.strftime('%Y-%m-%d %H:%M')} UTC  {mark} {age_str} ago")
+finally:
+    dc.close()
 PYEOF
   done <<< "$([ -z "$instances" ] && echo "" || echo "$instances")"
   echo ""
@@ -388,8 +392,7 @@ cmd_loadhist() {
       echo -e "  ${GREEN}✓ loadhist 完成${NC}" || \
       echo -e "  ${RED}✗ loadhist 失败${NC}"
 
-    systemctl start "duckport-ingestor@$inst"
-    echo -e "  ${GREEN}✓${NC} duckport-ingestor@$inst 已恢复"
+    echo -e "  ${YELLOW}提示：请手动执行 duckport start $inst 以恢复采集${NC}"
   done <<< "$instances"
 }
 
@@ -419,7 +422,7 @@ ${BOLD}插件管理：${NC}
 
 ${BOLD}服务控制：${NC}
   duckport ${CYAN}status${NC}                        服务总览 + 数据水位
-  duckport ${CYAN}start${NC}   [实例名|all]           启动（默认 all）
+  duckport ${CYAN}start${NC}   [实例名|server|all]    启动（默认 server）
   duckport ${CYAN}stop${NC}    [实例名|all]           停止（默认 all）
   duckport ${CYAN}restart${NC} [实例名|all]           重启（默认 all）
   duckport ${CYAN}logs${NC}    <实例名|server|all>    实时日志
@@ -452,7 +455,7 @@ case "$CMD" in
   rm)       cmd_rm      "${1:-}" ;;
   config)   cmd_config  "${1:-}" ;;
   status)   cmd_status ;;
-  start)    cmd_start   "${1:-all}" ;;
+  start)    cmd_start   "${1:-server}" ;;
   stop)     cmd_stop    "${1:-all}" ;;
   restart)  cmd_restart "${1:-all}" ;;
   logs)     cmd_logs    "${1:-}" ;;

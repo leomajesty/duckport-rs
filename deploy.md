@@ -114,8 +114,11 @@ duckport list
 # 安装数据插件（交互式填写配置）
 duckport install binance_ingestor
 
-# 启动服务
+# 启动 duckport-server
 duckport start
+
+# 启动所有服务（server + 所有 ingestor）
+duckport start all
 
 # 查看状态
 duckport status
@@ -386,7 +389,8 @@ duckport loadhist binance-5m
 sudo systemctl stop duckport-ingestor@binance-5m
 INGESTOR_ENV_FILE=/opt/duckport/ingestors/binance-5m/config.env \
   /opt/duckport/ingestors/binance-5m/.venv/bin/loadhist
-sudo systemctl start duckport-ingestor@binance-5m
+# loadhist 完成后确认数据无误，再手动启动
+duckport start binance-5m
 ```
 
 ### 9.3 执行流程
@@ -409,7 +413,8 @@ sudo systemctl start duckport-ingestor@binance-5m
 
 ```bash
 duckport status                  # 服务总览 + 各实例数据水位
-duckport start                   # 启动所有（server 优先，pause 2s 后启动 ingestors）
+duckport start                   # 启动 duckport-server
+duckport start all               # 启动所有（server 优先，pause 2s 后启动 ingestors）
 duckport stop                    # 停止所有（先停 ingestors，再停 server）
 duckport restart                 # 重启所有
 duckport start binance-5m        # 启动单个实例

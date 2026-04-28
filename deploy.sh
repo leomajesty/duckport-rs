@@ -79,8 +79,7 @@ if [[ "$MODE" == "loadhist" ]]; then
     INGESTOR_ENV_FILE="$cfg" "$inst_dir/.venv/bin/loadhist" && \
       ok "loadhist 完成" || { info "loadhist 失败"; }
 
-    systemctl start "duckport-ingestor@$inst"
-    ok "duckport-ingestor@$inst 已恢复"
+    info "提示：请手动执行 duckport start $inst 以恢复采集"
   }
 
   if [[ -n "$LOADHIST_INSTANCE" ]]; then
