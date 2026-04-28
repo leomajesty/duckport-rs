@@ -606,15 +606,17 @@ duckport start
 ### 13.3 更新 Ingestor 插件
 
 ```bash
-# 如果插件以本地 checkout 安装（editable 模式）
-cd /path/to/duckport-binance-ingestor && git pull
-duckport restart binance-5m
+duckport update binance-5m
+```
 
-# 如果从 git URL 安装，重新安装以获取最新版
-duckport stop binance-5m
-uv pip install --reinstall "git+https://github.com/leomajesty/duckport-binance-ingestor" \
-  --python /opt/duckport/ingestors/binance-5m/.venv/bin/python3
-duckport start binance-5m
+`duckport update` 自动判断安装模式：
+- **本地 checkout**（同级目录存在 `duckport-binance-ingestor/`）：执行 `git pull` 后重新 editable 安装
+- **GitHub 模式**（从 registry 中的 repo URL 安装）：执行 `uv pip install --reinstall git+<url>`
+
+安装完成后不会自动重启，确认更新无误后手动执行：
+
+```bash
+duckport restart binance-5m
 ```
 
 > **注意**：DuckDB 版本已锁定为 1.5.1（Rust crate `=1.10501.0`，Python `duckdb==1.5.1`）。升级 DuckDB 版本需同步更新 `Cargo.toml` 并重新编译，且需评估数据库文件兼容性。

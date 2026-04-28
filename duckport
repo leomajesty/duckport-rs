@@ -11,6 +11,7 @@
 #   duckport stop    [<实例>|all]        # 停止（默认 all）
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
+#   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist [<实例>]           # 补历史数据
 #   duckport upgrade                     # 更新环境
 
@@ -396,6 +397,71 @@ cmd_loadhist() {
   done <<< "$instances"
 }
 
+# ─── update（更新插件）────────────────────────────────────────────────────────
+
+cmd_update() {
+  _require_root
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "用法: duckport update <实例名>"; exit 1; }
+  name="${name//_/-}"
+
+  local inst_dir="$INGESTORS_DIR/$name"
+  local cfg="$inst_dir/config.env"
+  [[ -d "$inst_dir" ]] || { echo -e "${RED}实例 '$name' 不存在${NC}"; exit 1; }
+
+  local inst_py="$inst_dir/.venv/bin/python3"
+  [[ -x "$inst_py" ]] || { echo -e "${RED}实例 '$name' 的 venv 不完整，请重新执行 duckport install${NC}"; exit 1; }
+
+  # 通过 INGESTOR_EXEC 反查 registry 中的插件名和 repo URL
+  local exec_cmd
+  exec_cmd=$(grep '^INGESTOR_EXEC=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
+
+  local plugin_name repo
+  local reg
+  reg=$(_registry_file)
+  if [[ -f "$reg" ]]; then
+    plugin_name=$(python3 -c "
+import json
+try:
+    d = json.load(open('$reg'))
+    for k, v in d.items():
+        if v.get('exec','') == '$exec_cmd':
+            print(k); break
+except: pass
+" 2>/dev/null)
+    repo=$(python3 -c "
+import json
+try:
+    d = json.load(open('$reg'))
+    for v in d.values():
+        if v.get('exec','') == '$exec_cmd':
+            print(v.get('repo','')); break
+except: pass
+" 2>/dev/null)
+  fi
+
+  export PATH="$HOME/.local/bin:$PATH"
+  echo -e "\n${BOLD}更新实例：$name${NC}  (exec=$exec_cmd)"
+
+  local local_src
+  local_src="$(dirname "$REPO_DIR")/duckport-${plugin_name:-$exec_cmd}"
+
+  if [[ -f "$local_src/pyproject.toml" ]]; then
+    echo -e "  ${CYAN}本地源码模式：$local_src${NC}"
+    git -C "$local_src" pull --ff-only
+    uv pip install -e "$local_src" --python "$inst_py" -q
+  elif [[ -n "$repo" ]]; then
+    echo -e "  ${CYAN}GitHub 模式：$repo${NC}"
+    uv pip install --reinstall "git+${repo}" --python "$inst_py" -q
+  else
+    echo -e "${RED}无法确定插件来源（registry 中未找到 exec=$exec_cmd）${NC}"
+    exit 1
+  fi
+
+  echo -e "  ${GREEN}✓${NC} 插件已更新"
+  echo -e "  ${YELLOW}提示：请手动执行 duckport restart $name 以使新版本生效${NC}"
+}
+
 # ─── upgrade ──────────────────────────────────────────────────────────────────
 
 cmd_upgrade() {
@@ -418,6 +484,7 @@ ${BOLD}插件管理：${NC}
   duckport ${CYAN}list${NC}                           列出 registry 中的可用插件
   duckport ${CYAN}install${NC} <插件名>               从 registry 安装插件（交互式）
   duckport ${CYAN}rm${NC}      <实例名>               删除实例
+  duckport ${CYAN}update${NC}  <实例名>               更新插件并重启实例
   duckport ${CYAN}config${NC}  <实例名>               编辑实例配置文件
 
 ${BOLD}服务控制：${NC}
@@ -453,6 +520,7 @@ case "$CMD" in
   list)     cmd_list ;;
   install)  cmd_install "${1:-}" ;;
   rm)       cmd_rm      "${1:-}" ;;
+  update)   cmd_update  "${1:-}" ;;
   config)   cmd_config  "${1:-}" ;;
   status)   cmd_status ;;
   start)    cmd_start   "${1:-server}" ;;
