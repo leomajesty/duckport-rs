@@ -91,8 +91,12 @@ cmd_status() {
   fi
 
   echo -e "\n${BOLD}数据水位${NC}"
-  if ! nc -z localhost 50051 2>/dev/null; then
-    echo -e "  ${DIM}duckport-server 未监听 :50051${NC}\n"
+  local server_port
+  server_port=$(grep '^DUCKPORT_LISTEN_ADDR=' "$DEPLOY_OPT/server.env" 2>/dev/null \
+    | cut -d: -f2 | tr -d '"' | tr -d "'" | xargs)
+  server_port="${server_port:-50051}"
+  if ! nc -z localhost "$server_port" 2>/dev/null; then
+    echo -e "  ${DIM}duckport-server 未监听 :${server_port}${NC}\n"
     return
   fi
 
@@ -138,17 +142,17 @@ PYEOF
 
 cmd_start() {
   _require_root
-  local arg="${1:-all}"
-  local instances
-  instances=$(_resolve_instances "$arg")
+  local arg="${1:-server}"
 
-  # server 优先
   if [[ "$arg" == "all" ]] || [[ "$arg" == "server" ]]; then
     systemctl start duckport-server
     echo -e "  ${GREEN}✓${NC} duckport-server started"
+    [[ "$arg" == "server" ]] && return
     sleep 2
   fi
 
+  local instances
+  instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
     systemctl start "duckport-ingestor@$inst"
@@ -159,17 +163,22 @@ cmd_start() {
 cmd_stop() {
   _require_root
   local arg="${1:-all}"
+
+  if [[ "$arg" == "server" ]]; then
+    systemctl stop duckport-server 2>/dev/null || true
+    echo -e "  ${DIM}○${NC} duckport-server stopped"
+    return
+  fi
+
   local instances
   instances=$(_resolve_instances "$arg")
-
-  # 先停 ingestor
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
     systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
     echo -e "  ${DIM}○${NC} duckport-ingestor@$inst stopped"
   done <<< "$instances"
 
-  if [[ "$arg" == "all" ]] || [[ "$arg" == "server" ]]; then
+  if [[ "$arg" == "all" ]]; then
     systemctl stop duckport-server 2>/dev/null || true
     echo -e "  ${DIM}○${NC} duckport-server stopped"
   fi
