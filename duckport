@@ -17,11 +17,27 @@
 
 set -euo pipefail
 
-DEPLOY_OPT="/opt/duckport"
+# ─── 平台检测 ─────────────────────────────────────────────────────────────────
+
+OS=$(uname -s)    # Linux | Darwin
+
+# macOS 用用户路径（无需 sudo），Linux 用系统路径
+if [[ "$OS" == "Darwin" ]]; then
+  DEPLOY_OPT="$HOME/.duckport"
+  PLIST_DIR="$HOME/Library/LaunchAgents"
+  LOG_DIR="$HOME/.duckport/logs"
+  _DEFAULT_REPO="$HOME/code/duckport-rs"
+else
+  DEPLOY_OPT="/opt/duckport"
+  PLIST_DIR=""   # Linux 用 systemd，不需要
+  LOG_DIR="/opt/duckport/logs"
+  _DEFAULT_REPO="/w/code/duckport-rs"
+fi
+
 DEPLOY_BIN="$DEPLOY_OPT/bin"
 INGESTORS_DIR="$DEPLOY_OPT/ingestors"
-# 从 deploy.sh 写入的持久化路径读取，回退到默认值
-REPO_DIR="$(cat "$DEPLOY_OPT/repo_dir" 2>/dev/null || echo "/w/code/duckport-rs")"
+# 从 deploy.sh 写入的持久化路径读取，回退到平台默认值
+REPO_DIR="$(cat "$DEPLOY_OPT/repo_dir" 2>/dev/null || echo "$_DEFAULT_REPO")"
 
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; RED='\033[0;31m'; DIM='\033[2m'; NC='\033[0m'
@@ -29,12 +45,77 @@ CYAN='\033[0;36m'; RED='\033[0;31m'; DIM='\033[2m'; NC='\033[0m'
 # ─── 工具 ──────────────────────────────────────────────────────────────────────
 
 _require_root() {
+  # macOS 用户路径模式：所有操作在当前用户权限下即可完成
+  [[ "$OS" == "Darwin" ]] && return
   [[ $EUID -eq 0 ]] || { echo -e "${RED}需要 root 权限，请用 sudo${NC}"; exit 1; }
+}
+
+# uv pip install 封装：清除 shell 代理（代理是给 ingestor 运行时用的，不用于包安装），
+# 并支持 UV_INDEX_URL 环境变量指定 PyPI 镜像（如清华 https://pypi.tuna.tsinghua.edu.cn/simple/）
+_uv_install() {
+  HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" \
+    uv pip install "$@"
+}
+
+# 将服务逻辑名转为 launchd label
+_svc_label() {
+  case "$1" in
+    duckport-server)     echo "com.duckport.server" ;;
+    duckport-ingestor@*) echo "com.duckport.ingestor.${1#duckport-ingestor@}" ;;
+    *)                   echo "com.duckport.$1" ;;
+  esac
+}
+
+# 查询服务是否 active，输出 "active" | "inactive"
+_svc_is_active() {
+  local svc="$1"
+  if [[ "$OS" == "Linux" ]]; then
+    systemctl is-active "$svc" 2>/dev/null || echo "inactive"
+  else
+    local label; label=$(_svc_label "$svc")
+    # launchctl list <label> 有 "PID" 字段即为运行中
+    if launchctl list "$label" 2>/dev/null | grep -q '"PID"'; then
+      echo "active"
+    else
+      echo "inactive"
+    fi
+  fi
+}
+
+# 启动服务（macOS 用 bootstrap/kickstart 代替已废弃的 load）
+_svc_start() {
+  local svc="$1"
+  if [[ "$OS" == "Linux" ]]; then
+    systemctl start "$svc"
+  else
+    local label; label=$(_svc_label "$svc")
+    local plist="$PLIST_DIR/${label}.plist"
+    [[ -f "$plist" ]] || { echo -e "${RED}找不到 plist：$plist${NC}"; return 1; }
+    local domain="gui/$(id -u)"
+    # 若 plist 尚未注册，先 bootstrap（RunAtLoad=false 不会自动启动）
+    if ! launchctl list "$label" &>/dev/null; then
+      launchctl bootstrap "$domain" "$plist"
+    fi
+    # bootstrap 后或已注册时，kickstart 真正拉起进程
+    launchctl kickstart "$domain/$label"
+  fi
+}
+
+# 停止服务（macOS 用 bootout 代替已废弃的 unload）
+_svc_stop() {
+  local svc="$1"
+  if [[ "$OS" == "Linux" ]]; then
+    systemctl stop "$svc" 2>/dev/null || true
+  else
+    local label; label=$(_svc_label "$svc")
+    local domain="gui/$(id -u)"
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+  fi
 }
 
 _svc_status_label() {
   local state
-  state=$(systemctl is-active "duckport-ingestor@$1" 2>/dev/null || echo "inactive")
+  state=$(_svc_is_active "duckport-ingestor@$1")
   case "$state" in
     active)   echo -e "${GREEN}● active${NC}" ;;
     inactive) echo -e "${DIM}○ inactive${NC}" ;;
@@ -71,10 +152,14 @@ _resolve_instances() {
 
 cmd_status() {
   echo -e "\n${BOLD}duckport-server${NC}"
-  local sv_state
-  sv_state=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
-  printf "  %-22s %s\n" "duckport-server" \
-    "$(case $sv_state in active) echo -e "${GREEN}● active${NC}";; *) echo -e "${DIM}○ $sv_state${NC}";; esac)"
+  local sv_state sv_label
+  sv_state=$(_svc_is_active "duckport-server")
+  if [[ "$sv_state" == "active" ]]; then
+    sv_label="${GREEN}● active${NC}"
+  else
+    sv_label="${DIM}○ ${sv_state}${NC}"
+  fi
+  printf "  %-22s " "duckport-server"; echo -e "$sv_label"
 
   echo -e "\n${BOLD}Ingestors${NC}"
   local instances
@@ -107,10 +192,12 @@ cmd_status() {
     [[ -x "$py" && -f "$cfg" ]] || continue
 
     "$py" - "$inst" "$cfg" << 'PYEOF' 2>/dev/null || true
-import sys, os, pandas as pd
+import sys, os, pandas as pd, logging
 os.environ.setdefault("INGESTOR_ENV_FILE", sys.argv[2])
 from binance_ingestor.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, KLINE_INTERVAL
 from binance_ingestor.duckport_client import DuckportClient
+for _h in logging.getLogger('binance_ingestor').handlers:
+    _h.stream = sys.stderr
 from datetime import datetime, timezone
 
 inst = sys.argv[1]
@@ -145,7 +232,7 @@ cmd_start() {
   local arg="${1:-server}"
 
   if [[ "$arg" == "all" ]] || [[ "$arg" == "server" ]]; then
-    systemctl start duckport-server
+    _svc_start "duckport-server"
     echo -e "  ${GREEN}✓${NC} duckport-server started"
     [[ "$arg" == "server" ]] && return
     sleep 2
@@ -155,7 +242,7 @@ cmd_start() {
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
-    systemctl start "duckport-ingestor@$inst"
+    _svc_start "duckport-ingestor@$inst"
     echo -e "  ${GREEN}✓${NC} duckport-ingestor@$inst started"
   done <<< "$instances"
 }
@@ -165,7 +252,7 @@ cmd_stop() {
   local arg="${1:-all}"
 
   if [[ "$arg" == "server" ]]; then
-    systemctl stop duckport-server 2>/dev/null || true
+    _svc_stop "duckport-server"
     echo -e "  ${DIM}○${NC} duckport-server stopped"
     return
   fi
@@ -174,12 +261,12 @@ cmd_stop() {
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
-    systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
+    _svc_stop "duckport-ingestor@$inst"
     echo -e "  ${DIM}○${NC} duckport-ingestor@$inst stopped"
   done <<< "$instances"
 
   if [[ "$arg" == "all" ]]; then
-    systemctl stop duckport-server 2>/dev/null || true
+    _svc_stop "duckport-server"
     echo -e "  ${DIM}○${NC} duckport-server stopped"
   fi
 }
@@ -199,18 +286,48 @@ cmd_logs() {
   if [[ -z "$target" ]]; then
     echo "用法: duckport logs <实例名>|server|all"; exit 1
   fi
-  case "$target" in
-    server)
-      exec journalctl -u duckport-server -f --no-hostname -o short-iso ;;
-    all)
-      local units=("-u" "duckport-server")
-      while IFS= read -r inst; do
-        [[ -n "$inst" ]] && units+=("-u" "duckport-ingestor@$inst")
-      done <<< "$(_list_instances)"
-      exec journalctl "${units[@]}" -f --no-hostname -o short-iso ;;
-    *)
-      exec journalctl -u "duckport-ingestor@$target" -f --no-hostname -o short-iso ;;
-  esac
+
+  if [[ "$OS" == "Linux" ]]; then
+    case "$target" in
+      server)
+        exec journalctl -u duckport-server -f --no-hostname -o short-iso ;;
+      all)
+        local units=("-u" "duckport-server")
+        while IFS= read -r inst; do
+          [[ -n "$inst" ]] && units+=("-u" "duckport-ingestor@$inst")
+        done <<< "$(_list_instances)"
+        exec journalctl "${units[@]}" -f --no-hostname -o short-iso ;;
+      *)
+        exec journalctl -u "duckport-ingestor@$target" -f --no-hostname -o short-iso ;;
+    esac
+  else
+    # macOS：launchd 将 stdout/stderr 重定向到 LOG_DIR 下的文件
+    case "$target" in
+      server)
+        exec tail -f "$LOG_DIR/server.log" "$LOG_DIR/server.err" ;;
+      all)
+        # 收集所有日志文件（server + 所有已注册实例）
+        local log_files=("$LOG_DIR/server.log" "$LOG_DIR/server.err")
+        while IFS= read -r inst; do
+          [[ -n "$inst" ]] || continue
+          [[ -f "$LOG_DIR/$inst.log" ]] && log_files+=("$LOG_DIR/$inst.log")
+          [[ -f "$LOG_DIR/$inst.err" ]] && log_files+=("$LOG_DIR/$inst.err")
+        done <<< "$(_list_instances)"
+        exec tail -f "${log_files[@]}" ;;
+      *)
+        local lf="$LOG_DIR/$target.log"
+        local ef="$LOG_DIR/$target.err"
+        if [[ ! -f "$lf" && ! -f "$ef" ]]; then
+          echo -e "${RED}找不到日志文件：$lf${NC}"
+          echo "提示：服务必须已被启动过才会生成日志文件"
+          exit 1
+        fi
+        local args=()
+        [[ -f "$lf" ]] && args+=("$lf")
+        [[ -f "$ef" ]] && args+=("$ef")
+        exec tail -f "${args[@]}" ;;
+    esac
+  fi
 }
 
 # ─── list（registry 插件列表）────────────────────────────────────────────────
@@ -311,7 +428,7 @@ EOF
   export PATH="$HOME/.local/bin:$PATH"
   local python_bin python_ver
   python_bin=$(command -v python3.12 2>/dev/null || command -v python3)
-  python_ver=$("$python_bin" --version | grep -oP '\d+\.\d+')
+  python_ver=$("$python_bin" --version | grep -oE '[0-9]+\.[0-9]+'  | head -1)
   uv venv --python "$python_ver" "$inst_dir/.venv" -q
 
   local inst_py="$inst_dir/.venv/bin/python3"
@@ -320,13 +437,50 @@ EOF
   local_src="$(dirname "$REPO_DIR")/duckport-${plugin}"
   if [[ -f "$local_src/pyproject.toml" ]]; then
     echo -e "  使用本地源码：$local_src"
-    uv pip install -e "$local_src" --python "$inst_py" -q
+    _uv_install -e "$local_src" --python "$inst_py"
   else
-    uv pip install "git+${repo}" --python "$inst_py" -q
+    _uv_install "git+${repo}" --python "$inst_py"
   fi
 
-  systemctl daemon-reload
-  systemctl enable "duckport-ingestor@$INST_NAME" 2>/dev/null || true
+  if [[ "$OS" == "Linux" ]]; then
+    systemctl daemon-reload
+    systemctl enable "duckport-ingestor@$INST_NAME" 2>/dev/null || true
+  else
+    # macOS：launchd 无模板 unit，为每个实例生成独立 plist
+    local label="com.duckport.ingestor.$INST_NAME"
+    cat > "$PLIST_DIR/${label}.plist" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${DEPLOY_BIN}/ingestor-run</string>
+    <string>${INST_NAME}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/${INST_NAME}.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/${INST_NAME}.err</string>
+  <key>WorkingDirectory</key>
+  <string>${INGESTORS_DIR}/${INST_NAME}</string>
+</dict>
+</plist>
+PLISTEOF
+    echo -e "  ${GREEN}✓${NC} plist 已创建：$PLIST_DIR/${label}.plist"
+  fi
 
   echo -e "\n  ${GREEN}✓${NC} 实例 '${INST_NAME}' 安装完成"
   echo -e "  配置文件：$cfg"
@@ -366,8 +520,12 @@ cmd_rm() {
   read -rp "确认删除实例 '$name'？[y/N] " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
 
-  systemctl stop    "duckport-ingestor@$name" 2>/dev/null || true
-  systemctl disable "duckport-ingestor@$name" 2>/dev/null || true
+  _svc_stop "duckport-ingestor@$name"
+  if [[ "$OS" == "Linux" ]]; then
+    systemctl disable "duckport-ingestor@$name" 2>/dev/null || true
+  else
+    rm -f "$PLIST_DIR/com.duckport.ingestor.${name}.plist"
+  fi
   rm -rf "$inst_dir"
   echo -e "  ${GREEN}✓${NC} 实例 '$name' 已删除"
 }
@@ -395,7 +553,7 @@ cmd_loadhist() {
 
     echo -e "\n${BOLD}▶ loadhist — $inst${NC}"
     echo -e "  ${YELLOW}⚠ 停止 ingestor 以独占 staging 表${NC}"
-    systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
+    _svc_stop "duckport-ingestor@$inst"
 
     INGESTOR_ENV_FILE="$cfg" \
       "$INGESTORS_DIR/$inst/.venv/bin/loadhist" && \
@@ -458,10 +616,10 @@ except: pass
   if [[ -f "$local_src/pyproject.toml" ]]; then
     echo -e "  ${CYAN}本地源码模式：$local_src${NC}"
     git -C "$local_src" pull --ff-only
-    uv pip install -e "$local_src" --python "$inst_py" -q
+    _uv_install -e "$local_src" --python "$inst_py"
   elif [[ -n "$repo" ]]; then
     echo -e "  ${CYAN}GitHub 模式：$repo${NC}"
-    uv pip install --reinstall "git+${repo}" --python "$inst_py" -q
+    _uv_install --reinstall "git+${repo}" --python "$inst_py"
   else
     echo -e "${RED}无法确定插件来源（registry 中未找到 exec=$exec_cmd）${NC}"
     exit 1

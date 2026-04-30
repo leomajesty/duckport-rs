@@ -9,8 +9,17 @@ permissions:
   contents: write
 
 jobs:
-  build-linux-x86_64:
-    runs-on: ubuntu-22.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: duckport-server-linux-x86_64
+          - os: macos-14
+            artifact: duckport-server-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,16 +33,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
         run: cargo build --release --bin duckport-server
 
       - name: Rename binary
-        run: cp target/release/duckport-server duckport-server-linux-x86_64
+        run: cp target/release/duckport-server ${{ matrix.artifact }}
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: duckport-server-linux-x86_64
+          files: ${{ matrix.artifact }}
           generate_release_notes: true

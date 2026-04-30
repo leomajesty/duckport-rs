@@ -15,15 +15,30 @@
 
 set -euo pipefail
 
+# ─── 平台检测 ─────────────────────────────────────────────────────────────────
+
+OS=$(uname -s)    # Linux | Darwin
+ARCH=$(uname -m)  # x86_64 | arm64
+
 # ─── 默认配置 ─────────────────────────────────────────────────────────────────
 
 GITHUB_REPO="${GITHUB_REPO:-leomajesty/duckport-rs}"
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 
-DEPLOY_BIN="/opt/duckport/bin"
-DEPLOY_OPT="/opt/duckport"
-DEPLOY_DATA="/data/duckport"
-INGESTORS_DIR="/opt/duckport/ingestors"
+# macOS 用用户路径（无需 sudo），Linux 用系统路径
+if [[ "$OS" == "Darwin" ]]; then
+  DEPLOY_OPT="${DEPLOY_OPT:-$HOME/.duckport}"
+  DEPLOY_DATA="${DEPLOY_DATA:-$HOME/data/duckport}"
+  PLIST_DIR="$HOME/Library/LaunchAgents"
+else
+  DEPLOY_OPT="${DEPLOY_OPT:-/opt/duckport}"
+  DEPLOY_DATA="${DEPLOY_DATA:-/data/duckport}"
+  PLIST_DIR=""  # Linux 用 systemd，无需此变量
+fi
+
+DEPLOY_BIN="$DEPLOY_OPT/bin"
+INGESTORS_DIR="$DEPLOY_OPT/ingestors"
+LOG_DIR="$DEPLOY_OPT/logs"
 
 DB_PATH="${DB_PATH:-${DEPLOY_DATA}/duckport.db}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:50051}"
@@ -53,7 +68,13 @@ ok()    { echo -e "  ${GREEN}✓ $*${NC}"; }
 skip()  { echo -e "  ${CYAN}– $*${NC}"; }
 fail()  { echo -e "  ${RED}✗ $*${NC}"; exit 1; }
 
-md5_of() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+md5_of() {
+  if [[ "$OS" == "Darwin" ]]; then
+    md5 -q "$1" 2>/dev/null
+  else
+    md5sum "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}
 
 # ─── 确定仓库根目录 ───────────────────────────────────────────────────────────
 
@@ -74,7 +95,11 @@ if [[ "$MODE" == "loadhist" ]]; then
     [[ -x "$py" && -f "$cfg" ]] || { info "实例 $inst 环境不完整，跳过"; return; }
 
     info "⚠ 停止 duckport-ingestor@$inst 以独占 staging 表"
-    systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
+    if [[ "$OS" == "Linux" ]]; then
+      systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
+    else
+      launchctl unload "$PLIST_DIR/com.duckport.ingestor.${inst}.plist" 2>/dev/null || true
+    fi
 
     INGESTOR_ENV_FILE="$cfg" "$inst_dir/.venv/bin/loadhist" && \
       ok "loadhist 完成" || { info "loadhist 失败"; }
@@ -102,7 +127,15 @@ info "GitHub 仓库：$GITHUB_REPO  tag：$RELEASE_TAG"
 # ─── 辅助：获取 Release binary URL ───────────────────────────────────────────
 
 _get_binary_url() {
-  local api_url
+  local api_url asset_name
+  if [[ "$OS" == "Darwin" ]]; then
+    # uname -m 在 Apple Silicon 返回 arm64，release 产物命名用 aarch64
+    local norm_arch
+    norm_arch="$([[ "$ARCH" == "arm64" ]] && echo "aarch64" || echo "$ARCH")"
+    asset_name="duckport-server-macos-${norm_arch}"
+  else
+    asset_name="duckport-server-linux-${ARCH}"
+  fi
   if [[ "$RELEASE_TAG" == "latest" ]]; then
     api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
   else
@@ -112,29 +145,32 @@ _get_binary_url() {
     ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
     "$api_url" 2>/dev/null \
     | grep '"browser_download_url"' \
-    | grep 'duckport-server-linux-x86_64' \
+    | grep "${asset_name}" \
     | cut -d'"' -f4
 }
 
 # ─── 辅助：本机编译回落 ───────────────────────────────────────────────────────
 
 _build_from_source() {
-  info "回落：在本机编译（首次含 DuckDB bundled，约需 2-5 分钟）..."
+  # 所有诊断输出走 stderr，只有最终路径走 stdout（供调用方 $(...) 捕获）
+  info "回落：在本机编译（首次含 DuckDB bundled，约需 2-5 分钟）..." >&2
   export PATH="$HOME/.cargo/bin:$PATH"
   if ! command -v cargo &>/dev/null; then
-    info "安装 Rust..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    info "安装 Rust..." >&2
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable >&2
     export PATH="$HOME/.cargo/bin:$PATH"
   fi
-  ok "Rust: $(rustc --version)"
-  cargo build --release --bin duckport-server --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
-  echo "$REPO_DIR/target/release/duckport-server"
+  ok "Rust: $(rustc --version)" >&2
+  cargo build --release --bin duckport-server --manifest-path "$REPO_DIR/Cargo.toml" >&2
+  local bin="$REPO_DIR/target/release/duckport-server"
+  [[ -f "$bin" ]] || { fail "编译完成但找不到产物：$bin" >&2; exit 1; }
+  echo "$bin"
 }
 
 # ─── Step 1：目录结构 ─────────────────────────────────────────────────────────
 
 step "创建目录结构"
-mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INGESTORS_DIR"
+mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INGESTORS_DIR" "$DEPLOY_OPT/logs"
 ok "目录就绪"
 
 # ─── Step 2：获取 binary（MD5 比对决定是否替换）──────────────────────────────
@@ -212,12 +248,36 @@ else
   ok "uv 已安装：$(uv --version)"
 fi
 
-# ─── Step 5：注册 systemd unit（不启动）──────────────────────────────────────
+# ─── Step 5：注册服务（systemd on Linux，launchd on macOS）────────────────────
 
-step "注册 systemd unit 文件"
+step "注册服务"
 
-# duckport-server.service（固定）
-cat > /etc/systemd/system/duckport-server.service << 'SVCEOF'
+# 通用 ingestor 启动器（两个平台共用）
+# 使用非引号 heredoc：$INGESTORS_DIR 在写入时展开，运行时变量用 \$ 转义
+cat > "$DEPLOY_BIN/ingestor-run" << RUNEOF
+#!/usr/bin/env bash
+# 通用 ingestor 启动器（由 systemd/launchd 调用）
+INSTANCE="\${1:?实例名不能为空}"
+INST_DIR="${INGESTORS_DIR}/\$INSTANCE"
+CFG="\$INST_DIR/config.env"
+
+[[ -f "\$CFG" ]] || { echo "找不到配置：\$CFG"; exit 1; }
+
+EXEC_CMD=\$(grep '^INGESTOR_EXEC=' "\$CFG" | cut -d= -f2 | tr -d '"' || echo "binance-ingestor")
+EXEC_BIN="\$INST_DIR/.venv/bin/\$EXEC_CMD"
+
+[[ -x "\$EXEC_BIN" ]] || { echo "找不到可执行文件：\$EXEC_BIN"; exit 1; }
+
+export INGESTOR_ENV_FILE="\$CFG"
+exec "\$EXEC_BIN"
+RUNEOF
+chmod +x "$DEPLOY_BIN/ingestor-run"
+
+if [[ "$OS" == "Linux" ]]; then
+  # ── Linux：systemd unit ──────────────────────────────────────────────────────
+
+  # duckport-server.service（固定）
+  cat > /etc/systemd/system/duckport-server.service << 'SVCEOF'
 [Unit]
 Description=duckport-rs gRPC Database Service
 After=network-online.target
@@ -238,8 +298,8 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SVCEOF
 
-# duckport-ingestor@.service（template，%i = 实例名）
-cat > /etc/systemd/system/duckport-ingestor@.service << 'SVCEOF'
+  # duckport-ingestor@.service（template，%i = 实例名）
+  cat > /etc/systemd/system/duckport-ingestor@.service << 'SVCEOF'
 [Unit]
 Description=duckport Ingestor (%i)
 After=duckport-server.service
@@ -261,43 +321,92 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SVCEOF
 
-# 通用启动器：读取实例 config.env 中的 INGESTOR_EXEC
-cat > "$DEPLOY_BIN/ingestor-run" << 'RUNEOF'
+  systemctl daemon-reload
+  systemctl enable duckport-server 2>/dev/null || true
+  ok "duckport-server.service 已注册并 enable"
+  ok "duckport-ingestor@.service (template) 已注册"
+
+else
+  # ── macOS：launchd plist（PLIST_DIR 已在默认配置块中按平台设置）────────────
+
+  mkdir -p "$PLIST_DIR"
+
+  # server-run wrapper：launchd 不支持 EnvironmentFile，由此脚本 source 后 exec
+  # 非引号 heredoc：$DEPLOY_OPT/$DEPLOY_BIN 在写入时展开
+  cat > "$DEPLOY_BIN/server-run" << RUNEOF
 #!/usr/bin/env bash
-# 通用 ingestor 启动器（由 duckport-ingestor@.service 调用）
-INSTANCE="${1:?实例名不能为空}"
-INST_DIR="/opt/duckport/ingestors/$INSTANCE"
-CFG="$INST_DIR/config.env"
-
-[[ -f "$CFG" ]] || { echo "找不到配置：$CFG"; exit 1; }
-
-EXEC_CMD=$(grep '^INGESTOR_EXEC=' "$CFG" | cut -d= -f2 | tr -d '"' || echo "binance-ingestor")
-EXEC_BIN="$INST_DIR/.venv/bin/$EXEC_CMD"
-
-[[ -x "$EXEC_BIN" ]] || { echo "找不到可执行文件：$EXEC_BIN"; exit 1; }
-
-export INGESTOR_ENV_FILE="$CFG"
-exec "$EXEC_BIN"
+set -a
+source ${DEPLOY_OPT}/server.env
+set +a
+exec ${DEPLOY_BIN}/duckport-server
 RUNEOF
-chmod +x "$DEPLOY_BIN/ingestor-run"
+  chmod +x "$DEPLOY_BIN/server-run"
+  ok "server-run wrapper 已写入 $DEPLOY_BIN/server-run"
 
-systemctl daemon-reload
-systemctl enable duckport-server 2>/dev/null || true
-ok "duckport-server.service 已注册并 enable"
-ok "duckport-ingestor@.service (template) 已注册"
+  # com.duckport.server.plist（RunAtLoad=false，由 duckport start 触发）
+  cat > "$PLIST_DIR/com.duckport.server.plist" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.duckport.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${DEPLOY_BIN}/server-run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/server.err</string>
+  <key>WorkingDirectory</key>
+  <string>${DEPLOY_OPT}</string>
+</dict>
+</plist>
+PLISTEOF
+  ok "com.duckport.server.plist 已写入 $PLIST_DIR"
+  ok "（ingestor plist 将在 duckport install 时按实例生成）"
+fi
 
 # ─── Step 6：注册 duckport CLI ────────────────────────────────────────────────
 
 step "注册 duckport 命令行工具"
 # 将仓库路径持久化，供 duckport CLI 读取（upgrade / ingestor add 需要）
 echo "$REPO_DIR" > "$DEPLOY_OPT/repo_dir"
-install -m 755 "$REPO_DIR/duckport" /usr/local/bin/duckport
-ok "已安装：/usr/local/bin/duckport"
+if [[ "$OS" == "Darwin" ]]; then
+  CLI_DIR="$HOME/.local/bin"
+  mkdir -p "$CLI_DIR"
+  install -m 755 "$REPO_DIR/duckport" "$CLI_DIR/duckport"
+  ok "已安装：$CLI_DIR/duckport"
+  if [[ ":$PATH:" != *":$CLI_DIR:"* ]]; then
+    info "提示：请确保 $CLI_DIR 在 PATH 中（可加入 ~/.zshrc）："
+    info "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+else
+  mkdir -p /usr/local/bin
+  install -m 755 "$REPO_DIR/duckport" /usr/local/bin/duckport
+  ok "已安装：/usr/local/bin/duckport"
+fi
 ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
 
 # ─── 完成摘要 ─────────────────────────────────────────────────────────────────
 
-SV_ACTIVE=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
+if [[ "$OS" == "Linux" ]]; then
+  SV_ACTIVE=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
+else
+  SV_ACTIVE=$(launchctl list 2>/dev/null | awk '$3=="com.duckport.server" {print ($1=="-")?"inactive":"active"}' || echo "inactive")
+  SV_ACTIVE="${SV_ACTIVE:-inactive}"
+fi
 
 echo ""
 echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
