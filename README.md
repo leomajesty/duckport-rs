@@ -1,5 +1,7 @@
 # duckport-rs
 
+中文 | [English](README.en.md)
+
 把 DuckDB 包装成一个 **gRPC 数据库服务**，通过 Arrow Flight 协议提供多进程读写能力。
 
 - **读平面**：通过 [`airport-rs`](./crates/airport/README.md) 实现 Airport 协议，DuckDB 客户端可直接 `ATTACH 'grpc://...' AS dp (TYPE AIRPORT)` 并执行任意 SELECT。
@@ -231,7 +233,7 @@ pytest test_phase1_airport_read.py test_phase2a_write_plane.py test_phase2b_appe
 |------|------|------|
 | `DUCKPORT_DB_PATH` | `./duckport.db` | DuckDB 文件路径；`:memory:` 为内存库 |
 | `DUCKPORT_LISTEN_ADDR` | `0.0.0.0:50051` | Flight/gRPC 监听地址 |
-| `DUCKPORT_ADVERTISED_ADDR` | 空 | 对外广播地址（用于构建 FlightEndpoint URI）；`LISTEN_ADDR` 为 `0.0.0.0` 时自动置空，客户端复用当前连接，无需手动设置；仅在需要指定具体对外 IP 时填写 |
+| `DUCKPORT_ADVERTISED_ADDR` | 空 | FlightEndpoint 对外广播地址；**`LISTEN_ADDR` 使用 `0.0.0.0` 时必须显式设置**，填写客户端可达的具体 IP（如 `10.8.20.101:8815`），否则 Airport 客户端会尝试连接不可路由的 `0.0.0.0` |
 | `DUCKPORT_CATALOG_NAME` | `duckport` | Airport 客户端 ATTACH 时看到的 catalog 名 |
 | `DUCKPORT_READ_POOL_SIZE` | `4` | 读连接池大小 |
 | `DUCKPORT_DUCKDB_THREADS` | `0` (DuckDB 默认) | DuckDB `threads` PRAGMA |

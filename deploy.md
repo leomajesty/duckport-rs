@@ -175,7 +175,7 @@ duckport-server 通过**环境变量**配置，所有变量以 `DUCKPORT_` 为�
 |------|--------|------|
 | `DUCKPORT_DB_PATH` | `./duckport.db` | DuckDB 数据库文件路径（`:memory:` 为纯内存模式） |
 | `DUCKPORT_LISTEN_ADDR` | `0.0.0.0:50051` | gRPC 监听地址 |
-| `DUCKPORT_ADVERTISED_ADDR` | *(空)* | FlightEndpoint 对外广播地址；`LISTEN_ADDR` 为 `0.0.0.0` 时自动返回空 location（客户端复用连接），通常无需设置；仅在多网卡需指定特定 IP 时填写 |
+| `DUCKPORT_ADVERTISED_ADDR` | *(空)* | FlightEndpoint 对外广播地址；**`LISTEN_ADDR` 使用 `0.0.0.0` 时必须显式设置**（如 `10.8.20.101:8815`），Airport 客户端扫描表时依赖此地址建立 DoGet 连接 |
 | `DUCKPORT_CATALOG_NAME` | `duckport` | Airport catalog 名称（客户端 `ATTACH ... AS <name>` 使用） |
 | `DUCKPORT_READ_POOL_SIZE` | `4` | 读连接池大小（最小 1） |
 | `DUCKPORT_DUCKDB_THREADS` | `0` | DuckDB 工作线程数（0 = DuckDB 自动检测） |
