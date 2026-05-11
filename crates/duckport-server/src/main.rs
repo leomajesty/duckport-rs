@@ -54,10 +54,19 @@ async fn main() -> Result<()> {
     let catalog: Arc<dyn airport::catalog::Catalog> =
         DuckDbCatalog::new(cfg.catalog_name.clone(), backend.clone());
 
-    let advertised = if cfg.advertised_addr.is_empty() {
-        cfg.listen_addr.to_string()
-    } else {
+    let advertised = if !cfg.advertised_addr.is_empty() {
         cfg.advertised_addr.clone()
+    } else {
+        // 0.0.0.0 / * are not routable by clients; return empty so Airport
+        // returns location:[] in FlightEndpoint, causing the client to reuse
+        // the current connection instead of trying to dial 0.0.0.0.
+        let addr = cfg.listen_addr.to_string();
+        let host = addr.rsplitn(2, ':').nth(1).unwrap_or("");
+        if matches!(host, "0.0.0.0" | "*" | "::") {
+            String::new()
+        } else {
+            addr
+        }
     };
 
     // Build the airport inner server directly so we can wrap it in DuckportService
