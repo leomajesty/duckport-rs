@@ -318,7 +318,30 @@ DuckDB 的查询性能强依赖 **RAM**（用作 buffer pool + 查询中间状�
     "repo": "https://github.com/your-org/duckport-my-ingestor",
     "description": "My exchange K-line ingestor",
     "exec": "my-ingestor",
-    "default_instance": "my-5m"
+    "default_instance": "my-5m",
+    "config": [
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K 线周期",
+        "default": "5m"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
   }
 }
 ```
@@ -326,6 +349,8 @@ DuckDB 的查询性能强依赖 **RAM**（用作 buffer pool + 查询中间状�
 ```bash
 duckport install my_ingestor    # 从 registry 安装，交互式填写配置
 ```
+
+`config` 数组定义安装时需要交互填写并写入 `config.env` 的变量；`INGESTOR_EXEC` 会根据 `exec` 自动生成，无需放入 `config`。
 
 ### 从零构建 Ingestor 插件
 

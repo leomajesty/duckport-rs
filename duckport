@@ -349,6 +349,44 @@ except Exception:
 " 2>/dev/null
 }
 
+_registry_config() {
+  local plugin="${1//_/-}"
+  local reg
+  reg=$(_registry_file)
+  REGISTRY_FILE="$reg" PLUGIN="$plugin" python3 <<'PY' 2>/dev/null
+import json
+import os
+import re
+import sys
+
+reg = os.environ["REGISTRY_FILE"]
+plugin = os.environ["PLUGIN"]
+default_config = [
+    {"name": "KLINE_INTERVAL", "label": "K 线周期", "default": "5m"},
+    {"name": "DATA_SOURCES", "label": "DATA_SOURCES", "default": "usdt_perp,usdt_spot"},
+    {"name": "CONCURRENCY", "label": "并发数", "default": "2"},
+    {"name": "START_DATE", "label": "START_DATE", "default": "2021-01-01"},
+    {"name": "PROXY_URL", "label": "PROXY_URL", "default": "", "empty_hint": "留空跳过"},
+]
+
+try:
+    data = json.load(open(reg))
+    config = data.get(plugin, {}).get("config") or default_config
+except Exception:
+    config = default_config
+
+for item in config:
+    name = str(item.get("name", ""))
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        print(f"invalid config name for {plugin}: {name}", file=sys.stderr)
+        sys.exit(1)
+    label = str(item.get("label") or name)
+    default = str(item.get("default", ""))
+    empty_hint = str(item.get("empty_hint", ""))
+    print("\x1f".join([name, label, default, empty_hint]))
+PY
+}
+
 cmd_list() {
   local reg
   reg=$(_registry_file)
@@ -407,21 +445,24 @@ cmd_install() {
   fi
   mkdir -p "$inst_dir"
 
-  read -rp "  K 线周期        (默认 5m): " IV;   IV="${IV:-5m}"
-  read -rp "  DATA_SOURCES    (默认 usdt_perp,usdt_spot): " DS; DS="${DS:-usdt_perp,usdt_spot}"
-  read -rp "  并发数          (默认 2): " CONC;  CONC="${CONC:-2}"
-  read -rp "  START_DATE      (默认 2021-01-01): " SD; SD="${SD:-2021-01-01}"
-  read -rp "  PROXY_URL       (留空跳过): " PX
+  {
+    echo "# 实例：$INST_NAME  插件：$plugin"
+    echo "INGESTOR_EXEC=${exec_cmd:-$plugin}"
+  } > "$cfg"
 
-  cat > "$cfg" << EOF
-# 实例：$INST_NAME  插件：$plugin
-INGESTOR_EXEC=${exec_cmd:-$plugin}
-KLINE_INTERVAL=${IV}
-DATA_SOURCES=${DS}
-CONCURRENCY=${CONC}
-START_DATE=${SD}
-PROXY_URL=${PX}
-EOF
+  local name label default_value empty_hint value hint prompt
+  while IFS=$'\x1f' read -r -u 3 name label default_value empty_hint; do
+    [[ -n "$name" ]] || continue
+    if [[ -z "$default_value" && -n "$empty_hint" ]]; then
+      hint="$empty_hint"
+    else
+      hint="默认 $default_value"
+    fi
+    printf -v prompt "  %-16s (%s): " "$label" "$hint"
+    read -rp "$prompt" value
+    value="${value:-$default_value}"
+    printf '%s=%s\n' "$name" "$value" >> "$cfg"
+  done 3< <(_registry_config "$plugin")
 
   # 安装 Python 包
   echo -e "\n  安装 Python 环境..."

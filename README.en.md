@@ -319,7 +319,30 @@ Exceeding these constraints triggers frequent disk spills; P95 latency degrades 
     "repo": "https://github.com/your-org/duckport-my-ingestor",
     "description": "My exchange K-line ingestor",
     "exec": "my-ingestor",
-    "default_instance": "my-5m"
+    "default_instance": "my-5m",
+    "config": [
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K-line interval",
+        "default": "5m"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "Concurrency",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "leave empty to skip"
+      }
+    ]
   }
 }
 ```
@@ -327,6 +350,8 @@ Exceeding these constraints triggers frequent disk spills; P95 latency degrades 
 ```bash
 duckport install my_ingestor    # Install from registry, interactive config setup
 ```
+
+The `config` array defines variables prompted during installation and written to `config.env`; `INGESTOR_EXEC` is generated from `exec` automatically and should not be listed in `config`.
 
 ### Building an Ingestor Plugin from Scratch
 

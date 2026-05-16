@@ -3,12 +3,58 @@
     "repo": "https://github.com/leomajesty/duckport-binance-ingestor",
     "description": "Binance Spot + USDT-Perp K-line ingestor",
     "exec": "binance-ingestor",
-    "default_instance": "binance-5m"
+    "default_instance": "binance-5m",
+    "config": [
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K 线周期",
+        "default": "5m"
+      },
+      {
+        "name": "DATA_SOURCES",
+        "label": "DATA_SOURCES",
+        "default": "usdt_perp,usdt_spot"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
   },
   "binance-funding": {
     "repo": "https://github.com/leomajesty/duckport-binance-funding",
     "description": "Binance USD-M funding-rate ingestor",
     "exec": "binance-funding",
-    "default_instance": "binance-funding"
+    "default_instance": "binance-funding",
+    "config": [
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
   }
 }

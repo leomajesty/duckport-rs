@@ -454,7 +454,35 @@ client.replace_duck_time("usdt_perp", "2026-04-28 08:00:00")  # upsert duck_time
     "repo": "https://github.com/your-org/duckport-my-ingestor",
     "description": "My exchange K-line ingestor for duckport",
     "exec": "my-ingestor",
-    "default_instance": "my-5m"
+    "default_instance": "my-5m",
+    "config": [
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K 线周期",
+        "default": "5m"
+      },
+      {
+        "name": "DATA_SOURCES",
+        "label": "DATA_SOURCES",
+        "default": "usdt_perp,usdt_spot"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
   }
 }
 ```
@@ -465,6 +493,9 @@ client.replace_duck_time("usdt_perp", "2026-04-28 08:00:00")  # upsert duck_time
 | `repo` | git clone URL，支持 `git+https://` 格式 |
 | `exec` | `pyproject.toml [project.scripts]` 中定义的脚本名 |
 | `default_instance` | `duckport install` 交互时的默认实例名建议值 |
+| `config` | 安装时交互填写并写入 `config.env` 的变量列表，按数组顺序提示 |
+
+`config` 每项支持 `name`、`label`、`default`、`empty_hint`；`INGESTOR_EXEC` 由 `exec` 自动写入，不需要放入 `config`。
 
 注册后用户即可通过 `duckport install my-ingestor` 安装。
 
