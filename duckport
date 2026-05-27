@@ -185,43 +185,102 @@ cmd_status() {
     return
   fi
 
+  local status_py
+  status_py=$(command -v python3)
   while IFS= read -r inst; do
-    local py cfg
-    py=$(_instance_python "$inst")
-    cfg="$INGESTORS_DIR/$inst/config.env"
-    [[ -x "$py" && -f "$cfg" ]] || continue
-
-    "$py" - "$inst" "$cfg" << 'PYEOF' 2>/dev/null || true
-import sys, os, pandas as pd, logging
-os.environ.setdefault("INGESTOR_ENV_FILE", sys.argv[2])
-from binance_ingestor.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, KLINE_INTERVAL
-from binance_ingestor.duckport_client import DuckportClient
-for _h in logging.getLogger('binance_ingestor').handlers:
-    _h.stream = sys.stderr
-from datetime import datetime, timezone
-
-inst = sys.argv[1]
-dc = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA, interval=KLINE_INTERVAL)
-now = datetime.now(timezone.utc)
-try:
-    wm = dc.read_table(DUCKPORT_SCHEMA, "watermark").to_pandas()
-    for _, row in wm.iterrows():
-        tname = row["table_name"]
-        val = row["duck_time"]
-        if pd.isna(val):
-            print(f"  [{inst}] {tname:<22}: None")
-            continue
-        dt = pd.to_datetime(val).tz_localize(timezone.utc)
-        age = now - dt
-        h, r = divmod(int(age.total_seconds()), 3600)
-        m = r // 60
-        age_str = f"{h}h{m:02d}m" if h else f"{m}m"
-        mark = "\033[0;32m✓\033[0m" if age.total_seconds() < 900 else "\033[1;33m⚠\033[0m"
-        print(f"  [{inst}] {tname:<22}: {dt.strftime('%Y-%m-%d %H:%M')} UTC  {mark} {age_str} ago")
-finally:
-    dc.close()
-PYEOF
+    local candidate
+    candidate=$(_instance_python "$inst")
+    if [[ -x "$candidate" ]]; then
+      status_py="$candidate"
+      break
+    fi
   done <<< "$([ -z "$instances" ] && echo "" || echo "$instances")"
+
+  "$status_py" - "$server_port" << 'PYEOF' 2>/dev/null || {
+import json
+import sys
+from datetime import timezone
+
+import pandas as pd
+import pyarrow.flight as flight
+
+port = sys.argv[1]
+client = flight.FlightClient(f"grpc://localhost:{port}")
+
+def query(sql):
+    ticket = json.dumps({"type": "duckport.query", "sql": sql}).encode("utf-8")
+    return client.do_get(flight.Ticket(ticket)).read_all().to_pandas()
+
+try:
+    cols = query(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'data' AND table_name = 'watermark'"
+    )
+    colset = set(cols["column_name"].astype(str)) if "column_name" in cols else set()
+    ingestor_expr = "ingestor" if "ingestor" in colset else "NULL AS ingestor"
+    max_lag_expr = "max_lag_seconds" if "max_lag_seconds" in colset else "NULL AS max_lag_seconds"
+    wm = query(
+        "SELECT "
+        f"{ingestor_expr}, {max_lag_expr}, table_name, time_column, start_time, duck_time, updated_at "
+        "FROM data.watermark "
+        "ORDER BY COALESCE(ingestor, ''), table_name"
+    )
+except Exception as exc:
+    print(f"  \033[2m无法读取 data.watermark: {exc}\033[0m")
+    sys.exit(0)
+finally:
+    client.close()
+
+if wm.empty:
+    print("  \033[2m（无）\033[0m")
+    sys.exit(0)
+
+now = pd.Timestamp.now(tz=timezone.utc)
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    h, r = divmod(seconds, 3600)
+    m = r // 60
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+def _infer_max_lag_seconds(table_name):
+    if str(table_name).endswith("_funding"):
+        return 9 * 3600
+    parts = str(table_name).rsplit("_", 1)
+    if len(parts) == 2 and parts[1].endswith("m") and parts[1][:-1].isdigit():
+        return max(900, int(parts[1][:-1]) * 60 * 2)
+    return 900
+
+for _, row in wm.iterrows():
+    ingestor = row.get("ingestor")
+    ingestor = "unknown" if pd.isna(ingestor) or not str(ingestor) else str(ingestor)
+    tname = row["table_name"]
+    val = row["duck_time"]
+    if pd.isna(val):
+        print(f"  [{ingestor}] {tname:<22}: None")
+        continue
+    dt = pd.to_datetime(val)
+    if dt.tzinfo is None:
+        dt = dt.tz_localize(timezone.utc)
+    else:
+        dt = dt.tz_convert(timezone.utc)
+    age = now - dt
+    seconds = int(age.total_seconds())
+    raw_max_lag = row.get("max_lag_seconds")
+    if pd.isna(raw_max_lag) or int(raw_max_lag) <= 0:
+        max_lag = _infer_max_lag_seconds(tname)
+    else:
+        max_lag = int(raw_max_lag)
+    if seconds < 0:
+        mark = "\033[1;33m⚠\033[0m"
+        age_str = f"{_format_duration(abs(seconds))} ahead"
+    else:
+        mark = "\033[0;32m✓\033[0m" if seconds <= max_lag else "\033[1;33m⚠\033[0m"
+        age_str = f"{_format_duration(seconds)} ago"
+    print(f"  [{ingestor}] {tname:<22}: {dt.strftime('%Y-%m-%d %H:%M')} UTC  {mark} {age_str}")
+PYEOF
+    echo -e "  ${DIM}无法读取 data.watermark：缺少 pyarrow/pandas 或查询失败${NC}"
+  }
   echo ""
 }
 
@@ -463,6 +522,7 @@ cmd_install() {
     value="${value:-$default_value}"
     printf '%s=%s\n' "$name" "$value" >> "$cfg"
   done 3< <(_registry_config "$plugin")
+  printf 'INGESTOR_NAME=%s\n' "$INST_NAME" >> "$cfg"
 
   # 安装 Python 包
   echo -e "\n  安装 Python 环境..."
@@ -676,7 +736,18 @@ cmd_upgrade() {
   _require_root
   [[ -d "$REPO_DIR/.git" ]] || { echo -e "${RED}未找到仓库：$REPO_DIR${NC}"; exit 1; }
   echo -e "${BOLD}升级环境...${NC}"
-  git -C "$REPO_DIR" pull --ff-only
+
+  local branch upstream
+  branch=$(git -C "$REPO_DIR" branch --show-current)
+  if upstream=$(git -C "$REPO_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
+    git -C "$REPO_DIR" pull --ff-only
+  elif [[ -n "$branch" ]] && git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}当前分支未设置 upstream，改用 origin/$branch${NC}"
+    git -C "$REPO_DIR" pull --ff-only origin "$branch"
+  else
+    echo -e "  ${YELLOW}当前分支未设置 upstream，跳过 git pull，使用本地 checkout 部署${NC}"
+  fi
+
   bash "$REPO_DIR/deploy.sh"
   echo -e "\n  ${YELLOW}环境已更新，如需生效：${NC}"
   echo -e "  duckport restart"

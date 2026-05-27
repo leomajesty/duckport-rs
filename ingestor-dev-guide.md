@@ -190,16 +190,18 @@ class DuckportClient:
 |------|------|
 | 业务表 | 放 `data` schema（`data.my_kline_5m`） |
 | staging 表 | 放 `main` schema（`_staging_my_kline_5m`），无 PK |
-| watermark 表 | `data.watermark`，每张业务表对应一行 |
-| 通用元数据 | `data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)` |
+| watermark 表 | `data.watermark`，由 duckport-rs 启动时创建/迁移，每张业务表对应一行 |
+| 通用元数据 | `data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)`，由 duckport-rs 启动时创建 |
 | 所有 DDL | 使用 `CREATE TABLE IF NOT EXISTS`，幂等 |
-| `CREATE SCHEMA` | 必须与首张表建立在**同一事务**中 |
+| `CREATE SCHEMA` | `data` schema 由 duckport-rs 创建；插件只需创建自己的业务表 |
 
 ### watermark 表定义
 
 ```sql
 CREATE TABLE IF NOT EXISTS data.watermark (
     table_name  VARCHAR PRIMARY KEY,   -- 业务表名，如 'usdt_perp_5m'
+    ingestor    VARCHAR,               -- 负责该业务表的 ingestor 实例名，如 'binance-15m'
+    max_lag_seconds INTEGER,           -- duckport status 判定超时的最大延迟秒数
     time_column VARCHAR NOT NULL,      -- 时间索引列名，如 'open_time'
     start_time  TIMESTAMP,             -- 数据起始时间（来自 START_DATE 配置）
     duck_time   TIMESTAMP,             -- 最新写入行的时间戳（水位线）
@@ -207,7 +209,9 @@ CREATE TABLE IF NOT EXISTS data.watermark (
 )
 ```
 
-- `start_time`：在 `init_schema` 时由配置的 `START_DATE` 写入，后续仅追加 `ON CONFLICT DO NOTHING`，不会被覆盖。
+- `ingestor`：写入该业务表的 ingestor 实例名，`duckport status` 用它展示水位归属。
+- `max_lag_seconds`：`duckport status` 使用的超时阈值；不同频率的数据应写入不同阈值。
+- `start_time`：在 `init_schema` 时由配置的 `START_DATE` 写入，后续更新水位时不覆盖。
 - `duck_time`：每次成功写入后通过 upsert 更新，`start_time` 在 DO UPDATE 中不参与，保持初始值。
 - `updated_at`：每次 duck_time 变更时由 `CURRENT_TIMESTAMP` 自动刷新，可用于监控水位推进是否停滞。
 
@@ -217,13 +221,8 @@ CREATE TABLE IF NOT EXISTS data.watermark (
 def init_schema(self, markets, interval, data_sources, start_date=None):
     s = self.schema
     start_ts = f"'{start_date} 00:00:00'" if start_date else "NULL"
+    ingestor_sql = sql_str(INGESTOR_NAME)
     stmts = [
-        f"CREATE SCHEMA IF NOT EXISTS {s}",
-        f"CREATE TABLE IF NOT EXISTS {s}.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)",
-        f"CREATE TABLE IF NOT EXISTS {s}.watermark ("
-        f"table_name VARCHAR PRIMARY KEY, time_column VARCHAR NOT NULL, "
-        f"start_time TIMESTAMP, duck_time TIMESTAMP, "
-        f"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     ]
     for market in markets:
         if market not in data_sources:
@@ -232,15 +231,17 @@ def init_schema(self, markets, interval, data_sources, start_date=None):
         stmts += [
             f"CREATE TABLE IF NOT EXISTS {s}.{target} (..., PRIMARY KEY (open_time, symbol))",
             f"CREATE TABLE IF NOT EXISTS _staging_{target} (...)",
-            # start_time 只在首次创建时写入，ON CONFLICT DO NOTHING 保证幂等
-            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{target}', 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
-            f"ON CONFLICT (table_name) DO NOTHING",
+            # data.watermark 由 duckport-rs 创建；插件只 upsert 自己负责的业务表行
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target}', {ingestor_sql}, max_lag_seconds, 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
+            f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+            f"time_column = excluded.time_column",
         ]
     self.execute_transaction(stmts)
 ```
 
-`CREATE SCHEMA IF NOT EXISTS` 和 `CREATE TABLE` 必须放同一事务，否则下一条语句看不到新建的 schema。
+`data.watermark` / `data.config_dict` 是 duckport-rs 的系统表，插件不得自行定义不同结构。
 
 ### 表命名约定
 
@@ -379,11 +380,13 @@ def main():
 
 ## 9. 水位线（Watermark）管理
 
-watermark 统一存储在 `data.watermark` 表中，每张业务表对应一行：
+watermark 统一存储在 duckport-rs 管理的 `data.watermark` 表中，每张业务表对应一行：
 
 | 列 | 类型 | 含义 |
 |----|------|------|
 | `table_name` | VARCHAR PK | 业务表名，如 `usdt_perp_5m` |
+| `ingestor` | VARCHAR | 负责该业务表的 ingestor 实例名，如 `binance-15m` |
+| `max_lag_seconds` | INTEGER | `duckport status` 判断水位超时的最大延迟秒数 |
 | `time_column` | VARCHAR | 时间索引列名，如 `open_time` |
 | `start_time` | TIMESTAMP | 数据起始时间（来自 `START_DATE` 配置，初始化时写入） |
 | `duck_time` | TIMESTAMP | 最新成功写入行的时间戳（水位线），NULL 表示尚未写入任何数据 |
@@ -399,9 +402,11 @@ watermark 统一存储在 `data.watermark` 表中，每张业务表对应一行�
 
 **upsert 模式**：
 ```sql
-INSERT INTO data.watermark (table_name, time_column, start_time, duck_time, updated_at)
-VALUES ('usdt_perp_5m', 'open_time', NULL, '2026-04-28 08:00:00', CURRENT_TIMESTAMP)
+INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at)
+VALUES ('usdt_perp_5m', 'binance-15m', 1800, 'open_time', NULL, '2026-04-28 08:00:00', CURRENT_TIMESTAMP)
 ON CONFLICT (table_name) DO UPDATE SET
+    ingestor   = excluded.ingestor,
+    max_lag_seconds = excluded.max_lag_seconds,
     duck_time  = excluded.duck_time,
     updated_at = CURRENT_TIMESTAMP
 -- start_time 不在 DO UPDATE 中，保留初始值不被覆盖

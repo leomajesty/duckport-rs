@@ -51,6 +51,7 @@ Key design decisions:
 - **Serialized single-writer**: The writer connection is wrapped in a `tokio::sync::Mutex`; all write RPCs execute FIFO, conforming to DuckDB's single-writer model.
 - **Concurrent reads**: r2d2 connection pool; all pool connections are `try_clone` of the writer, sharing MVCC state.
 - **Catalog epoch**: After any write RPC, `bump_catalog_epoch()` is called so Airport clients can refresh their schema cache.
+- **System metadata tables**: `duckport-server` creates and migrates `data.config_dict` and `data.watermark` on startup; ingestors only upsert the watermark rows for their own business tables.
 
 See `extra-enhancement.md` for the concurrency model decision record.
 
@@ -439,8 +440,11 @@ Recommended: update the watermark in the same transaction to guarantee atomic co
 ```python
 execute_transaction([
     "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
-    f"INSERT OR REPLACE INTO metrics.config_dict (key, value) "
-    f"VALUES ('events_latest_ts', '{latest_ts}')",
+    f"INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+    f"VALUES ('metrics.events', '{ingestor_name}', 900, 'event_time', NULL, '{latest_ts}', CURRENT_TIMESTAMP) "
+    f"ON CONFLICT (table_name) DO UPDATE SET "
+    f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+    f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
     "TRUNCATE _staging_events",
 ])
 ```

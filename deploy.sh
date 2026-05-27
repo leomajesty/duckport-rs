@@ -269,6 +269,8 @@ EXEC_BIN="\$INST_DIR/.venv/bin/\$EXEC_CMD"
 [[ -x "\$EXEC_BIN" ]] || { echo "找不到可执行文件：\$EXEC_BIN"; exit 1; }
 
 export INGESTOR_ENV_FILE="\$CFG"
+export INGESTOR_NAME="\$INSTANCE"
+export INGESTOR_INSTANCE="\$INSTANCE"
 exec "\$EXEC_BIN"
 RUNEOF
 chmod +x "$DEPLOY_BIN/ingestor-run"

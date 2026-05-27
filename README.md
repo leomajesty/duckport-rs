@@ -50,6 +50,7 @@
 - **单写串行化**：writer 连接包在 `tokio::sync::Mutex` 里，所有 write RPC FIFO 执行，符合 DuckDB 单写模型。
 - **读并发**：r2d2 连接池，池内连接都是 writer 的 `try_clone`，共享 MVCC 状态。
 - **Catalog epoch**：任何写 RPC 后 `bump_catalog_epoch()`，Airport 客户端据此刷新 schema 缓存。
+- **系统元数据表**：`duckport-server` 启动时创建并迁移 `data.config_dict` 和 `data.watermark`；ingestor 只负责 upsert 自己业务表对应的 watermark 行。
 
 详见 `extra-enhancement.md` 关于并发模型的决策记录。
 
@@ -438,8 +439,11 @@ for offset in range(0, len(arrow), CHUNK_SIZE):
 ```python
 execute_transaction([
     "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
-    f"INSERT OR REPLACE INTO metrics.config_dict (key, value) "
-    f"VALUES ('events_latest_ts', '{latest_ts}')",
+    f"INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+    f"VALUES ('metrics.events', '{ingestor_name}', 900, 'event_time', NULL, '{latest_ts}', CURRENT_TIMESTAMP) "
+    f"ON CONFLICT (table_name) DO UPDATE SET "
+    f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+    f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
     "TRUNCATE _staging_events",
 ])
 ```

@@ -46,6 +46,8 @@ async fn main() -> Result<()> {
         &cfg.duckdb_memory_limit,
     )?;
 
+    init_system_schema(&backend).await?;
+
     // Seed demo data if requested (handy for Phase 1 end-to-end tests).
     if std::env::var("DUCKPORT_SEED_DEMO").ok().as_deref() == Some("1") {
         seed_demo(&backend).await?;
@@ -77,11 +79,8 @@ async fn main() -> Result<()> {
         info!("retention scheduler disabled (DUCKPORT_RETENTION_ENABLED=false)");
     }
 
-    let duckport_svc = DuckportService::new(
-        airport_server,
-        backend.clone(),
-        cfg.catalog_name.clone(),
-    );
+    let duckport_svc =
+        DuckportService::new(airport_server, backend.clone(), cfg.catalog_name.clone());
     let max_msg = 64 * 1024 * 1024;
     let flight_svc = FlightServiceServer::new(duckport_svc)
         .max_decoding_message_size(max_msg)
@@ -94,6 +93,46 @@ async fn main() -> Result<()> {
         .await
         .context("tonic transport")?;
 
+    Ok(())
+}
+
+/// Create and migrate duckport-managed metadata tables.
+///
+/// Ingestors own their business tables, but duckport-server owns shared metadata
+/// schema such as `data.watermark`. This keeps `duckport status` and future
+/// plugins on one stable contract.
+async fn init_system_schema(backend: &Backend) -> Result<()> {
+    backend
+        .with_writer(|conn| {
+            conn.execute_batch(
+                r#"
+                CREATE SCHEMA IF NOT EXISTS data;
+                CREATE TABLE IF NOT EXISTS data.config_dict (
+                    key   VARCHAR PRIMARY KEY,
+                    value VARCHAR
+                );
+                CREATE TABLE IF NOT EXISTS data.watermark (
+                    table_name      VARCHAR PRIMARY KEY,
+                    ingestor        VARCHAR,
+                    max_lag_seconds INTEGER,
+                    time_column     VARCHAR NOT NULL,
+                    start_time      TIMESTAMP,
+                    duck_time       TIMESTAMP,
+                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS ingestor VARCHAR;
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS max_lag_seconds INTEGER;
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS time_column VARCHAR;
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS start_time TIMESTAMP;
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS duck_time TIMESTAMP;
+                ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                "#,
+            )?;
+            Ok(())
+        })
+        .await?;
+    backend.bump_catalog_epoch();
+    info!("initialised duckport system schema data.config_dict + data.watermark");
     Ok(())
 }
 
