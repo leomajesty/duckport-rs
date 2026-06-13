@@ -35,12 +35,14 @@ duckport-my-ingestor/
 │   ├── config.py               # 纯 env 驱动，无副作用
 │   ├── duckport_client.py      # Arrow Flight RPC 封装
 │   ├── data_jobs.py            # 数据源拉取 + 写入循环
-│   ├── loadhist.py             # 历史数据批量回填入口
+│   ├── loadhist.py             # 可选：历史数据批量回填入口
 │   └── main.py                 # 程序入口
 └── start_ingestor.py           # 可选：本地直接运行的便捷脚本
 ```
 
-**必须文件**：`pyproject.toml`、`config.py`、`main.py`、`loadhist.py`、`config.env.example`。
+**必须文件**：`pyproject.toml`、`config.py`、`main.py`、`config.env.example`。
+
+**可选文件**：`loadhist.py`。仅当 ingestor 需要离线/批量回填长历史（如从 data.binance.vision 下载 Parquet）时才提供。若主进程能在启动时通过 REST 自行回填历史（如 `binance-funding` 按月窗口拉取），则无需 `loadhist.py`。
 
 ---
 
@@ -65,13 +67,13 @@ dependencies = [
 include = ["my_ingestor*"]      # 显式列出，避免 data/ 等目录误入
 
 [project.scripts]
-my-ingestor = "my_ingestor.main:main"      # 主进程入口
-loadhist    = "my_ingestor.loadhist:main"  # 历史数据入口
+my-ingestor = "my_ingestor.main:main"      # 主进程入口（必须）
+loadhist    = "my_ingestor.loadhist:main"  # 历史数据入口（可选，仅在提供 loadhist.py 时声明）
 ```
 
 **关键约定**：
 
-- `[project.scripts]` 中必须同时声明主进程和 `loadhist` 两个脚本。
+- `[project.scripts]` 中必须声明主进程脚本；`loadhist` 为可选，仅在 ingestor 提供 `loadhist.py` 时声明。`registry.json` 的 `exec` 字段必须与主进程脚本名一致。
 - `duckdb` 版本必须与 duckport-server 内嵌的 DuckDB 版本一致（当前 `==1.5.1`），否则 Parquet 文件格式可能不兼容。
 - `requires-python = ">=3.12"`。
 - `[tool.setuptools.packages.find]` 的 `include` 字段必须显式填写，防止 `data/`、`hist/` 等目录被错误打包。
@@ -337,7 +339,9 @@ def main():
 
 ---
 
-## 8. 历史数据入口（loadhist.py）
+## 8. 历史数据入口（loadhist.py，可选）
+
+> `loadhist` 是**可选组件**。只有当 ingestor 需要离线批量回填长历史（例如从 data.binance.vision 下载历史 Parquet）时才实现它。若主进程已能在启动时通过 REST 自行回填（如 `binance-funding` 按月窗口拉取），可不提供 `loadhist.py`，也不在 `pyproject.toml` 中声明 `loadhist` 脚本。
 
 `loadhist` 是**独立脚本**，与主进程互斥，不可同时运行（共享 staging 表）。
 

@@ -483,12 +483,12 @@ print(tbl.to_pandas())
 duckport-my-ingestor/           # 仓库名建议以 duckport- 为前缀
 ├── pyproject.toml              # 依赖 pyarrow>=15, pandas>=2
 │                               # [project.scripts] my-ingestor = "my_ingestor.main:main"
-│                               #                   loadhist    = "my_ingestor.loadhist:main"
+│                               #                   loadhist    = "my_ingestor.loadhist:main"（可选）
 ├── my_ingestor/
 │   ├── duckport_client.py      # 封装 Flight client（参考 binance-ingestor）
 │   ├── config.py               # 纯 env 驱动配置（读取 INGESTOR_ENV_FILE）
 │   ├── data_jobs.py            # 数据源抓取 + 写入循环
-│   ├── loadhist.py             # 历史数据回填入口
+│   ├── loadhist.py             # 可选：仅需离线批量回填长历史时提供
 │   └── main.py                 # 入口：init_schema → data_jobs
 └── config.env.example          # 仅需 5 个变量
 ```

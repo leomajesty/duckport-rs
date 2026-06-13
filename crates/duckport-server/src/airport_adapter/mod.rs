@@ -1,12 +1,13 @@
 //! Airport-protocol adapter backed by a DuckDB file.
 //!
-//! Phase 1 scope: read plane only. Implements [`airport::catalog::Catalog`],
+//! Read plane only. Implements [`airport::catalog::Catalog`],
 //! [`airport::catalog::Schema`], and [`airport::catalog::table::Table`] by
 //! delegating to DuckDB's system views (`duckdb_schemas()`, `duckdb_tables()`,
 //! `information_schema.columns`).
 //!
-//! Phase 2 will add the write plane (DynamicCatalog / DynamicSchema / InsertableTable
-//! etc.) through a custom Flight service wrapper.
+//! Writes and DDL are handled separately by the custom `duckport.*` write plane
+//! (see [`crate::write_plane`]), not through Airport's DynamicCatalog/TransactionManager.
+//! This adapter therefore leaves `as_dynamic()` as `None` on purpose.
 
 mod catalog;
 mod schema;

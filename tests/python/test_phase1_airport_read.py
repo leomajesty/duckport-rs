@@ -38,10 +38,6 @@ def main():
     rows = con.execute("SELECT COUNT(*) FROM duckport.app.users").fetchall()
     print("rows =", rows)
 
-    print("\n>>> SELECT * FROM duckport.app.ingestor_watermarks")
-    rows = con.execute("SELECT * FROM duckport.app.ingestor_watermarks").fetchall()
-    print("rows =", rows)
-
     print("\nALL GREEN (phase 1)")
     sys.exit(0)
 

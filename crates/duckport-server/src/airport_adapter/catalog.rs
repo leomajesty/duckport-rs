@@ -94,7 +94,12 @@ impl airport::catalog::Catalog for DuckDbCatalog {
     }
 
     fn as_dynamic(&self) -> Option<&dyn DynamicCatalog> {
-        // Phase 2 will return Some(self). For now, DDL is not exposed via Airport.
+        // Intentionally `None`: DDL is single-track in duckport. The DuckDB Airport
+        // extension does not forward client DDL/`BEGIN`/`COMMIT` to the server, so all
+        // DDL and multi-statement transactions go through the custom write plane
+        // (`duckport.execute` / `duckport.execute_transaction`), never via Airport's
+        // DynamicCatalog. Returning `Some(self)` would expose a second, unreachable
+        // DDL path and mislead clients.
         None
     }
 

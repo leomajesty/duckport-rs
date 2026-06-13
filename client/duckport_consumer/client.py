@@ -86,6 +86,20 @@ class DuckportConsumer:
         results = list(self._client.do_action(action))
         return json.loads(results[0].body.to_pybytes())
 
+    def execute(self, sql: str) -> dict:
+        """Execute a single DDL/DML statement via duckport.execute DoAction."""
+        body = json.dumps({"sql": sql}).encode("utf-8")
+        action = flight.Action("duckport.execute", body)
+        results = list(self._client.do_action(action))
+        return json.loads(results[0].body.to_pybytes())
+
+    def execute_transaction(self, statements: list[str]) -> dict:
+        """Execute multiple statements atomically via duckport.execute_transaction."""
+        body = json.dumps({"statements": statements}).encode("utf-8")
+        action = flight.Action("duckport.execute_transaction", body)
+        results = list(self._client.do_action(action))
+        return json.loads(results[0].body.to_pybytes())
+
     def read_duck_time(self, market: str) -> Optional[datetime]:
         """Read the latest duck_time for a market from config_dict."""
         try:

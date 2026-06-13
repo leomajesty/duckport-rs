@@ -1,7 +1,10 @@
 //! duckport-server — gRPC database service on top of DuckDB.
 //!
-//! Phase 1: Airport-protocol read plane. A DuckDB-backed `airport::Catalog` is wired
-//! into `airport::server::new_server` and exposed over a tonic Flight service.
+//! A DuckDB-backed `airport::Catalog` is exposed over a tonic Flight service for the
+//! read plane, wrapped by `DuckportService` which adds the custom `duckport.*` write
+//! plane. Writes and DDL go exclusively through `duckport.execute` /
+//! `duckport.execute_transaction` / `duckport.append`; Airport's DynamicCatalog and
+//! TransactionManager are intentionally left unwired (single-track DDL).
 
 mod airport_adapter;
 mod backend;
@@ -66,9 +69,9 @@ async fn main() -> Result<()> {
     // (which intercepts `duckport.*` DoActions for the custom write plane).
     let airport_server = Arc::new(AirportServer::new(
         catalog,
-        None, // no auth in Phase 2a — add in Phase 3
+        None, // no auth yet — see roadmap (Bearer token)
         advertised.clone(),
-        None, // tx_manager: unused; we do transactions via duckport.execute_transaction
+        None, // tx_manager intentionally unwired: transactions go via duckport.execute_transaction (single-track)
         cfg.catalog_name.clone(),
     ));
 
@@ -151,20 +154,12 @@ async fn seed_demo(backend: &Backend) -> Result<()> {
                 CREATE TABLE IF NOT EXISTS app.users (id BIGINT, name VARCHAR);
                 DELETE FROM app.users;
                 INSERT INTO app.users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
-                CREATE TABLE IF NOT EXISTS app.ingestor_watermarks (
-                    table_name   VARCHAR PRIMARY KEY,
-                    watermark_ts TIMESTAMP NOT NULL,
-                    row_count    BIGINT,
-                    updated_at   TIMESTAMP DEFAULT now()
-                );
-                INSERT OR REPLACE INTO app.ingestor_watermarks
-                    VALUES ('app.users', '2026-04-22 10:00:00', 3, now());
                 "#,
             )?;
             Ok(())
         })
         .await?;
     backend.bump_catalog_epoch();
-    info!("seeded demo schema 'app' with tables users + ingestor_watermarks");
+    info!("seeded demo schema 'app' with table users");
     Ok(())
 }
