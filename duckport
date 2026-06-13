@@ -31,7 +31,7 @@ else
   DEPLOY_OPT="/opt/duckport"
   PLIST_DIR=""   # Linux 用 systemd，不需要
   LOG_DIR="/opt/duckport/logs"
-  _DEFAULT_REPO="/w/code/duckport-rs"
+  _DEFAULT_REPO="$HOME/code/duckport-rs"
 fi
 
 DEPLOY_BIN="$DEPLOY_OPT/bin"

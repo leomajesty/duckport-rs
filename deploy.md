@@ -97,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install
 
 脚本自动完成：
 
-1. 克隆仓库到 `/w/code/duckport-rs`（可用 `DUCKPORT_INSTALL_DIR` 覆盖）
+1. 克隆仓库到 `$HOME/code/duckport-rs`（可用 `DUCKPORT_INSTALL_DIR` 覆盖）
 2. 从 GitHub Release 下载预构建的 `duckport-server` binary（MD5 比对，已安装且未变化时跳过）
 3. 无 Release 时自动回落到本机 `cargo build --release`
 4. 写入 `/opt/duckport/server.env`（已存在时跳过，不会覆盖已有配置）
@@ -131,7 +131,7 @@ duckport status
 duckport upgrade
 
 # 手动重新执行
-bash /w/code/duckport-rs/deploy.sh
+bash "$HOME/code/duckport-rs/deploy.sh"
 ```
 
 ## 6. 手动构建与部署
