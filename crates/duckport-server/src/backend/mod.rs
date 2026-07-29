@@ -181,4 +181,21 @@ impl Backend {
         .await
         .context("duckdb writer task panicked")?
     }
+
+    /// Flush the WAL into the database file. Intended for graceful shutdown after
+    /// in-flight RPCs have drained; connections are released when `Backend` drops.
+    pub async fn checkpoint(&self) -> Result<()> {
+        info!(
+            db_path = %self.inner.db_path.display(),
+            "checkpointing DuckDB before shutdown"
+        );
+        self.with_writer(|conn| {
+            conn.execute_batch("CHECKPOINT")?;
+            Ok(())
+        })
+        .await
+        .context("CHECKPOINT during shutdown")?;
+        info!("DuckDB checkpoint complete");
+        Ok(())
+    }
 }

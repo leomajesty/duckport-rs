@@ -148,7 +148,7 @@ Python 侧 `DuckportClient` 封装 + `DataJobs` 集成，将 kline 写入从本�
 
 - HTTP `/healthz` + `/readyz` 端点 (tonic-health 或独立 axum)
 - Prometheus 指标：`duckport_append_rows_total`, `duckport_write_duration_seconds`, `duckport_write_rollback_total`, `duckport_read_pool_active`
-- 优雅关停 (SIGTERM → drain inflight → close DuckDB)
+- ~~优雅关停 (SIGTERM → drain inflight → CHECKPOINT → close DuckDB)~~ ✅
 - Token 认证：`Authorization: Bearer <secret>` tonic interceptor
 
 ### Phase 5 — 生产加固

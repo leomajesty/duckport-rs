@@ -42,12 +42,17 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{Datelike, NaiveDate, Timelike, Utc};
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::backend::Backend;
 
 /// Spawn the retention scheduler as a background tokio task.
-pub fn spawn(backend: Backend, table: String) {
+///
+/// Dropping or sending on the returned sender cancels the wait loop (an in-flight
+/// `run_once` is allowed to finish first).
+pub fn spawn(backend: Backend, table: String) -> oneshot::Sender<()> {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     tokio::spawn(async move {
         loop {
             let delay = secs_until_next_run();
@@ -57,13 +62,20 @@ pub fn spawn(backend: Backend, table: String) {
                 %table,
                 "retention: next run scheduled"
             );
-            tokio::time::sleep(Duration::from_secs(delay)).await;
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("retention: shutdown requested");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+            }
 
             if let Err(e) = run_once(&backend, &table).await {
                 error!(err = ?e, "retention: run failed");
             }
         }
     });
+    shutdown_tx
 }
 
 /// Seconds from now until the next 8-hour UTC boundary + 3 m 30 s.

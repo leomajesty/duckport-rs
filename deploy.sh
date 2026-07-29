@@ -292,6 +292,9 @@ Group=root
 WorkingDirectory=/opt/duckport
 EnvironmentFile=/opt/duckport/server.env
 ExecStart=/opt/duckport/bin/duckport-server
+# SIGTERM → drain inflight RPCs → CHECKPOINT → exit 0
+KillSignal=SIGTERM
+TimeoutStopSec=60
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -315,6 +318,9 @@ WorkingDirectory=/opt/duckport/ingestors/%i
 EnvironmentFile=/opt/duckport/ingestors/%i/config.env
 Environment=INGESTOR_ENV_FILE=/opt/duckport/ingestors/%i/config.env
 ExecStart=/opt/duckport/bin/ingestor-run %i
+# Ingestor handles SIGTERM (client.close) before exit
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536

@@ -75,12 +75,16 @@ async fn main() -> Result<()> {
         cfg.catalog_name.clone(),
     ));
 
-    if cfg.retention_enabled {
+    let retention_shutdown = if cfg.retention_enabled {
         info!(table = %cfg.retention_table, "retention scheduler enabled");
-        retention::spawn(backend.clone(), cfg.retention_table.clone());
+        Some(retention::spawn(
+            backend.clone(),
+            cfg.retention_table.clone(),
+        ))
     } else {
         info!("retention scheduler disabled (DUCKPORT_RETENTION_ENABLED=false)");
-    }
+        None
+    };
 
     let duckport_svc =
         DuckportService::new(airport_server, backend.clone(), cfg.catalog_name.clone());
@@ -89,14 +93,56 @@ async fn main() -> Result<()> {
         .max_decoding_message_size(max_msg)
         .max_encoding_message_size(max_msg);
 
+    // Bind only after DuckDB + schema are ready so clients never see a half-booted server.
     info!(%advertised, "duckport Flight service ready (airport read plane + duckport.* write plane)");
     tonic::transport::Server::builder()
         .add_service(flight_svc)
-        .serve(cfg.listen_addr)
+        .serve_with_shutdown(cfg.listen_addr, shutdown_signal())
         .await
         .context("tonic transport")?;
 
+    info!("Flight service drained, shutting down");
+
+    if let Some(tx) = retention_shutdown {
+        let _ = tx.send(());
+    }
+
+    if let Err(e) = backend.checkpoint().await {
+        tracing::warn!(err = ?e, "shutdown CHECKPOINT failed");
+    }
+
+    info!("duckport shutdown complete");
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM (systemd / launchd stop).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(err = %e, "failed to install Ctrl+C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT, starting graceful shutdown"),
+        _ = terminate => info!("received SIGTERM, starting graceful shutdown"),
+    }
 }
 
 /// Create and migrate duckport-managed metadata tables.
