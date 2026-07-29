@@ -1,0 +1,6 @@
+interface:
+  display_name: "duckport-rs"
+  short_description: "Operate and develop local duckport-rs"
+  default_prompt: "Use $duckport-rs to check duckport status, inspect Flight RPC health, or debug an ingestor."
+policy:
+  allow_implicit_invocation: true

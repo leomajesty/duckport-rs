@@ -185,9 +185,11 @@ BINARY_URL=$(_get_binary_url || true)
 
 if [[ -n "$BINARY_URL" ]]; then
   info "下载：$BINARY_URL"
-  curl -fsSL \
+  # --progress-bar：TTY 下显示进度条；-f 保留 HTTP 错误失败；不加 -s 以免静默掉进度
+  curl -fL --progress-bar \
     ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
     "$BINARY_URL" -o "$TMP_BIN"
+  echo
 else
   info "GitHub Release 暂无预构建包，尝试本机编译..."
   SRC_BIN=$(_build_from_source)
