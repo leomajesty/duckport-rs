@@ -56,5 +56,78 @@
         "empty_hint": "留空跳过"
       }
     ]
+  },
+  "aster-ingestor": {
+    "repo": "https://github.com/fdguuwzj/duckport-aster-ingestor.git",
+    "description": "Aster USDT-Perp K-line ingestor",
+    "exec": "aster-ingestor",
+    "default_instance": "aster-1h",
+    "config": [
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K 线周期",
+        "default": "1h"
+      },
+      {
+        "name": "DATA_SOURCES",
+        "label": "DATA_SOURCES",
+        "default": "aster_perp"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "2"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-09-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
+  },
+  "binance-open-interest": {
+    "repo": "https://github.com/fdguuwzj/duckport-binance-open-interest.git",
+    "description": "Binance USD-M open-interest ingestor (5m history or 1m snapshot)",
+    "exec": "binance-open-interest",
+    "default_instance": "binance-open-interest-5m",
+    "config": [
+      {
+        "name": "OI_MODE",
+        "label": "采集模式 history/snapshot",
+        "default": "history"
+      },
+      {
+        "name": "BACKFILL_DAYS",
+        "label": "历史回补天数",
+        "default": "30"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "8"
+      },
+      {
+        "name": "REQUEST_INTERVAL_SECONDS",
+        "label": "请求间隔秒数",
+        "default": "0.34"
+      },
+      {
+        "name": "POLL_DELAY_SECONDS",
+        "label": "周期延迟秒数",
+        "default": "30"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
   }
 }

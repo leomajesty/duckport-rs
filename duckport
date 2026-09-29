@@ -393,6 +393,19 @@ cmd_logs() {
 
 _registry_file() { echo "$REPO_DIR/ingestor/registry.json"; }
 
+# 仓库内 ingestor/<插件名> 优先；否则回退到同级目录 duckport-<插件名>
+_plugin_src() {
+  local plugin="${1//_/-}"
+  local in_repo="$REPO_DIR/ingestor/$plugin"
+  local sibling
+  sibling="$(dirname "$REPO_DIR")/duckport-${plugin}"
+  if [[ -f "$in_repo/pyproject.toml" ]]; then
+    echo "$in_repo"
+  elif [[ -f "$sibling/pyproject.toml" ]]; then
+    echo "$sibling"
+  fi
+}
+
 _registry_get() {
   local plugin="${1//_/-}"
   local field="$2"
@@ -533,10 +546,10 @@ cmd_install() {
   uv venv --python "$python_ver" "$inst_dir/.venv" -q
 
   local inst_py="$inst_dir/.venv/bin/python3"
-  # 优先本地 checkout（开发模式），否则从 git 安装
+  # 优先仓库内或同级目录源码，否则从 git 安装
   local local_src
-  local_src="$(dirname "$REPO_DIR")/duckport-${plugin}"
-  if [[ -f "$local_src/pyproject.toml" ]]; then
+  local_src="$(_plugin_src "$plugin")"
+  if [[ -n "$local_src" ]]; then
     echo -e "  使用本地源码：$local_src"
     _uv_install -e "$local_src" --python "$inst_py"
   else
@@ -712,11 +725,18 @@ except: pass
   echo -e "\n${BOLD}更新实例：$name${NC}  (exec=$exec_cmd)"
 
   local local_src
-  local_src="$(dirname "$REPO_DIR")/duckport-${plugin_name:-$exec_cmd}"
+  local_src="$(_plugin_src "${plugin_name:-$exec_cmd}")"
 
-  if [[ -f "$local_src/pyproject.toml" ]]; then
-    echo -e "  ${CYAN}本地源码模式：$local_src${NC}"
-    git -C "$local_src" pull --ff-only
+  if [[ -n "$local_src" ]]; then
+    case "$local_src" in
+      "$REPO_DIR"/*)
+        echo -e "  ${CYAN}仓库内源码：$local_src${NC}"
+        ;;
+      *)
+        echo -e "  ${CYAN}本地源码模式：$local_src${NC}"
+        git -C "$local_src" pull --ff-only
+        ;;
+    esac
     _uv_install -e "$local_src" --python "$inst_py"
   elif [[ -n "$repo" ]]; then
     echo -e "  ${CYAN}GitHub 模式：$repo${NC}"
