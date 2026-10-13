@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-REPO="leomajesty/duckport-rs"
+REPO="sjmc-quant/duckport-rs"
 INSTALL_DIR="${DUCKPORT_INSTALL_DIR:-$HOME/code/duckport-rs}"
 
 # 构造带认证的 clone URL（私有仓库需要 GITHUB_TOKEN）
