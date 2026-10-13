@@ -43,6 +43,7 @@ def _build_resample_fragment(
     symbol: Optional[str] = None,
     *,
     end_inclusive: bool = True,
+    extra_predicate: Optional[str] = None,
 ) -> str:
     """Build a single resample sub-query (GROUP BY + HAVING) for one data source."""
     end_op = "<=" if end_inclusive else "<"
@@ -53,6 +54,8 @@ def _build_resample_fragment(
     WHERE open_time >= '{_fmt_ts(begin)}' AND open_time {end_op} '{_fmt_ts(end)}'"""
     if symbol:
         sql += f"\n      AND symbol = '{symbol}'"
+    if extra_predicate:
+        sql += f"\n      AND {extra_predicate}"
     sql += f"""
     GROUP BY symbol, resample_time
     HAVING count(open_time) = {interval // kline_interval_minutes}
@@ -68,6 +71,8 @@ def build_duckdb_resample_sql(
     end: datetime,
     kline_interval_minutes: int,
     symbol: Optional[str] = None,
+    *,
+    extra_predicate: Optional[str] = None,
 ) -> str:
     """Build a resample query against a DuckDB table (recent data)."""
     return _build_resample_fragment(
@@ -78,4 +83,5 @@ def build_duckdb_resample_sql(
         end=end,
         kline_interval_minutes=kline_interval_minutes,
         symbol=symbol,
+        extra_predicate=extra_predicate,
     )

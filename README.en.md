@@ -274,7 +274,21 @@ c = DuckportConsumer(
     suffix="_5m",
     # Plan A: pqt_path / redundancy_hours deprecated (queries data.kline_* main table only)
 )
+
+# interval is the resample size in minutes. It must divide 60 and be a
+# multiple of kline_interval_minutes. Omitting asset_class returns both
+# Crypto and TradFi for usdt_perp.
+bars = c.get_market("usdt_perp", interval=60)
+crypto = c.get_market("usdt_perp", interval=60, asset_class="crypto")
+tradfi = c.get_market("usdt_perp", interval=60, asset_class="tradifi")
+# EQUITY includes EQUITY, HK_EQUITY, KR_EQUITY, and CN_EQUITY.
+equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
+# Any other value matches exginfo.underlying_type exactly, e.g. COMMODITY, FX, PREMARKET, COIN.
+gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
+info = c.get_exginfo("usdt_perp", asset_class="tradifi")
 ```
+
+`asset_class` applies only to `usdt_perp`, on `get_market`, `get_symbol`, and `get_exginfo`. `crypto` selects `contract_type='PERPETUAL'`; `tradifi` selects `TRADIFI_PERPETUAL`. Do not pass it for `usdt_spot`. A raw `query()` against `usdt_perp_5m` or `usdt_perp_funding` is not filtered.
 
 ---
 

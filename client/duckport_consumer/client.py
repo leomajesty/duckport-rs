@@ -10,6 +10,7 @@ that mirror the old FlightClient interface (get_market / get_symbol / get_exginf
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -20,6 +21,96 @@ import pyarrow.flight as flight
 from duckport_consumer.resample import build_duckdb_resample_sql
 
 logger = logging.getLogger("duckport_consumer")
+
+_KLINE_MARKETS = ("usdt_perp", "usdt_spot")
+_EQUITY_UNDERLYING_TYPES = ("EQUITY", "HK_EQUITY", "KR_EQUITY", "CN_EQUITY")
+_ASSET_CLASS_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _asset_class_clause(asset_class: str) -> str:
+    """Extra exginfo predicate for an usdt_perp asset_class value.
+
+    ``crypto`` / ``tradifi`` select contract types. ``EQUITY`` also includes
+    HK, KR and CN equity. Any other value matches ``underlying_type`` exactly.
+    """
+    if not _ASSET_CLASS_RE.fullmatch(asset_class):
+        raise ValueError(f"Invalid asset_class: {asset_class!r}")
+    key = asset_class.upper()
+    if key == "CRYPTO":
+        return "contract_type = 'PERPETUAL'"
+    if key in ("TRADIFI", "TRADFI"):
+        return "contract_type = 'TRADIFI_PERPETUAL'"
+    if key == "EQUITY":
+        listed = ", ".join(f"'{name}'" for name in _EQUITY_UNDERLYING_TYPES)
+        return (
+            "contract_type = 'TRADIFI_PERPETUAL' "
+            f"AND underlying_type IN ({listed})"
+        )
+    return f"underlying_type = '{key}'"
+
+
+def usdt_perp_asset_where(asset_class: Optional[str] = None) -> str:
+    """WHERE fragment for data.exginfo rows of market usdt_perp."""
+    where = "market = 'usdt_perp'"
+    if asset_class is None:
+        return where
+    if not isinstance(asset_class, str):
+        raise ValueError(f"Invalid asset_class: {asset_class!r}")
+    return f"{where} AND {_asset_class_clause(asset_class)}"
+
+
+def build_exginfo_sql(
+    schema: str,
+    market: str,
+    asset_class: Optional[str] = None,
+) -> str:
+    """SQL for get_exginfo. Omitting asset_class keeps the original statement."""
+    if market not in _KLINE_MARKETS:
+        raise ValueError(f"Unsupported market: {market}")
+    if asset_class is not None and market != "usdt_perp":
+        raise ValueError("asset_class is only supported for market 'usdt_perp'")
+    if market == "usdt_spot" or asset_class is None:
+        return f"SELECT * FROM {schema}.exginfo WHERE market = '{market}'"
+    return (
+        f"SELECT * FROM {schema}.exginfo WHERE {usdt_perp_asset_where(asset_class)}"
+    )
+
+
+def build_market_kline_sql(
+    schema: str,
+    suffix: str,
+    market: str,
+    interval: int,
+    offset: int,
+    begin: datetime,
+    end: datetime,
+    kline_interval_minutes: int,
+    symbol: Optional[str] = None,
+    asset_class: Optional[str] = None,
+) -> str:
+    """Resample SQL. asset_class filters usdt_perp symbols via exginfo."""
+    if market not in _KLINE_MARKETS:
+        raise ValueError(f"Unsupported market: {market}")
+    if asset_class is not None and market != "usdt_perp":
+        raise ValueError("asset_class is only supported for market 'usdt_perp'")
+    extra = None
+    if asset_class is not None:
+        extra = (
+            "symbol IN ("
+            f"SELECT symbol FROM {schema}.exginfo "
+            f"WHERE {usdt_perp_asset_where(asset_class)}"
+            ")"
+        )
+    return build_duckdb_resample_sql(
+        f"{schema}.{market}{suffix}",
+        interval,
+        offset,
+        begin,
+        end,
+        kline_interval_minutes,
+        symbol,
+        extra_predicate=extra,
+    )
 
 
 class DuckportConsumer:
@@ -126,12 +217,19 @@ class DuckportConsumer:
         offset: int = 0,
         begin: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        *,
+        asset_class: Optional[str] = None,
     ) -> pa.Table:
         """Resample K-line data for all symbols in a market.
 
-        Mirrors old FlightClient.get_market().
+        Mirrors old FlightClient.get_market(). ``asset_class`` applies only to
+        ``usdt_perp``. Omit it to keep the original mixed result. ``crypto``
+        and ``tradifi`` select contract types. ``EQUITY`` also includes HK, KR
+        and CN equity. Other values match ``exginfo.underlying_type``.
         """
-        return self._resample_query(market, interval, offset, begin, end)
+        return self._resample_query(
+            market, interval, offset, begin, end, asset_class=asset_class,
+        )
 
     def get_symbol(
         self,
@@ -141,23 +239,32 @@ class DuckportConsumer:
         offset: int = 0,
         begin: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        *,
+        asset_class: Optional[str] = None,
     ) -> pa.Table:
         """Resample K-line data for a single symbol.
 
-        Mirrors old FlightClient.get_symbol().
+        Mirrors old FlightClient.get_symbol(). See :meth:`get_market` for
+        ``asset_class``.
         """
-        return self._resample_query(market, interval, offset, begin, end, symbol)
+        return self._resample_query(
+            market, interval, offset, begin, end, symbol,
+            asset_class=asset_class,
+        )
 
-    def get_exginfo(self, market: str) -> pa.Table:
+    def get_exginfo(
+        self,
+        market: str,
+        *,
+        asset_class: Optional[str] = None,
+    ) -> pa.Table:
         """Fetch exchange info for a market.
 
-        Mirrors old FlightClient.get_exginfo().
+        Mirrors old FlightClient.get_exginfo(). ``usdt_perp`` and ``usdt_spot``
+        without ``asset_class`` are unchanged. On ``usdt_perp``, ``asset_class``
+        restricts rows the same way as :meth:`get_market`.
         """
-        if market not in ("usdt_perp", "usdt_spot"):
-            raise ValueError(f"Unsupported market: {market}")
-        return self.query(
-            f"SELECT * FROM {self._schema}.exginfo WHERE market = '{market}'"
-        )
+        return self.query(build_exginfo_sql(self._schema, market, asset_class))
 
     # ------------------------------------------------------------------
     # Internal
@@ -171,10 +278,11 @@ class DuckportConsumer:
         begin: Optional[datetime],
         end: Optional[datetime],
         symbol: Optional[str] = None,
+        asset_class: Optional[str] = None,
     ) -> pa.Table:
         if self._pqt_path is not None or self._redundancy_hours != 1:
             self._log_plan_a_deprecation()
-        if market not in ("usdt_perp", "usdt_spot"):
+        if market not in _KLINE_MARKETS:
             raise ValueError(f"Unsupported market: {market}")
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}")
@@ -202,21 +310,22 @@ class DuckportConsumer:
             end = pd.to_datetime(end)
             end = end.tz_convert(timezone.utc) if end.tzinfo is not None else end.tz_localize(timezone.utc)
 
-        table_name = f"{self._schema}.{market}{self._suffix}"
-
         logger.info(
-            "resample (Plan A: DuckDB only) market=%s interval=%d begin=%s end=%s symbol=%s",
-            market, interval, begin, end, symbol,
+            "resample (Plan A: DuckDB only) market=%s interval=%d begin=%s end=%s symbol=%s asset_class=%s",
+            market, interval, begin, end, symbol, asset_class,
         )
 
-        sql = build_duckdb_resample_sql(
-            table_name,
+        sql = build_market_kline_sql(
+            self._schema,
+            self._suffix,
+            market,
             interval,
             offset,
             begin,
             end,
             self._kline_interval_minutes,
             symbol,
+            asset_class,
         )
         try:
             return self.query(sql)

@@ -337,18 +337,32 @@ uv pip install -e .
 ```python
 from duckport_consumer import DuckportConsumer
 
-consumer = DuckportConsumer(addr="localhost:50051", schema="data")
+consumer = DuckportConsumer(
+    addr="localhost:50051",
+    schema="data",
+    kline_interval_minutes=5,
+    suffix="_5m",
+)
 
-# 查询 K 线数据
-table = consumer.get_market("usdt_perp", interval="5m", limit=1000)
+# interval 是重采样分钟数。不传 asset_class 时同时返回 Crypto 与 TradFi。
+table = consumer.get_market("usdt_perp", interval=60)
 df = table.to_pandas()
 
-# 执行自定义 SQL
+# 只查 Crypto 永续、全部 TradFi、股票（含港股/韩股/A股）或商品。
+consumer.get_market("usdt_perp", interval=60, asset_class="crypto")
+consumer.get_market("usdt_perp", interval=60, asset_class="tradifi")
+consumer.get_market("usdt_perp", interval=60, asset_class="EQUITY")
+consumer.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
+consumer.get_exginfo("usdt_perp", asset_class="tradifi")
+
+# 执行自定义 SQL。这条不套用 asset_class。
 table = consumer.query("SELECT * FROM data.usdt_perp_5m WHERE symbol = 'BTCUSDT' ORDER BY open_time DESC LIMIT 100")
 
 # 获取最新水位线
 duck_time = consumer.read_duck_time("usdt_perp")
 ```
+
+`asset_class` 只用于 `usdt_perp`。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`EQUITY` 展开为 `EQUITY`、`HK_EQUITY`、`KR_EQUITY`、`CN_EQUITY`；`COMMODITY`、`FX`、`PREMARKET`、`COIN` 等按 `exginfo.underlying_type` 精确匹配。`usdt_spot` 传入该参数会报错。
 
 ### 8.3 Airport 扩展直连（可选）
 

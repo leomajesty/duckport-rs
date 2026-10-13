@@ -273,7 +273,20 @@ c = DuckportConsumer(
     suffix="_5m",
     # Plan A: pqt_path / redundancy_hours 已弃用（仍仅查 data.kline_* 主表）
 )
+
+# interval 是重采样分钟数，必须能整除 60，并且是 kline_interval_minutes 的倍数。
+# 不传 asset_class 时，usdt_perp 同时返回 Crypto 与 TradFi。
+bars = c.get_market("usdt_perp", interval=60)
+crypto = c.get_market("usdt_perp", interval=60, asset_class="crypto")
+tradfi = c.get_market("usdt_perp", interval=60, asset_class="tradifi")
+# EQUITY 包含 EQUITY、HK_EQUITY、KR_EQUITY、CN_EQUITY。
+equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
+# 其他值按 exginfo.underlying_type 精确匹配，例如 COMMODITY、FX、PREMARKET、COIN。
+gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
+info = c.get_exginfo("usdt_perp", asset_class="tradifi")
 ```
+
+`asset_class` 只对 `usdt_perp` 生效，`get_market`、`get_symbol`、`get_exginfo` 共用。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`usdt_spot` 不能传这个参数。直接 `query()` 读 `usdt_perp_5m` 或 `usdt_perp_funding` 不会套用该过滤。
 
 ---
 

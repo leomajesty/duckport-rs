@@ -407,6 +407,82 @@ def test_resample_builder():
         fail("resample with symbol filter", e)
         traceback.print_exc()
 
+    # T3: omitting asset_class keeps usdt_perp SQL; filters are optional
+    try:
+        from duckport_consumer.client import (
+            build_exginfo_sql,
+            build_market_kline_sql,
+        )
+
+        perp_sql = build_market_kline_sql(
+            "data", "_5m", "usdt_perp", 5, 0, past, now, 1,
+        )
+        plain_sql = build_duckdb_resample_sql(
+            "data.usdt_perp_5m", 5, 0, past, now, 1,
+        )
+        assert perp_sql == plain_sql
+        assert "TRADIFI_PERPETUAL" not in perp_sql
+        assert "contract_type" not in perp_sql
+
+        crypto_sql = build_market_kline_sql(
+            "data", "_5m", "usdt_perp", 5, 0, past, now, 1,
+            asset_class="crypto",
+        )
+        assert "data.usdt_perp_5m" in crypto_sql
+        assert "contract_type = 'PERPETUAL'" in crypto_sql
+        assert "TRADIFI_PERPETUAL" not in crypto_sql
+
+        tradfi_sql = build_market_kline_sql(
+            "data", "_5m", "usdt_perp", 5, 0, past, now, 1,
+            asset_class="tradifi",
+        )
+        assert "contract_type = 'TRADIFI_PERPETUAL'" in tradfi_sql
+        assert "underlying_type" not in tradfi_sql
+
+        equity_sql = build_market_kline_sql(
+            "data", "_5m", "usdt_perp", 5, 0, past, now, 1,
+            asset_class="EQUITY",
+        )
+        for name in ("EQUITY", "HK_EQUITY", "KR_EQUITY", "CN_EQUITY"):
+            assert f"'{name}'" in equity_sql
+        assert "underlying_type IN" in equity_sql
+
+        commodity_sql = build_market_kline_sql(
+            "data", "_5m", "usdt_perp", 5, 0, past, now, 1,
+            asset_class="COMMODITY",
+        )
+        assert "underlying_type = 'COMMODITY'" in commodity_sql
+        assert "HK_EQUITY" not in commodity_sql
+
+        assert build_exginfo_sql("data", "usdt_perp") == (
+            "SELECT * FROM data.exginfo WHERE market = 'usdt_perp'"
+        )
+        assert "contract_type = 'TRADIFI_PERPETUAL'" in build_exginfo_sql(
+            "data", "usdt_perp", "tradifi",
+        )
+        equity_info = build_exginfo_sql("data", "usdt_perp", "EQUITY")
+        assert "HK_EQUITY" in equity_info
+        assert "usdt_tradfi" not in equity_info
+        try:
+            build_market_kline_sql(
+                "data", "_5m", "usdt_spot", 5, 0, past, now, 1,
+                asset_class="crypto",
+            )
+            raise AssertionError("usdt_spot accepted asset_class")
+        except ValueError:
+            pass
+        try:
+            build_market_kline_sql(
+                "data", "_5m", "usdt_tradfi", 5, 0, past, now, 1,
+            )
+            raise AssertionError("usdt_tradfi is still a market")
+        except ValueError:
+            pass
+        ok("usdt_perp asset_class filter leaves the default SQL unchanged")
+    except Exception as e:
+        fail("usdt_perp asset_class filter leaves the default SQL unchanged", e)
+        traceback.print_exc()
+
 
 # ──────────────────────────────────────────────────────────────────
 
