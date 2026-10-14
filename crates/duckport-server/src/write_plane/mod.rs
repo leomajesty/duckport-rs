@@ -24,14 +24,16 @@ use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::debug;
 
+use crate::access;
 use crate::backend::Backend;
+use crate::read_limit::{self, recover_status};
 
 /// Shorthand for the boxed, pinned, `Send + 'static` streams every Flight RPC uses.
 pub type DuckportStream<T> =
@@ -72,6 +74,24 @@ where
 {
     let (meta, inner, ext) = resp.into_parts();
     let stream: DuckportStream<T> = Box::pin(inner);
+    Response::from_parts(meta, stream, ext)
+}
+
+fn map_stream_status<T>(resp: Response<DuckportStream<T>>) -> Response<DuckportStream<T>>
+where
+    T: Send + 'static,
+{
+    let (meta, inner, ext) = resp.into_parts();
+    let stream: DuckportStream<T> = Box::pin(inner.map(|item| {
+        item.map_err(|status| {
+            let text = status.to_string();
+            if text.contains("resource_exhausted:") || text.contains("deadline_exceeded:") {
+                recover_status(&text)
+            } else {
+                status
+            }
+        })
+    }));
     Response::from_parts(meta, stream, ext)
 }
 
@@ -124,20 +144,29 @@ impl FlightService for DuckportService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let access = access::from_request(&request);
         let ticket_bytes = &request.get_ref().ticket;
         if let Ok(qt) = serde_json::from_slice::<proto::QueryTicket>(ticket_bytes) {
             if qt.r#type == "duckport.query" {
                 debug!(sql_len = qt.sql.len(), "intercepted duckport.query DoGet");
-                return query::handle_query(self.backend.clone(), &qt.sql).await;
+                return query::handle_query(self.backend.clone(), &qt.sql, access.doget_limits)
+                    .await;
             }
         }
-        self.airport.do_get(request).await.map(forward)
+        let response = match access.doget_limits {
+            Some(limits) => read_limit::with_limits(limits, self.airport.do_get(request))
+                .await
+                .map(forward)?,
+            None => self.airport.do_get(request).await.map(forward)?,
+        };
+        Ok(map_stream_status(response))
     }
 
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        access::from_request(&request).ensure_write()?;
         // Peek the first FlightData to read the FlightDescriptor. Bulk append uses
         // path = ["duckport.append", <schema>, <table>]. Anything else is rejected:
         // tonic::Streaming can't be rebuilt from arbitrary streams so we can't
@@ -183,6 +212,7 @@ impl FlightService for DuckportService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        access::from_request(&request).ensure_write()?;
         self.airport.do_exchange(request).await.map(forward)
     }
 
@@ -193,7 +223,9 @@ impl FlightService for DuckportService {
         // Split off metadata/extensions so we can either act locally or rebuild the
         // Request and hand it to airport. We must preserve metadata because airport's
         // `authenticate_request` reads auth headers from it.
+        let access = access::from_request(&request);
         let (meta, ext, action) = request.into_parts();
+        access.ensure_action(&action.r#type)?;
 
         if action.r#type.starts_with(actions::PREFIX) {
             debug!(action = %action.r#type, "handling duckport.* action locally");
@@ -220,8 +252,7 @@ impl FlightService for DuckportService {
                 description: desc.to_string(),
             });
         let extra_stream = futures::stream::iter(extras.map(Ok));
-        let combined: DuckportStream<ActionType> =
-            Box::pin(extra_stream.chain(airport_stream));
+        let combined: DuckportStream<ActionType> = Box::pin(extra_stream.chain(airport_stream));
 
         Ok(Response::from_parts(meta, combined, ext))
     }

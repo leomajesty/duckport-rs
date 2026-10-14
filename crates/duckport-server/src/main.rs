@@ -6,9 +6,11 @@
 //! `duckport.execute_transaction` / `duckport.append`; Airport's DynamicCatalog and
 //! TransactionManager are intentionally left unwired (single-track DDL).
 
+mod access;
 mod airport_adapter;
 mod backend;
 mod config;
+mod read_limit;
 mod retention;
 mod write_plane;
 
@@ -17,9 +19,12 @@ use std::sync::Arc;
 use airport::flight::Server as AirportServer;
 use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
-use tracing::info;
+use tonic::service::interceptor::InterceptedService;
+use tonic::Request;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::access::AccessPolicy;
 use crate::airport_adapter::DuckDbCatalog;
 use crate::backend::Backend;
 use crate::config::Config;
@@ -69,11 +74,27 @@ async fn main() -> Result<()> {
     // (which intercepts `duckport.*` DoActions for the custom write plane).
     let airport_server = Arc::new(AirportServer::new(
         catalog,
-        None, // no auth yet — see roadmap (Bearer token)
+        None, // zone + bearer checks live in AccessInterceptor, not airport auth
         advertised.clone(),
         None, // tx_manager intentionally unwired: transactions go via duckport.execute_transaction (single-track)
         cfg.catalog_name.clone(),
     ));
+
+    let policy = Arc::new(AccessPolicy::from_config(&cfg)?);
+    if policy.auth_enabled() && cfg.tls.is_none() {
+        warn!(
+            "DUCKPORT_AUTH_TOKENS is set but TLS is disabled; bearer tokens will travel in cleartext"
+        );
+    }
+    info!(
+        auth_required = policy.auth_enabled(),
+        token_count = policy.token_count(),
+        trusted_cidrs = cfg.trusted_cidrs.len(),
+        doget_max_bytes = cfg.doget_max_bytes,
+        doget_timeout_secs = cfg.doget_timeout.as_secs(),
+        tls = cfg.tls.is_some(),
+        "access policy"
+    );
 
     let retention_shutdown = if cfg.retention_enabled {
         info!(table = %cfg.retention_table, "retention scheduler enabled");
@@ -92,10 +113,28 @@ async fn main() -> Result<()> {
     let flight_svc = FlightServiceServer::new(duckport_svc)
         .max_decoding_message_size(max_msg)
         .max_encoding_message_size(max_msg);
+    let gate = policy.clone();
+    let flight_svc = InterceptedService::new(flight_svc, move |mut req: Request<()>| {
+        let ctx = gate.authorize(req.remote_addr(), req.metadata())?;
+        tracing::debug!(
+            zone = ?ctx.zone,
+            identity = ctx.identity.as_deref().unwrap_or(""),
+            "request zone"
+        );
+        req.extensions_mut().insert(ctx);
+        Ok::<_, tonic::Status>(req)
+    });
 
     // Bind only after DuckDB + schema are ready so clients never see a half-booted server.
     info!(%advertised, "duckport Flight service ready (airport read plane + duckport.* write plane)");
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = cfg.tls.clone() {
+        let identity = tonic::transport::Identity::from_pem(tls.cert_pem, tls.key_pem);
+        builder = builder
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+            .context("configure TLS")?;
+    }
+    builder
         .add_service(flight_svc)
         .serve_with_shutdown(cfg.listen_addr, shutdown_signal())
         .await

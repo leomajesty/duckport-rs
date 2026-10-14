@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "duckport-server"
-version = "0.1.0"
+version = "1.0.4"
 dependencies = [
  "airport",
  "anyhow",
@@ -755,9 +755,11 @@ dependencies = [
  "chrono",
  "duckdb",
  "futures",
+ "ipnet",
  "r2d2",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

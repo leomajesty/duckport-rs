@@ -182,7 +182,21 @@ duckport-server 通过**环境变量**配置，所有变量以 `DUCKPORT_` 为�
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(空)* | DuckDB 内存上限（如 `4GB`，空 = 不限制） |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | **Plan A 默认关闭**：不启动周期 `COPY+DELETE`；设为 `true` 启用旧版热数据归档 |
 | `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 周期任务行所在表（由 ingestor 在 `RETENTION_ENABLED=true` 时写入） |
+| `DUCKPORT_AUTH_TOKENS` | *(空)* | `名字:令牌`，逗号分隔。空则拒绝全部公网访问。本机始终不鉴权；局域网在未配置令牌时仍可读写 |
+| `DUCKPORT_TRUSTED_CIDRS` | *(空)* | 额外视为局域网的 CIDR。不能把地址变成免鉴权的本机 |
+| `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 仅公网 DoGet 的 Arrow 字节上限（16MiB）。`0` 表示不限制 |
+| `DUCKPORT_DOGET_TIMEOUT_SECS` | `10` | 仅公网 DoGet 的超时秒数。`0` 表示不限制。到点后中断该查询 |
+| `DUCKPORT_TLS_CERT` | *(空)* | 服务端 PEM 证书路径。必须与 `DUCKPORT_TLS_KEY` 同时设置 |
+| `DUCKPORT_TLS_KEY` | *(空)* | 服务端 PEM 私钥路径 |
 | `RUST_LOG` | `info` | 日志级别（`debug`, `info`, `warn`, `error`） |
+
+来源地址分三区，按 TCP 对端判断，不看 `X-Forwarded-For`：
+
+- **本机**（`127.0.0.0/8`、`::1`）不鉴权，读写都不限制 DoGet。
+- **局域网**（RFC1918、IPv6 `fc00::/7`，以及 `DUCKPORT_TRUSTED_CIDRS`）可以写入。配置了令牌时必须带 `Authorization: Bearer`。DoGet 不限制。
+- **公网**（其余地址，含 CGNAT）在 `DUCKPORT_AUTH_TOKENS` 为空时全部拒绝。配置令牌后只能读，写入直接拒绝，DoGet 受字节和超时上限约束。
+
+客户端用 `DUCKPORT_TOKEN` 或连接参数带令牌。地址写成 `grpc+tls://host:port` 时走 TLS。只配置令牌、不配置 TLS 时，服务启动会告警。
 
 ### 4.2 生产环境推荐配置
 
@@ -720,6 +734,12 @@ DuckDB 单写模型意味着**同一个数据库文件只能被一个 duckport-s
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(空)* | 否 |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | 否 |
 | `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 否 |
+| `DUCKPORT_AUTH_TOKENS` | *(空)* | 否 |
+| `DUCKPORT_TRUSTED_CIDRS` | *(空)* | 否 |
+| `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 否 |
+| `DUCKPORT_DOGET_TIMEOUT_SECS` | `10` | 否 |
+| `DUCKPORT_TLS_CERT` | *(空)* | 否 |
+| `DUCKPORT_TLS_KEY` | *(空)* | 否 |
 | `RUST_LOG` | `info` | 否 |
 
 ### Ingestor 实例（`/opt/duckport/ingestors/<name>/config.env`）

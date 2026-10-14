@@ -10,6 +10,7 @@ that mirror the old FlightClient interface (get_market / get_symbol / get_exginf
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -21,6 +22,45 @@ import pyarrow.flight as flight
 from duckport_consumer.resample import build_duckdb_resample_sql
 
 logger = logging.getLogger("duckport_consumer")
+
+
+def normalize_flight_location(addr: str) -> str:
+    """Accept ``host:port`` or a full ``grpc://`` / ``grpc+tls://`` URI."""
+    if addr.startswith("grpc://") or addr.startswith("grpc+tls://"):
+        return addr
+    return f"grpc://{addr}"
+
+
+def resolve_token(token: Optional[str] = None) -> str:
+    """Use an explicit token, otherwise ``DUCKPORT_TOKEN``. Empty means no auth header."""
+    if token is not None:
+        return token
+    return os.environ.get("DUCKPORT_TOKEN", "")
+
+
+class _BearerMiddleware(flight.ClientMiddleware):
+    def __init__(self, token: str) -> None:
+        self._value = f"Bearer {token}".encode()
+
+    def sending_headers(self):
+        return {b"authorization": self._value}
+
+
+class _BearerFactory(flight.ClientMiddlewareFactory):
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def start_call(self, info):
+        return _BearerMiddleware(self._token)
+
+
+def open_flight_client(addr: str, token: Optional[str] = None, **kwargs):
+    """Flight client. Loopback does not require a token; send one only when set."""
+    location = normalize_flight_location(addr)
+    resolved = resolve_token(token)
+    if resolved:
+        kwargs["middleware"] = [_BearerFactory(resolved)]
+    return flight.FlightClient(location, **kwargs)
 
 _KLINE_MARKETS = ("usdt_perp", "usdt_spot")
 _EQUITY_UNDERLYING_TYPES = ("EQUITY", "HK_EQUITY", "KR_EQUITY", "CN_EQUITY")
@@ -124,6 +164,9 @@ class DuckportConsumer:
         pqt_path: *Deprecated (Plan A).* Ignored. Previously used for hybrid
             `read_parquet` + hot table queries; all resample now uses DuckDB only.
         redundancy_hours: *Deprecated (Plan A).* Ignored.
+        token: Bearer token for non-loopback access. Defaults to ``DUCKPORT_TOKEN``.
+            Empty means the client sends no Authorization header. Loopback servers
+            do not require a token.
     """
 
     def __init__(
@@ -134,9 +177,11 @@ class DuckportConsumer:
         suffix: str = "_1m",
         pqt_path: Optional[str] = None,
         redundancy_hours: int = 1,
+        token: Optional[str] = None,
     ):
-        self._location = f"grpc://{addr}"
-        self._client = flight.FlightClient(self._location)
+        self._token = resolve_token(token)
+        self._location = normalize_flight_location(addr)
+        self._client = open_flight_client(self._location, token=self._token)
         self._schema = schema
         self._kline_interval_minutes = kline_interval_minutes
         self._suffix = suffix

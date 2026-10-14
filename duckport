@@ -148,6 +148,39 @@ _resolve_instances() {
   fi
 }
 
+# 查询正在运行的 duckport-server 版本（duckport.ping 的 server_version）。
+_server_version() {
+  local port="$1"
+  local py candidate inst
+  py=$(command -v python3)
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    candidate=$(_instance_python "$inst")
+    if [[ -x "$candidate" ]]; then
+      py="$candidate"
+      break
+    fi
+  done <<< "$(_list_instances)"
+
+  "$py" - "$port" << 'PY' 2>/dev/null || true
+import json
+import sys
+
+import pyarrow.flight as flight
+
+port = sys.argv[1]
+client = flight.FlightClient(f"grpc://127.0.0.1:{port}")
+try:
+    results = list(client.do_action(flight.Action("duckport.ping", b"")))
+    info = json.loads(results[0].body.to_pybytes())
+    version = info.get("server_version") or ""
+    if version:
+        print(version)
+finally:
+    client.close()
+PY
+}
+
 # ─── status ───────────────────────────────────────────────────────────────────
 
 cmd_status() {
@@ -166,8 +199,16 @@ cmd_status() {
   else
     sv_label="${DIM}○ ${sv_state}${NC}"
   fi
+  local version_label=""
+  if nc -z localhost "$server_port" 2>/dev/null; then
+    local ver
+    ver=$(_server_version "$server_port")
+    if [[ -n "$ver" ]]; then
+      version_label="  ${DIM}v${ver}${NC}"
+    fi
+  fi
   printf "  %-22s " "duckport-server"
-  echo -e "$sv_label  ${DIM}:${server_port}${NC}"
+  echo -e "$sv_label  ${DIM}:${server_port}${NC}${version_label}"
 
   echo -e "\n${BOLD}Ingestors${NC}"
   local instances

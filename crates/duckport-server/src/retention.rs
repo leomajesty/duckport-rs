@@ -83,9 +83,8 @@ fn secs_until_next_run() -> u64 {
     let now = Utc::now();
     let h = now.hour();
     let next_boundary_h = ((h / 8) + 1) * 8;
-    let secs_to_boundary = (next_boundary_h as i64 - h as i64) * 3600
-        - now.minute() as i64 * 60
-        - now.second() as i64;
+    let secs_to_boundary =
+        (next_boundary_h as i64 - h as i64) * 3600 - now.minute() as i64 * 60 - now.second() as i64;
     (secs_to_boundary + 210).max(1) as u64
 }
 
@@ -160,9 +159,7 @@ async fn process_task(backend: &Backend, task: &TaskRow) -> Result<()> {
     // Read current duck_time from config_dict.
     let schema = task.schema_name.clone();
     let key = format!("{}_duck_time", task.market);
-    let duck_sql = format!(
-        "SELECT value FROM {schema}.config_dict WHERE key = '{key}'"
-    );
+    let duck_sql = format!("SELECT value FROM {schema}.config_dict WHERE key = '{key}'");
     let duck_time_str: Option<String> = backend
         .with_reader(move |conn| {
             match conn.query_row(&duck_sql, [], |row| row.get::<_, String>(0)) {
@@ -185,7 +182,14 @@ async fn process_task(backend: &Backend, task: &TaskRow) -> Result<()> {
 
     let cutoff = duck_time.date() - chrono::Duration::days(task.retention_days as i64);
 
-    let pqt = match parquet_file_for(cutoff, &task.parquet_dir, &task.market, &task.interval, start_date, task.file_period) {
+    let pqt = match parquet_file_for(
+        cutoff,
+        &task.parquet_dir,
+        &task.market,
+        &task.interval,
+        start_date,
+        task.file_period,
+    ) {
         Some(p) => p,
         None => {
             info!(market = %task.market, "retention: no completed parquet period yet, skipping");
@@ -302,7 +306,11 @@ fn parquet_file_for(
         .join(format!("{market}_{interval}"))
         .join(filename);
 
-    Some(ParquetFileInfo { path, period_start, period_end })
+    Some(ParquetFileInfo {
+        path,
+        period_start,
+        period_end,
+    })
 }
 
 fn parse_naive_dt(s: &str) -> Option<chrono::NaiveDateTime> {

@@ -212,7 +212,7 @@ import pyarrow.flight as flight, json
 client = flight.FlightClient("grpc://localhost:50051")
 resp = list(client.do_action(flight.Action("duckport.ping", b"")))
 print(json.loads(resp[0].body.to_pybytes()))
-# {'server': 'duckport', 'server_version': '0.1.0', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
+# {'server': 'duckport', 'server_version': '1.0.4', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
 ```
 
 ### End-to-End Tests
@@ -242,6 +242,12 @@ All parameters are passed via environment variables, all prefixed with `DUCKPORT
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(empty, DuckDB default)* | DuckDB `memory_limit` PRAGMA, e.g. `"2GB"` |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | Plan A: no periodic `COPY+DELETE`; set `true` to enable legacy archival job |
 | `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | Task table (written by ingestors when `RETENTION_ENABLED=true`) |
+| `DUCKPORT_AUTH_TOKENS` | *(empty)* | Comma-separated `name:token` entries. Empty rejects every public peer. Loopback never requires a token; LAN stays open until tokens are set |
+| `DUCKPORT_TRUSTED_CIDRS` | *(empty)* | Extra CIDRs treated as LAN for writes. They do not become auth-exempt loopback |
+| `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | Public DoGet Arrow byte cap only (16MiB). `0` disables it |
+| `DUCKPORT_DOGET_TIMEOUT_SECS` | `10` | Public DoGet timeout in seconds. `0` disables it. The query is interrupted at the deadline |
+| `DUCKPORT_TLS_CERT` | *(empty)* | PEM certificate path. Must be set together with `DUCKPORT_TLS_KEY` |
+| `DUCKPORT_TLS_KEY` | *(empty)* | PEM private key path |
 | `DUCKPORT_SEED_DEMO` | *(unset)* | Set to `1` to seed a demo schema on startup for smoke testing |
 | `RUST_LOG` | `info` | Standard tracing filter |
 

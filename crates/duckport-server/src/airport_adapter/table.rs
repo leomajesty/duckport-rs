@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
 use crate::backend::Backend;
+use crate::read_limit::{self, ScanFail};
 
 use super::{quote_ident, to_airport};
 
@@ -89,7 +90,12 @@ impl Table for DuckDbTable {
         _ctx: &RequestContext,
         opts: &ScanOptions,
     ) -> CatalogResult<SendableRecordBatchStream> {
-        let sql = build_scan_sql(&self.schema_name, &self.table_name, opts, &self.arrow_schema);
+        let sql = build_scan_sql(
+            &self.schema_name,
+            &self.table_name,
+            opts,
+            &self.arrow_schema,
+        );
 
         if opts.filter.is_some() {
             // Phase 1: filter pushdown is deferred. Log it so we notice on real workloads.
@@ -106,10 +112,10 @@ impl Table for DuckDbTable {
 
         let (tx, rx) = mpsc::channel::<Result<RecordBatch, AirportError>>(SCAN_CHANNEL_BUFFER);
         let backend = self.backend.clone();
+        let limits = read_limit::current_limits();
 
-        // Own the DuckDB connection + statement + arrow iterator entirely on a
-        // blocking thread. Push batches through `tx`; stop early if the receiver drops
-        // (i.e. the client disconnected).
+        // Own the DuckDB connection entirely on a blocking thread. Public DoGet
+        // limits, if the task-local is set, stop the scan before the bytes leave.
         tokio::task::spawn_blocking(move || {
             let conn = match backend.reader() {
                 Ok(c) => c,
@@ -120,38 +126,18 @@ impl Table for DuckDbTable {
                     return;
                 }
             };
-
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(AirportError::Internal(format!(
-                        "prepare scan: {e}"
-                    ))));
-                    return;
-                }
-            };
-
-            let arrow_iter = match stmt.query_arrow([]) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(AirportError::Internal(format!(
-                        "query_arrow: {e}"
-                    ))));
-                    return;
-                }
-            };
-
-            for batch in arrow_iter {
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    // Receiver dropped — client went away; stop walking the iterator.
-                    break;
-                }
-            }
+            read_limit::execute_arrow_query(&conn, &sql, limits, |item| {
+                tx.blocking_send(item.map_err(scan_fail_to_airport)).is_ok()
+            });
         });
 
         let stream = ReceiverStream::new(rx);
         Ok(Box::pin(stream) as SendableRecordBatchStream)
     }
+}
+
+fn scan_fail_to_airport(fail: ScanFail) -> AirportError {
+    AirportError::Internal(fail.marked())
 }
 
 fn build_scan_sql(

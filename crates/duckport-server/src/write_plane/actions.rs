@@ -43,9 +43,7 @@ pub async fn handle(
     let body = action.body;
 
     let result_bytes = match kind.as_str() {
-        "duckport.ping" => ping(backend, catalog_name)
-            .await
-            .map_err(internal_err)?,
+        "duckport.ping" => ping(backend, catalog_name).await.map_err(internal_err)?,
         "duckport.execute" => execute(backend, &body).await?,
         "duckport.execute_transaction" => execute_transaction(backend, &body).await?,
         other => {
@@ -58,9 +56,7 @@ pub async fn handle(
     single_result(result_bytes)
 }
 
-fn single_result(
-    bytes: Bytes,
-) -> Result<Response<DuckportStream<FlightResult>>, Status> {
+fn single_result(bytes: Bytes) -> Result<Response<DuckportStream<FlightResult>>, Status> {
     let item: std::result::Result<FlightResult, Status> = Ok(FlightResult { body: bytes });
     let stream = stream::iter(std::iter::once(item));
     Ok(Response::new(Box::pin(stream)))
@@ -131,9 +127,7 @@ async fn execute_transaction(backend: &Backend, body: &[u8]) -> Result<Bytes, St
     }
     for (i, s) in req.statements.iter().enumerate() {
         if s.trim().is_empty() {
-            return Err(Status::invalid_argument(format!(
-                "statement[{i}] is empty"
-            )));
+            return Err(Status::invalid_argument(format!("statement[{i}] is empty")));
         }
     }
 

@@ -18,7 +18,7 @@ arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-flight.workspace = true
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
 
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -37,3 +37,5 @@ bytes.workspace = true
 # Connection pool
 r2d2 = "0.8"
 chrono.workspace = true
+ipnet = "2"
+sha2 = "0.10"

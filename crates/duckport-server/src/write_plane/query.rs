@@ -3,7 +3,6 @@
 //! Accepts arbitrary read-only SQL, executes it on a **reader** connection
 //! (never the writer), and streams Arrow RecordBatches back to the client.
 
-use arrow_array::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::FlightData;
 use futures::TryStreamExt;
@@ -12,7 +11,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::debug;
 
+use crate::access::DoGetLimits;
 use crate::backend::Backend;
+use crate::read_limit::{self, recover_status};
 
 use super::DuckportStream;
 
@@ -45,6 +46,7 @@ fn validate_read_only(sql: &str) -> Result<(), Status> {
 pub async fn handle_query(
     backend: Backend,
     sql: &str,
+    limits: Option<DoGetLimits>,
 ) -> Result<Response<DuckportStream<FlightData>>, Status> {
     validate_read_only(sql)?;
 
@@ -52,56 +54,32 @@ pub async fn handle_query(
     let sql_for_log = sql.clone();
     debug!(sql = %truncate(&sql_for_log, 200), "duckport.query");
 
-    let (tx, rx) = mpsc::channel::<Result<RecordBatch, Status>>(QUERY_CHANNEL_BUFFER);
+    let (tx, rx) = mpsc::channel(QUERY_CHANNEL_BUFFER);
 
     tokio::task::spawn_blocking(move || {
         let conn = match backend.reader() {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.blocking_send(Err(Status::internal(format!(
+                let _ = tx.blocking_send(Err(read_limit::ScanFail::Internal(format!(
                     "acquire reader conn: {e:#}"
                 ))));
                 return;
             }
         };
-
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(Status::internal(format!(
-                    "prepare query: {e}"
-                ))));
-                return;
-            }
-        };
-
-        let arrow_iter = match stmt.query_arrow([]) {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(Status::internal(format!(
-                    "query_arrow: {e}"
-                ))));
-                return;
-            }
-        };
-
-        for batch in arrow_iter {
-            if tx.blocking_send(Ok(batch)).is_err() {
-                break;
-            }
-        }
+        read_limit::execute_arrow_query(&conn, &sql, limits, |item| tx.blocking_send(item).is_ok());
     });
 
     let batch_stream = ReceiverStream::new(rx);
 
     let flight_stream = FlightDataEncoderBuilder::new()
-        .build(batch_stream.map_err(|e| {
+        .build(batch_stream.map_err(|fail| {
+            let marked = fail.marked();
             arrow_flight::error::FlightError::Arrow(arrow_schema::ArrowError::IoError(
-                e.to_string(),
-                std::io::Error::other(e.to_string()),
+                marked.clone(),
+                std::io::Error::other(marked),
             ))
         }))
-        .map_err(|e| Status::internal(e.to_string()));
+        .map_err(|e| recover_status(&e.to_string()));
 
     Ok(Response::new(Box::pin(flight_stream)))
 }

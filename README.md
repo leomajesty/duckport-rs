@@ -211,7 +211,7 @@ import pyarrow.flight as flight, json
 client = flight.FlightClient("grpc://localhost:50051")
 resp = list(client.do_action(flight.Action("duckport.ping", b"")))
 print(json.loads(resp[0].body.to_pybytes()))
-# {'server': 'duckport', 'server_version': '0.1.0', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
+# {'server': 'duckport', 'server_version': '1.0.4', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
 ```
 
 ### 端到端测试
@@ -241,6 +241,12 @@ pytest test_phase1_airport_read.py test_phase2a_write_plane.py test_phase2b_appe
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | 空 (DuckDB 默认) | DuckDB `memory_limit` PRAGMA，如 `"2GB"` |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | Plan A：不跑周期 `COPY+DELETE`；`true` 启用旧版归档任务 |
 | `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 任务表（ingestor 在 `RETENTION_ENABLED=true` 时写入行） |
+| `DUCKPORT_AUTH_TOKENS` | 空 | `name:token` 列表，逗号分隔。空则拒绝全部公网访问。本机不鉴权；未配置令牌时局域网仍可读写 |
+| `DUCKPORT_TRUSTED_CIDRS` | 空 | 额外视为局域网的 CIDR，允许写入。不能把地址变成免鉴权的本机 |
+| `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 仅公网 DoGet 的 Arrow 字节上限（16MiB）。`0` 关闭 |
+| `DUCKPORT_DOGET_TIMEOUT_SECS` | `10` | 仅公网 DoGet 超时秒数。`0` 关闭。到点后 interrupt 该查询 |
+| `DUCKPORT_TLS_CERT` | 空 | PEM 证书路径，须与 `DUCKPORT_TLS_KEY` 成对出现 |
+| `DUCKPORT_TLS_KEY` | 空 | PEM 私钥路径 |
 | `DUCKPORT_SEED_DEMO` | 未设 | `=1` 时启动后植入 demo schema，便于冒烟测试 |
 | `RUST_LOG` | `info` | 标准 tracing filter |
 

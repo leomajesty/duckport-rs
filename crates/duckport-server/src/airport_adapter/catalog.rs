@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use airport::catalog::{
-    dynamic::DynamicCatalog, CatalogVersion, Result as CatalogResult, Schema,
-};
+use airport::catalog::{dynamic::DynamicCatalog, CatalogVersion, Result as CatalogResult, Schema};
 use airport::flight::context::RequestContext;
 
 use crate::backend::Backend;
