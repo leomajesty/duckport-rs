@@ -351,14 +351,18 @@ def test_consumer_client():
 
         def cap(sql: str) -> pa.Table:
             captured.append(sql)
+            if "count(DISTINCT symbol)" in sql:
+                return pa.table({"n": [1]})
             return pa.table({})
 
         hy.query = cap  # type: ignore[assignment]
         tnow = datetime.now(tz=timezone.utc)
         past = tnow - timedelta(days=2)
         hy.get_market("usdt_perp", interval=5, offset=0, begin=past, end=tnow)
-        sql = captured[0]
-        if "read_parquet" in sql:
+        resample_sqls = [sql for sql in captured if "DATE_TRUNC" in sql]
+        if not resample_sqls:
+            fail("Plan A: no read_parquet when pqt_path set", "resample SQL was not issued")
+        elif any("read_parquet" in sql for sql in captured):
             fail("Plan A: no read_parquet when pqt_path set", "found read_parquet in SQL")
         else:
             ok("Plan A: resample SQL is DuckDB-only (no read_parquet)")

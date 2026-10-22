@@ -19,7 +19,12 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from duckport_consumer.resample import build_duckdb_resample_sql
+from duckport_consumer.resample import (
+    build_duckdb_resample_sql,
+    build_symbol_count_sql,
+    halve_range,
+    plan_resample_ranges,
+)
 
 logger = logging.getLogger("duckport_consumer")
 
@@ -116,6 +121,24 @@ def build_exginfo_sql(
     )
 
 
+def _resample_extra_predicate(
+    schema: str,
+    market: str,
+    asset_class: Optional[str],
+) -> Optional[str]:
+    """Symbol predicate shared by the resample and its symbol-count query."""
+    if asset_class is None:
+        return None
+    if market != "usdt_perp":
+        raise ValueError("asset_class is only supported for market 'usdt_perp'")
+    return (
+        "symbol IN ("
+        f"SELECT symbol FROM {schema}.exginfo "
+        f"WHERE {usdt_perp_asset_where(asset_class)}"
+        ")"
+    )
+
+
 def build_market_kline_sql(
     schema: str,
     suffix: str,
@@ -127,20 +150,16 @@ def build_market_kline_sql(
     kline_interval_minutes: int,
     symbol: Optional[str] = None,
     asset_class: Optional[str] = None,
+    *,
+    end_inclusive: bool = True,
 ) -> str:
-    """Resample SQL. asset_class filters usdt_perp symbols via exginfo."""
+    """Resample SQL. asset_class filters usdt_perp symbols via exginfo.
+
+    ``end_inclusive`` is False on every chunk except the last. Those chunks
+    stop on a resample-bucket boundary so a bucket is not split in half.
+    """
     if market not in _KLINE_MARKETS:
         raise ValueError(f"Unsupported market: {market}")
-    if asset_class is not None and market != "usdt_perp":
-        raise ValueError("asset_class is only supported for market 'usdt_perp'")
-    extra = None
-    if asset_class is not None:
-        extra = (
-            "symbol IN ("
-            f"SELECT symbol FROM {schema}.exginfo "
-            f"WHERE {usdt_perp_asset_where(asset_class)}"
-            ")"
-        )
     return build_duckdb_resample_sql(
         f"{schema}.{market}{suffix}",
         interval,
@@ -149,8 +168,14 @@ def build_market_kline_sql(
         end,
         kline_interval_minutes,
         symbol,
-        extra_predicate=extra,
+        extra_predicate=_resample_extra_predicate(schema, market, asset_class),
+        end_inclusive=end_inclusive,
     )
+
+
+def _is_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "could not allocate block" in text
 
 
 class DuckportConsumer:
@@ -271,6 +296,9 @@ class DuckportConsumer:
         ``usdt_perp``. Omit it to keep the original mixed result. ``crypto``
         and ``tradifi`` select contract types. ``EQUITY`` also includes HK, KR
         and CN equity. Other values match ``exginfo.underlying_type``.
+
+        A wide window is queried in several bucket-aligned pieces and returned
+        as one table. ``query()`` is not split.
         """
         return self._resample_query(
             market, interval, offset, begin, end, asset_class=asset_class,
@@ -355,11 +383,61 @@ class DuckportConsumer:
             end = pd.to_datetime(end)
             end = end.tz_convert(timezone.utc) if end.tzinfo is not None else end.tz_localize(timezone.utc)
 
-        logger.info(
-            "resample (Plan A: DuckDB only) market=%s interval=%d begin=%s end=%s symbol=%s asset_class=%s",
-            market, interval, begin, end, symbol, asset_class,
+        symbol_count = self._count_resample_symbols(
+            market, begin, end, symbol, asset_class,
         )
+        ranges = plan_resample_ranges(begin, end, interval, offset, symbol_count)
+        logger.info(
+            "resample (Plan A: DuckDB only) market=%s interval=%d offset=%d begin=%s end=%s symbol=%s asset_class=%s symbols=%d chunks=%d",
+            market, interval, offset, begin, end, symbol, asset_class,
+            symbol_count, len(ranges),
+        )
+        tables = [
+            self._query_resample_range(
+                market, interval, offset, lo, hi, inclusive, symbol, asset_class,
+            )
+            for lo, hi, inclusive in ranges
+        ]
+        if len(tables) == 1:
+            return tables[0]
+        return pa.concat_tables(tables)
 
+    def _count_resample_symbols(
+        self,
+        market: str,
+        begin: datetime,
+        end: datetime,
+        symbol: Optional[str],
+        asset_class: Optional[str],
+    ) -> int:
+        if symbol is not None:
+            return 1
+        sql = build_symbol_count_sql(
+            f"{self._schema}.{market}{self._suffix}",
+            begin,
+            end,
+            extra_predicate=_resample_extra_predicate(
+                self._schema, market, asset_class,
+            ),
+        )
+        table = self.query(sql)
+        if table.num_rows == 0:
+            return 0
+        value = table.column("n")[0].as_py()
+        return int(value or 0)
+
+    def _query_resample_range(
+        self,
+        market: str,
+        interval: int,
+        offset: int,
+        begin: datetime,
+        end: datetime,
+        end_inclusive: bool,
+        symbol: Optional[str],
+        asset_class: Optional[str],
+        depth: int = 0,
+    ) -> pa.Table:
         sql = build_market_kline_sql(
             self._schema,
             self._suffix,
@@ -371,12 +449,31 @@ class DuckportConsumer:
             self._kline_interval_minutes,
             symbol,
             asset_class,
+            end_inclusive=end_inclusive,
         )
         try:
             return self.query(sql)
-        except Exception as e:
-            logger.error("resample query failed: %s", e)
-            raise
+        except Exception as exc:
+            halves = None
+            if _is_oom(exc) and depth < 16:
+                halves = halve_range(begin, end, end_inclusive, interval, offset)
+            if halves is None:
+                logger.error("resample query failed: %s", exc)
+                raise
+            logger.warning(
+                "resample chunk out of memory, halving %s .. %s", begin, end,
+            )
+            left, right = halves
+            return pa.concat_tables([
+                self._query_resample_range(
+                    market, interval, offset, left[0], left[1], left[2],
+                    symbol, asset_class, depth + 1,
+                ),
+                self._query_resample_range(
+                    market, interval, offset, right[0], right[1], right[2],
+                    symbol, asset_class, depth + 1,
+                ),
+            ])
 
     def close(self):
         """Close the Flight client connection."""
