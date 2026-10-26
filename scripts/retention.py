@@ -64,7 +64,7 @@ def cmd_set(dp, args):
         sys.exit("keep_days must be >= 1")
     if keyed(dp, args.table):
         print(f"warning: data.{args.table} still has a PRIMARY KEY / index; retention will skip it "
-              "until it is migrated (duckport migrate nopk).")
+              "until it is rebuilt without the key (sudo duckport upgrade --data).")
     archive = lit(args.archive_dir) if args.archive_dir else "NULL"
     dp.action("duckport.execute", {"sql":
         "INSERT OR REPLACE INTO data.retention_policy "

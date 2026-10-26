@@ -127,10 +127,11 @@ duckport status
 ### 3.3 重新执行安装（升级 / 修复）
 
 ```bash
-# 拉取最新代码并重新配置环境（不重启服务）
-duckport upgrade
+# 升级到最新版本：服务端 → 插件 → 数据对齐（见 upgrade.md）
+sudo duckport upgrade --plan
+sudo duckport upgrade
 
-# 手动重新执行
+# 只重新配置环境（不重启服务）
 bash "$HOME/code/duckport-rs/deploy.sh"
 ```
 
@@ -651,14 +652,13 @@ sudo systemctl start binance-ingestor
 ### 13.1 一键升级
 
 ```bash
-# git pull + 重新配置环境（不重启服务）
-duckport upgrade
-
-# 确认 binary 已更新后重启
-duckport restart
+sudo duckport upgrade --plan [--proxy http://localhost:1082]   # 只看计划
+sudo duckport upgrade [--proxy http://localhost:1082]          # 执行
 ```
 
-`duckport upgrade` 内部执行：`git pull --ff-only && bash deploy.sh`。`deploy.sh` 对 binary 做 MD5 比对，相同则跳过替换；`server.env` 已存在时也跳过，不覆盖用户自定义配置。
+依次升级服务端（`git pull` + `deploy.sh`，版本变了才重启）、插件（每个实例重装，版本变了才重启）、数据（与当前版本的期望状态对齐，需要停写时先备份）。可以重复执行。详见 [`upgrade.md`](./upgrade.md)。
+
+`deploy.sh` 对 binary 做 MD5 比对，相同则跳过替换；`server.env` 已存在时也跳过，不覆盖用户自定义配置。
 
 ### 13.2 仅更新 duckport-server binary
 
@@ -680,7 +680,7 @@ duckport update binance-5m
 - **本地 checkout**（同级目录存在 `duckport-binance-ingestor/`）：执行 `git pull` 后重新 editable 安装
 - **GitHub 模式**（从 registry 中的 repo URL 安装）：执行 `uv pip install --reinstall git+<url>`
 
-安装完成后不会自动重启，确认更新无误后手动执行：
+安装完成后不会自动重启（`duckport upgrade` 会在版本变化时自动重启），确认更新无误后手动执行：
 
 ```bash
 duckport restart binance-5m

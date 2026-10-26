@@ -86,7 +86,7 @@ Do not ask users to fill `DUCKPORT_ADDR`; derive it.
 - Business tables are in `data`, for example `data.usdt_perp_5m`.
 - Staging tables are in `main`, for example `_staging_usdt_perp_5m`.
 - Business tables carry no PRIMARY KEY / UNIQUE / index (DuckDB 1.5 never reclaims deleted rows of indexed tables, and composite keys are not used by queries). Deduplicate in the write SQL instead.
-- Register `write_mode:<table> = anti_join` in `data.config_dict` from `init_schema` so `duckport migrate nopk` knows the table can drop its key.
+- Register each business table's spec in `data.table_specs` (columns, dedup key, time column and period, string checks, `write_mode = anti_join`) after `init_schema`, in its own transaction, ignoring failures on servers < 1.2.0; keep the `write_mode:<table> = anti_join` key in `data.config_dict` for 1.1.0. `duckport doctor` / `upgrade` check tables against these specs (see `ingestor-dev-guide.md` 5.3).
 - `data.watermark` and `data.config_dict` are system tables created by duckport-rs.
 - Use `CREATE TABLE IF NOT EXISTS` and `CREATE SCHEMA IF NOT EXISTS`.
 - If a schema is created and used in the same setup flow, put those statements in one `execute_transaction`.

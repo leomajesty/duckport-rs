@@ -4,6 +4,7 @@ Only needs pyarrow, so it runs from any ingestor venv. Loopback servers need no 
 otherwise the Bearer token comes from DUCKPORT_TOKEN.
 """
 
+import base64
 import json
 import os
 
@@ -66,3 +67,13 @@ def q(name):
 def lit(value):
     """Quote a string literal."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def text(value):
+    """String value for an expression. Non-ASCII text goes base64-encoded so the SQL stays
+    ASCII: duckport-server <= 1.1.0 panics when its log line cuts the SQL inside a
+    multi-byte character, after the statement has already run."""
+    value = str(value)
+    if value.isascii():
+        return lit(value)
+    return f"decode(from_base64({lit(base64.b64encode(value.encode()).decode())}))"

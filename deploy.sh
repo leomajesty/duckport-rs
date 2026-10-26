@@ -12,6 +12,8 @@
 # 环境变量（可覆盖默认值）：
 #   GITHUB_REPO, RELEASE_TAG
 #   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE, MEMORY_LIMIT
+#   DEPLOY_OPT, DEPLOY_DATA, DUCKPORT_UNIT_PREFIX, DUCKPORT_CLI_DIR（同机第二套部署）
+#   DUCKPORT_SERVER_BIN（离线安装：用这个 binary，不从 GitHub 下载）
 
 set -euo pipefail
 
@@ -37,6 +39,10 @@ else
 fi
 
 DEPLOY_BIN="$DEPLOY_OPT/bin"
+# systemd unit 名前缀和 CLI 安装目录：同机部署第二套（演练、测试）时改掉，默认不变
+# 首次部署时的选择记在 $DEPLOY_OPT 下，之后的升级沿用
+UNIT_PREFIX="${DUCKPORT_UNIT_PREFIX:-$(cat "$DEPLOY_OPT/unit_prefix" 2>/dev/null || echo duckport)}"
+CLI_DIR="${DUCKPORT_CLI_DIR:-$(cat "$DEPLOY_OPT/cli_dir" 2>/dev/null || true)}"
 INGESTORS_DIR="$DEPLOY_OPT/ingestors"
 LOG_DIR="$DEPLOY_OPT/logs"
 
@@ -162,7 +168,7 @@ _build_from_source() {
   fi
   ok "Rust: $(rustc --version)" >&2
   cargo build --release --bin duckport-server --manifest-path "$REPO_DIR/Cargo.toml" >&2
-  local bin="$REPO_DIR/target/release/duckport-server"
+  local bin="${CARGO_TARGET_DIR:-$REPO_DIR/target}/release/duckport-server"
   [[ -f "$bin" ]] || { fail "编译完成但找不到产物：$bin" >&2; exit 1; }
   echo "$bin"
 }
@@ -181,9 +187,14 @@ INSTALLED_BIN="$DEPLOY_BIN/duckport-server"
 TMP_BIN="$(mktemp)"
 trap 'rm -f "$TMP_BIN"' EXIT
 
-BINARY_URL=$(_get_binary_url || true)
+BINARY_URL=""
+[[ -n "${DUCKPORT_SERVER_BIN:-}" ]] || BINARY_URL=$(_get_binary_url || true)
 
-if [[ -n "$BINARY_URL" ]]; then
+if [[ -n "${DUCKPORT_SERVER_BIN:-}" ]]; then
+  # 离线安装：用指定的 binary，不访问 GitHub
+  info "使用本地 binary：$DUCKPORT_SERVER_BIN"
+  cp "$DUCKPORT_SERVER_BIN" "$TMP_BIN"
+elif [[ -n "$BINARY_URL" ]]; then
   info "下载：$BINARY_URL"
   # --progress-bar：TTY 下显示进度条；-f 保留 HTTP 错误失败；不加 -s 以免静默掉进度
   curl -fL --progress-bar \
@@ -272,6 +283,8 @@ EXEC_BIN="\$INST_DIR/.venv/bin/\$EXEC_CMD"
 [[ -x "\$EXEC_BIN" ]] || { echo "找不到可执行文件：\$EXEC_BIN"; exit 1; }
 
 export INGESTOR_ENV_FILE="\$CFG"
+# 插件从这里读服务端地址（DUCKPORT_LISTEN_ADDR）；同机多套部署时各读各的
+export DUCKPORT_SERVER_ENV="${DEPLOY_OPT}/server.env"
 export INGESTOR_NAME="\$INSTANCE"
 export INGESTOR_INSTANCE="\$INSTANCE"
 exec "\$EXEC_BIN"
@@ -281,8 +294,8 @@ chmod +x "$DEPLOY_BIN/ingestor-run"
 if [[ "$OS" == "Linux" ]]; then
   # ── Linux：systemd unit ──────────────────────────────────────────────────────
 
-  # duckport-server.service（固定）
-  cat > /etc/systemd/system/duckport-server.service << 'SVCEOF'
+  # ${UNIT_PREFIX}-server.service；非引号 heredoc：部署路径在写入时展开
+  cat > "/etc/systemd/system/${UNIT_PREFIX}-server.service" << SVCEOF
 [Unit]
 Description=duckport-rs gRPC Database Service
 After=network-online.target
@@ -292,9 +305,9 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/opt/duckport
-EnvironmentFile=/opt/duckport/server.env
-ExecStart=/opt/duckport/bin/duckport-server
+WorkingDirectory=${DEPLOY_OPT}
+EnvironmentFile=${DEPLOY_OPT}/server.env
+ExecStart=${DEPLOY_BIN}/duckport-server
 # SIGTERM → drain inflight RPCs → CHECKPOINT → exit 0
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -306,21 +319,21 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SVCEOF
 
-  # duckport-ingestor@.service（template，%i = 实例名）
-  cat > /etc/systemd/system/duckport-ingestor@.service << 'SVCEOF'
+  # ${UNIT_PREFIX}-ingestor@.service（template，%i = 实例名）
+  cat > "/etc/systemd/system/${UNIT_PREFIX}-ingestor@.service" << SVCEOF
 [Unit]
 Description=duckport Ingestor (%i)
-After=duckport-server.service
-Requires=duckport-server.service
+After=${UNIT_PREFIX}-server.service
+Requires=${UNIT_PREFIX}-server.service
 
 [Service]
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/opt/duckport/ingestors/%i
-EnvironmentFile=/opt/duckport/ingestors/%i/config.env
-Environment=INGESTOR_ENV_FILE=/opt/duckport/ingestors/%i/config.env
-ExecStart=/opt/duckport/bin/ingestor-run %i
+WorkingDirectory=${INGESTORS_DIR}/%i
+EnvironmentFile=${INGESTORS_DIR}/%i/config.env
+Environment=INGESTOR_ENV_FILE=${INGESTORS_DIR}/%i/config.env
+ExecStart=${DEPLOY_BIN}/ingestor-run %i
 # Ingestor handles SIGTERM (client.close) before exit
 KillSignal=SIGTERM
 TimeoutStopSec=30
@@ -333,9 +346,9 @@ WantedBy=multi-user.target
 SVCEOF
 
   systemctl daemon-reload
-  systemctl enable duckport-server 2>/dev/null || true
-  ok "duckport-server.service 已注册并 enable"
-  ok "duckport-ingestor@.service (template) 已注册"
+  systemctl enable "${UNIT_PREFIX}-server" 2>/dev/null || true
+  ok "${UNIT_PREFIX}-server.service 已注册并 enable"
+  ok "${UNIT_PREFIX}-ingestor@.service (template) 已注册"
 
 else
   # ── macOS：launchd plist（PLIST_DIR 已在默认配置块中按平台设置）────────────
@@ -394,8 +407,9 @@ fi
 step "注册 duckport 命令行工具"
 # 将仓库路径持久化，供 duckport CLI 读取（upgrade / ingestor add 需要）
 echo "$REPO_DIR" > "$DEPLOY_OPT/repo_dir"
+echo "$UNIT_PREFIX" > "$DEPLOY_OPT/unit_prefix"
 if [[ "$OS" == "Darwin" ]]; then
-  CLI_DIR="$HOME/.local/bin"
+  CLI_DIR="${CLI_DIR:-$HOME/.local/bin}"
   mkdir -p "$CLI_DIR"
   install -m 755 "$REPO_DIR/duckport" "$CLI_DIR/duckport"
   ok "已安装：$CLI_DIR/duckport"
@@ -404,16 +418,18 @@ if [[ "$OS" == "Darwin" ]]; then
     info "  export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
 else
-  mkdir -p /usr/local/bin
-  install -m 755 "$REPO_DIR/duckport" /usr/local/bin/duckport
-  ok "已安装：/usr/local/bin/duckport"
+  CLI_DIR="${CLI_DIR:-/usr/local/bin}"
+  mkdir -p "$CLI_DIR"
+  install -m 755 "$REPO_DIR/duckport" "$CLI_DIR/duckport"
+  ok "已安装：$CLI_DIR/duckport"
 fi
+echo "$CLI_DIR" > "$DEPLOY_OPT/cli_dir"
 ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
 
 # ─── 完成摘要 ─────────────────────────────────────────────────────────────────
 
 if [[ "$OS" == "Linux" ]]; then
-  SV_ACTIVE=$(systemctl is-active duckport-server 2>/dev/null || echo "inactive")
+  SV_ACTIVE=$(systemctl is-active "${UNIT_PREFIX}-server" 2>/dev/null || echo "inactive")
 else
   SV_ACTIVE=$(launchctl list 2>/dev/null | awk '$3=="com.duckport.server" {print ($1=="-")?"inactive":"active"}' || echo "inactive")
   SV_ACTIVE="${SV_ACTIVE:-inactive}"

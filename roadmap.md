@@ -10,7 +10,7 @@
 
 - **服务端**：`DUCKPORT_RETENTION_ENABLED` 改为按天滚动删除（策略表 `data.retention_policy`、日志表 `data.retention_log`，默认 dry-run），旧的按月 `COPY+DELETE` 逻辑与 `DUCKPORT_RETENTION_TABLE` 废弃；新增 `duckport.retention_run`；DuckDB 1.5.1 → 1.5.6（修复 duckdb#22279：主键冲突回滚后字符串损坏）。
 - **规范**：业务表不建 `PRIMARY KEY` / `UNIQUE` / 索引，写入用 anti-join 去重（`ingestor-dev-guide.md` 5.1、第 6 节）。原因：DuckDB 1.5 不回收带索引表删除的行，联合主键也不参与查询。
-- **CLI**：`duckport retention ...`、`duckport migrate nopk`（旧库业务表去主键，可回退）。
+- **CLI**：`duckport retention ...`、`duckport doctor`（只读检查）、`duckport upgrade --plan/--data`（把任意旧版本的库对齐到当前版本，包括业务表去主键，可回退）。
 - **升级**：见 `upgrade-1.1.md`。
 
 ### Plan A — 单热库 + 关闭 Parquet 混合读 / 默认关闭周期 retention ✅
