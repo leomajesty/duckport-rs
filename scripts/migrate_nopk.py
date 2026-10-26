@@ -26,6 +26,8 @@ import time
 from duckport_flight import Duckport, lit, q
 
 SYSTEM_TABLES = {"config_dict", "watermark", "retention_policy", "retention_log"}
+# Retired by duckport-server 1.1.0; migrate drops it instead of rebuilding it.
+LEGACY_TABLES = {"retention_tasks"}
 OLD_SUFFIX = "__pk_old"
 NEW_SUFFIX = "__nopk"
 MIN_SERVER = (1, 1, 0)
@@ -59,7 +61,7 @@ def keyed_tables(dp):
     )
     return [
         r for r in rows
-        if r["table_name"] not in SYSTEM_TABLES
+        if r["table_name"] not in SYSTEM_TABLES | LEGACY_TABLES
         and not r["table_name"].endswith(OLD_SUFFIX)
         and not r["table_name"].endswith(NEW_SUFFIX)
     ]
@@ -133,6 +135,8 @@ def preflight(dp, args):
         if name in ready:
             todo.append(name)
     skipped = [t["table_name"] for t in keyed if t["table_name"] not in ready]
+    if LEGACY_TABLES & set(data_tables(dp)):
+        print("\n  废弃的 data.retention_tasks 会在迁移时删除。")
     if skipped:
         print("\n  跳过的表：写它的插件还没升级到无主键写法（未在 data.config_dict 登记 "
               "write_mode:<表名>=anti_join）。先升级并重启对应插件，再重新执行。")
@@ -201,9 +205,9 @@ def cmd_migrate(dp, args):
         t0 = time.time()
         n = copy_table(dp, table, None if table == "exginfo" else tcols.get(table))
         print(f"  ✓ {n:,} rows，{time.time() - t0:.1f}s；原表保留为 data.{table}{OLD_SUFFIX}", flush=True)
-    if "retention_tasks" in data_tables(dp):
-        dp.execute("DROP TABLE data.retention_tasks")
-        print("\n已删除废弃的 data.retention_tasks")
+    for legacy in sorted(LEGACY_TABLES & set(data_tables(dp))):
+        dp.execute(f"DROP TABLE data.{q(legacy)}")
+        print(f"\n已删除废弃的 data.{legacy}")
     dp.execute("CHECKPOINT")
     print(f"\n完成，用时 {time.time() - t_all:.0f}s。确认 ingestor 正常写入后执行 finalize 删除旧表；"
           "有问题执行 rollback。")
