@@ -189,6 +189,7 @@ duckport loadhist binance-5m        # 补历史数据
 duckport retention set usdt_perp_1m 120   # 只保留最近 120 天（需 DUCKPORT_RETENTION_ENABLED=true）
 duckport retention status           # 保留策略与最近一次执行结果
 sudo duckport migrate nopk --plan   # 1.1.0 升级：检查哪些业务表还带主键（见 upgrade-1.1.md）
+sudo duckport doctor                # 只读：对照当前版本的期望状态检查库、系统表和插件版本（--deep 全表查重，--json）
 ```
 
 ### 本地开发

@@ -14,6 +14,7 @@
 #   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist [<实例>]           # 补历史数据
 #   duckport upgrade                     # 更新环境
+#   duckport doctor  [--deep] [--json]   # 对照当前版本检查库的状态（只读）
 
 set -euo pipefail
 
@@ -188,6 +189,36 @@ _flight_python() {
     fi
   done <<< "$(_list_instances)"
   echo "$py"
+}
+
+# 已安装的插件实例清单（JSON 写入 $1）：实例名、插件命令、安装版本、是否运行中。
+# 版本按 console script 名找到所属的发行包再读取，第三方插件同样适用。
+_instances_json() {
+  local out="$1" inst first=1 py exec_name ver active
+  echo "[" > "$out"
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    exec_name=$(_instance_exec "$inst")
+    py=$(_instance_python "$inst")
+    ver=""
+    if [[ -x "$py" ]]; then
+      ver=$("$py" - "$exec_name" 2>/dev/null << 'PY'
+import sys
+from importlib import metadata
+name = sys.argv[1]
+for dist in metadata.distributions():
+    if any(ep.group == "console_scripts" and ep.name == name for ep in dist.entry_points):
+        print(dist.version)
+        break
+PY
+)
+    fi
+    [[ "$(_svc_is_active "duckport-ingestor@$inst")" == "active" ]] && active=true || active=false
+    [[ $first -eq 1 ]] && first=0 || echo "," >> "$out"
+    printf '{"instance": "%s", "exec": "%s", "version": "%s", "active": %s}' \
+      "$inst" "$exec_name" "$ver" "$active" >> "$out"
+  done <<< "$(_list_instances)"
+  echo "]" >> "$out"
 }
 
 # 查询正在运行的 duckport-server 版本（duckport.ping 的 server_version）。
@@ -386,7 +417,30 @@ PYEOF
   fi
   "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>/dev/null \
     || echo -e "  ${DIM}无法读取 data.retention_policy（服务端版本低于 1.1.0？）${NC}"
+
+  echo -e "\n${BOLD}数据对齐${NC}"
+  local inv doctor_rc=0
+  inv=$(mktemp)
+  _instances_json "$inv"
+  "$status_py" "$REPO_DIR/scripts/doctor.py" --addr "127.0.0.1:$server_port" --instances-file "$inv" --summary 2>/dev/null \
+    || doctor_rc=$?
+  [[ $doctor_rc -eq 3 ]] && echo -e "  ${DIM}检查失败，运行 duckport doctor 查看原因${NC}"
+  rm -f "$inv"
   echo ""
+}
+
+# ─── doctor ───────────────────────────────────────────────────────────────────
+
+# 对照当前版本的期望状态检查数据库，只读。退出码：0 一致，1 有待对齐项，2 有阻断项，3 检查失败。
+cmd_doctor() {
+  local port inv rc=0
+  port=$(_server_port)
+  nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 3; }
+  inv=$(mktemp)
+  _instances_json "$inv"
+  "$(_flight_python)" "$REPO_DIR/scripts/doctor.py" --addr "127.0.0.1:$port" --instances-file "$inv" "$@" || rc=$?
+  rm -f "$inv"
+  return $rc
 }
 
 # ─── retention ────────────────────────────────────────────────────────────────
@@ -1011,6 +1065,7 @@ ${BOLD}数据操作：${NC}
   duckport ${CYAN}retention${NC} dry-run|run [表]      立即执行（dry-run 只统计不删除）
   duckport ${CYAN}retention${NC} log [表]              执行日志
   duckport ${CYAN}migrate${NC} nopk [--plan]           业务表去主键（--finalize 清理旧表，--rollback 回退）
+  duckport ${CYAN}doctor${NC} [--deep] [--json]         对照当前版本检查库的状态（只读）
 
 ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
@@ -1044,6 +1099,7 @@ case "$CMD" in
   logs)     cmd_logs    "${1:-}" ;;
   loadhist) cmd_loadhist "${1:-}" ;;
   retention) cmd_retention "$@" ;;
+  doctor)   cmd_doctor "$@" ;;
   migrate)  cmd_migrate "$@" ;;
   upgrade)  cmd_upgrade ;;
   help|-h|--help) cmd_help ;;
