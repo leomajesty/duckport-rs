@@ -30,6 +30,18 @@ pub struct ExecuteTransactionResponse {
     pub rows_affected: Vec<u64>,
 }
 
+/// Body of `duckport.retention_run`. An empty body runs every enabled policy using the
+/// server's `DUCKPORT_RETENTION_DRY_RUN` setting.
+#[derive(Debug, Default, Deserialize)]
+pub struct RetentionRunRequest {
+    /// Only run the policy for this table (bare name in schema `data`).
+    #[serde(default)]
+    pub table: Option<String>,
+    /// Override the server's dry-run setting for this run.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PingResponse {
     pub server: &'static str,

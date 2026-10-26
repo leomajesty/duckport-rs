@@ -96,19 +96,26 @@ async fn main() -> Result<()> {
         "access policy"
     );
 
-    let retention_shutdown = if cfg.retention_enabled {
-        info!(table = %cfg.retention_table, "retention scheduler enabled");
-        Some(retention::spawn(
-            backend.clone(),
-            cfg.retention_table.clone(),
-        ))
+    let retention_settings = retention::Settings::from_config(&cfg);
+    let retention_shutdown = if retention_settings.enabled {
+        info!(
+            dry_run = retention_settings.dry_run,
+            interval_secs = retention_settings.interval.as_secs(),
+            min_keep_days = retention_settings.min_keep_days,
+            "retention scheduler enabled (policies in data.retention_policy)"
+        );
+        Some(retention::spawn(backend.clone(), retention_settings.clone()))
     } else {
         info!("retention scheduler disabled (DUCKPORT_RETENTION_ENABLED=false)");
         None
     };
 
-    let duckport_svc =
-        DuckportService::new(airport_server, backend.clone(), cfg.catalog_name.clone());
+    let duckport_svc = DuckportService::new(
+        airport_server,
+        backend.clone(),
+        cfg.catalog_name.clone(),
+        retention_settings,
+    );
     let max_msg = 64 * 1024 * 1024;
     let flight_svc = FlightServiceServer::new(duckport_svc)
         .max_decoding_message_size(max_msg)
@@ -216,11 +223,12 @@ async fn init_system_schema(backend: &Backend) -> Result<()> {
                 ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                 "#,
             )?;
+            conn.execute_batch(retention::SYSTEM_SCHEMA_SQL)?;
             Ok(())
         })
         .await?;
     backend.bump_catalog_epoch();
-    info!("initialised duckport system schema data.config_dict + data.watermark");
+    info!("initialised duckport system schema data.config_dict + data.watermark + data.retention_policy/log");
     Ok(())
 }
 

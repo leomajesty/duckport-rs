@@ -9,10 +9,11 @@ use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
 use crate::backend::Backend;
+use crate::retention;
 
 use super::proto::{
     ExecuteRequest, ExecuteResponse, ExecuteTransactionRequest, ExecuteTransactionResponse,
-    PingResponse,
+    PingResponse, RetentionRunRequest,
 };
 use super::DuckportStream;
 
@@ -28,6 +29,10 @@ pub fn advertised() -> Vec<(&'static str, &'static str)> {
             "duckport.execute_transaction",
             "Execute multiple statements atomically (BEGIN/COMMIT or ROLLBACK)",
         ),
+        (
+            "duckport.retention_run",
+            "Run data retention now ({\"table\"?, \"dry_run\"?})",
+        ),
     ]
 }
 
@@ -36,6 +41,7 @@ pub fn advertised() -> Vec<(&'static str, &'static str)> {
 pub async fn handle(
     backend: &Backend,
     catalog_name: &str,
+    retention: &retention::Settings,
     action: Action,
 ) -> Result<Response<DuckportStream<FlightResult>>, Status> {
     let kind = action.r#type.clone();
@@ -46,6 +52,7 @@ pub async fn handle(
         "duckport.ping" => ping(backend, catalog_name).await.map_err(internal_err)?,
         "duckport.execute" => execute(backend, &body).await?,
         "duckport.execute_transaction" => execute_transaction(backend, &body).await?,
+        "duckport.retention_run" => retention_run(backend, retention, &body).await?,
         other => {
             return Err(Status::invalid_argument(format!(
                 "unknown duckport action: {other}"
@@ -152,6 +159,32 @@ async fn execute_transaction(backend: &Backend, body: &[u8]) -> Result<Bytes, St
     json_bytes(&ExecuteTransactionResponse {
         rows_affected: counts,
     })
+}
+
+async fn retention_run(
+    backend: &Backend,
+    settings: &retention::Settings,
+    body: &[u8],
+) -> Result<Bytes, Status> {
+    let req: RetentionRunRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        RetentionRunRequest::default()
+    } else {
+        parse_json(body)?
+    };
+    let dry_run = req.dry_run.unwrap_or(settings.dry_run);
+    let report = retention::run(backend, settings, req.table, dry_run)
+        .await
+        .map_err(|e| {
+            warn!(err = ?e, "duckport.retention_run failed");
+            Status::failed_precondition(format!("{e:#}"))
+        })?;
+    info!(
+        run_id = %report.run_id,
+        dry_run,
+        tables = report.tables.len(),
+        "duckport.retention_run ok"
+    );
+    json_bytes(&report)
 }
 
 /// Drives a DuckDB write transaction by hand using `execute_batch`.
