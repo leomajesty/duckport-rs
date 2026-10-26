@@ -23,7 +23,10 @@ COPY_BYTES_PER_S = 2e9
 KEYED_ROWS_PER_S = 1.5e6
 INDEX_BYTES_PER_ROW = 100
 BASE_MEMORY = 1 << 30
-REBUILD_ROWS_PER_S = 18e6   # constraint-free copy of a business table (pro.studio, 1.96 billion rows)
+# Rebuilding 1.96 billion keyed rows on pro.studio (2026-10-26): 15M rows/s, and the
+# constraint-free copy took 0.57 of the space the keyed tables used (no index, no deleted rows).
+REBUILD_ROWS_PER_S = 15e6
+KEYED_DATA_SHARE = 0.6
 _UNITS = {"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30,
           "TIB": 1 << 40, "BYTES": 1}
 
@@ -76,12 +79,22 @@ def estimate(dp, state: State, findings: List[Finding], db_path: str) -> Resourc
     size = state.db_size
     used = (size.get("used_blocks") or 0) * (dp.scalar(
         "SELECT block_size FROM pragma_database_size() WHERE database_name = current_database()") or 0)
-    total_rows = sum(t.estimated_size for t in state.tables.values()) or 1
-    rebuilt = {f.target for f in findings if f.rule in ("B1", "D5") and f.level == "stop"}
-    res.rebuild_rows = sum(state.tables[t].estimated_size for t in rebuilt if t in state.tables)
-    res.rebuild_bytes = int(used * min(1.0, res.rebuild_rows / total_rows) * 1.2)
+    # estimated_size also counts deleted rows; copies carry only the live ones
+    physical_total = sum(t.estimated_size for t in state.tables.values()) or 1
+    live = {}
 
-    keyed_rows = sum(t.estimated_size for t in state.business_tables() if t.keyed)
+    def live_rows(name):
+        if name not in live:
+            live[name] = dp.scalar(f"SELECT count(*) FROM data.{q(name)}") or 0
+        return live[name]
+
+    rebuilt = sorted({f.target for f in findings if f.rule in ("B1", "D5") and f.level == "stop"} & set(state.tables))
+    res.rebuild_rows = sum(live_rows(t) for t in rebuilt)
+    res.rebuild_bytes = int(1.1 * sum(
+        used * live_rows(t) / physical_total * (KEYED_DATA_SHARE if state.tables[t].keyed else 1.0)
+        for t in rebuilt))
+
+    keyed_rows = sum(live_rows(t.name) for t in state.business_tables() if t.keyed)
     res.backup_bytes = used
     res.backup_memory = BASE_MEMORY + keyed_rows * INDEX_BYTES_PER_ROW
     res.backup_seconds = (used / COPY_BYTES_PER_S) + keyed_rows / KEYED_ROWS_PER_S

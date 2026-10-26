@@ -33,12 +33,20 @@ from duckport_flight import Duckport
 from reconcile import backup, rebuild
 from reconcile.fixes import NEEDS_CONFIRMATION, Context, Result, actionable, apply, log_result, preview
 from reconcile.rules import Finding, Options, run_rules
-from reconcile.specs import UPGRADE_LOG_DDL
+from reconcile.specs import PLUGIN_MIN_VERSION, UPGRADE_LOG_DDL, version_at_least
 from reconcile.state import collect
 
 
 def check(dp, args):
-    state = collect(dp, load_instances(args.instances_file))
+    instances = load_instances(args.instances_file)
+    if args.assume_plugins_upgraded:
+        # plan of a full `duckport upgrade`: stage 2 brings known plugins to at least their minimum
+        for i in instances:
+            minimum = PLUGIN_MIN_VERSION.get(i.exec)
+            if minimum and version_at_least(i.version, minimum) is not True:
+                print(f"（按升级后估计：{i.name} {i.exec} v{i.version or '?'} → ≥ {minimum}）")
+                i.version = minimum
+    state = collect(dp, instances)
     opts = Options(deep=args.deep, bloat_min_dead_rows=args.bloat_min_dead_rows)
     return state, opts, run_rules(state, dp, opts)
 
@@ -192,6 +200,8 @@ def main():
     ap.add_argument("--levels", default="online", help="apply: online or online,stop")
     ap.add_argument("--confirm-delete", action="store_true", help="apply: delete corrupted/duplicate rows (D1/D2)")
     ap.add_argument("--state-out", default="", help="plan: write WINDOW/BACKUP_OK/DELETE_ROWS for the CLI")
+    ap.add_argument("--assume-plugins-upgraded", action="store_true",
+                    help="plan: judge as if known plugins were at their minimum version (full upgrade plan)")
     ap.add_argument("command", choices=["plan", "apply", "finalize", "rollback"])
     args = ap.parse_args()
     db_dir = os.path.dirname(os.path.abspath(args.db_path)) if args.db_path else ""

@@ -964,7 +964,7 @@ cmd_update() {
 # 损坏或重复的行先列出样例，人工确认后才删除；--yes 不包括这一项（--delete-bad-rows 才包括）。
 # 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。
 cmd_upgrade() {
-  local mode="full" yes=0 no_backup=0 delete_bad=0 after_pull=0 to="" proxy="" extra=()
+  local mode="full" yes=0 no_backup=0 delete_bad=0 after_pull=0 to="" proxy="" extra=() plan_args=()
   local orig_args=("$@")
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -999,7 +999,8 @@ cmd_upgrade() {
       ;;
     plan)
       _upgrade_plan_stages
-      echo -e "\n${BOLD}▶ 3/3 数据对齐${NC}（按当前状态估计；插件升级后，写入方版本过低造成的阻断会消失）"
+      echo -e "\n${BOLD}▶ 3/3 数据对齐${NC}（按插件升级后的版本估计）"
+      plan_args=(--assume-plugins-upgraded)
       ;;
   esac
   _upgrade_db
@@ -1154,7 +1155,7 @@ _upgrade_db() {
   case "$mode" in
     plan)
       _instances_json "$inv"
-      "${base[@]}" plan || rc=$?
+      "${base[@]}" plan ${plan_args[@]+"${plan_args[@]}"} || rc=$?
       rm -f "$inv"
       [[ $rc -eq 4 || $rc -eq 5 ]] && rc=1   # 对外：0 已对齐，1 有待修正，2 阻断，3 失败
       return $rc

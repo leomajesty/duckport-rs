@@ -23,6 +23,7 @@ PREFIX="${PREFIX:-dptest}"
 PORT="${PORT:-50081}"
 PROXY="${PROXY:-http://localhost:1082}"
 OLD_SERVER_TAG="${OLD_SERVER_TAG:-v1.0.4}"
+OLD_SERVER_BIN="${OLD_SERVER_BIN:-}"      # a local copy of that release binary skips the download
 OLD_INGESTOR="${OLD_INGESTOR:-4c8f295}"   # binance-ingestor 0.1.0
 OLD_FUNDING="${OLD_FUNDING:-a049f7f}"     # binance-funding 0.1.0
 PROD_PORT="${PROD_PORT:-8815}"            # the real deployment, which must stay untouched
@@ -82,6 +83,7 @@ git -C "$SBX/code/duckport-binance-funding" reset -q --hard "$OLD_FUNDING"
 step "install duckport-server $OLD_SERVER_TAG"
 (cd "$SBX/code/duckport-rs" && DEPLOY_OPT="$SBX/opt" DEPLOY_DATA="$SBX/data" DUCKPORT_UNIT_PREFIX="$PREFIX" \
   DUCKPORT_CLI_DIR="$SBX/bin" LISTEN_ADDR="127.0.0.1:$PORT" MEMORY_LIMIT=4GB RELEASE_TAG="$OLD_SERVER_TAG" \
+  DUCKPORT_SERVER_BIN="$OLD_SERVER_BIN" \
   bash deploy.sh > "$SBX/deploy-initial.log" 2>&1) || { tail -20 "$SBX/deploy-initial.log"; fail "initial deploy"; }
 grep -q "^EnvironmentFile=$SBX/opt/server.env$" "/etc/systemd/system/$PREFIX-server.service" \
   || fail "$PREFIX-server.service does not use $SBX/opt"
@@ -126,8 +128,9 @@ keyed=$(scalar "$PORT" "SELECT count(*) FROM duckdb_constraints() WHERE schema_n
 rows_before=$(scalar "$PORT" "SELECT count(*) FROM data.usdt_perp_5m")
 
 step "duckport upgrade --plan"
-rc=0; "$CLI" upgrade --plan --proxy "$PROXY" || rc=$?
-[[ $rc -eq 1 || $rc -eq 2 ]] || fail "plan exit $rc"
+rc=0; "$CLI" upgrade --plan --proxy "$PROXY" | tee "$SBX/plan.log" || rc=$?
+[[ $rc -eq 1 ]] || fail "plan exit $rc (expected 1: work to do, nothing blocked once plugins are upgraded)"
+grep -q "v1.0.4 → v" "$SBX/plan.log" || fail "plan does not show the server upgrade"
 
 step "duckport upgrade --yes"
 t_upgrade=$(date -u '+%F %T')

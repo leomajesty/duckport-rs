@@ -13,6 +13,7 @@
 #   GITHUB_REPO, RELEASE_TAG
 #   DB_PATH, LISTEN_ADDR, READ_POOL_SIZE, MEMORY_LIMIT
 #   DEPLOY_OPT, DEPLOY_DATA, DUCKPORT_UNIT_PREFIX, DUCKPORT_CLI_DIR（同机第二套部署）
+#   DUCKPORT_SERVER_BIN（离线安装：用这个 binary，不从 GitHub 下载）
 
 set -euo pipefail
 
@@ -186,9 +187,14 @@ INSTALLED_BIN="$DEPLOY_BIN/duckport-server"
 TMP_BIN="$(mktemp)"
 trap 'rm -f "$TMP_BIN"' EXIT
 
-BINARY_URL=$(_get_binary_url || true)
+BINARY_URL=""
+[[ -n "${DUCKPORT_SERVER_BIN:-}" ]] || BINARY_URL=$(_get_binary_url || true)
 
-if [[ -n "$BINARY_URL" ]]; then
+if [[ -n "${DUCKPORT_SERVER_BIN:-}" ]]; then
+  # 离线安装：用指定的 binary，不访问 GitHub
+  info "使用本地 binary：$DUCKPORT_SERVER_BIN"
+  cp "$DUCKPORT_SERVER_BIN" "$TMP_BIN"
+elif [[ -n "$BINARY_URL" ]]; then
   info "下载：$BINARY_URL"
   # --progress-bar：TTY 下显示进度条；-f 保留 HTTP 错误失败；不加 -s 以免静默掉进度
   curl -fL --progress-bar \
