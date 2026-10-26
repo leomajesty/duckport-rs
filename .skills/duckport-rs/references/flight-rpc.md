@@ -35,7 +35,7 @@ Use this for single DDL/DML statements. Do not use it for reads.
 ```python
 stmts = [
     "CREATE SCHEMA IF NOT EXISTS data",
-    "CREATE TABLE IF NOT EXISTS data.events (ts TIMESTAMP, device_id VARCHAR, value DOUBLE, PRIMARY KEY(ts, device_id))",
+    "CREATE TABLE IF NOT EXISTS data.events (ts TIMESTAMP, device_id VARCHAR, value DOUBLE)",  # no PRIMARY KEY; dedupe with an anti-join
     "CREATE TABLE IF NOT EXISTS _staging_events (ts TIMESTAMP, device_id VARCHAR, value DOUBLE)",
 ]
 body = json.dumps({"statements": stmts}).encode()

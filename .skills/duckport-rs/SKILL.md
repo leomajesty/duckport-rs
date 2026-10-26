@@ -52,7 +52,7 @@ Use the staging write model:
 TRUNCATE _staging_table
 DoPut -> main._staging_table
 execute_transaction:
-  INSERT INTO data.target SELECT * FROM _staging_table ON CONFLICT DO NOTHING
+  INSERT INTO data.target ... ANTI JOIN data.target (dedup, see ingestor-dev-guide.md section 6)
   UPSERT data.watermark
   TRUNCATE _staging_table
 ```
@@ -63,7 +63,7 @@ Core conventions:
 - Staging tables live in `main` and are named `_staging_<target>`.
 - `data.watermark` and `data.config_dict` are created/migrated by duckport-rs; ingestors upsert rows, they do not redefine these tables.
 - DoPut chunks should stay below roughly 500 MB; the existing ingestor convention is about 200,000 rows per chunk.
-- `duckdb` client package version should match the server DuckDB version, currently `1.5.1`.
+- `duckdb` client package version should match the server DuckDB version, currently `1.5.6`.
 
 For plugin layout, config rules, and loadhist behavior, read `references/ingestor.md`.
 

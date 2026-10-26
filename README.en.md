@@ -41,7 +41,7 @@ The core motivation is to free DuckDB from the "same-process embedding" constrai
               │  └───────┬─────────────────────────┘ │
               │          │ duckdb FFI                │
               │          ▼                           │
-              │      duckport.db (DuckDB 1.5.1)      │
+              │      duckport.db (DuckDB 1.5.6)      │
               └──────────────────────────────────────┘
 ```
 
@@ -187,6 +187,9 @@ duckport status                     # Show service status and data watermarks
 duckport config binance-5m          # Edit instance config file
 duckport logs binance-5m            # Tail logs in real time
 duckport loadhist binance-5m        # Backfill historical data
+duckport retention set usdt_perp_1m 120   # Keep only the last 120 days (needs DUCKPORT_RETENTION_ENABLED=true)
+duckport retention status           # Retention policies and the latest run
+sudo duckport migrate nopk --plan   # 1.1.0 upgrade: list business tables that still carry a primary key (see upgrade-1.1.md)
 ```
 
 ### Local Development
@@ -212,7 +215,7 @@ import pyarrow.flight as flight, json
 client = flight.FlightClient("grpc://localhost:50051")
 resp = list(client.do_action(flight.Action("duckport.ping", b"")))
 print(json.loads(resp[0].body.to_pybytes()))
-# {'server': 'duckport', 'server_version': '1.0.4', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
+# {'server': 'duckport', 'server_version': '1.1.0', 'catalog': 'duckport', 'duckdb_version': 'v1.5.6'}
 ```
 
 ### End-to-End Tests
@@ -240,8 +243,12 @@ All parameters are passed via environment variables, all prefixed with `DUCKPORT
 | `DUCKPORT_READ_POOL_SIZE` | `4` | Read connection pool size |
 | `DUCKPORT_DUCKDB_THREADS` | `0` (DuckDB default) | DuckDB `threads` PRAGMA |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(empty, DuckDB default)* | DuckDB `memory_limit` PRAGMA, e.g. `"2GB"` |
-| `DUCKPORT_RETENTION_ENABLED` | `false` | Plan A: no periodic `COPY+DELETE`; set `true` to enable legacy archival job |
-| `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | Task table (written by ingestors when `RETENTION_ENABLED=true`) |
+| `DUCKPORT_RETENTION_ENABLED` | `false` | Start the rolling-window retention; per-table rules live in `data.retention_policy` (`duckport retention set`) |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | Count rows only, never delete; switch to `false` after checking `duckport retention log` |
+| `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | Pause between runs (minimum 60) |
+| `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | Policies keeping fewer days are refused |
+| `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | Pause between two DELETE batches so ingestor writes interleave |
+| `DUCKPORT_RETENTION_TABLE` | — | Deprecated in 1.1.0; only logs a warning |
 | `DUCKPORT_AUTH_TOKENS` | *(empty)* | Comma-separated `name:token` entries. Empty rejects every public peer. Loopback never requires a token; LAN stays open until tokens are set |
 | `DUCKPORT_TRUSTED_CIDRS` | *(empty)* | Extra CIDRs treated as LAN for writes. They do not become auth-exempt loopback |
 | `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | Public DoGet Arrow byte cap only (16MiB). `0` disables it |
@@ -397,9 +404,8 @@ execute_transaction([
     """CREATE TABLE IF NOT EXISTS metrics.events (
         ts TIMESTAMP,
         device_id VARCHAR,
-        value DOUBLE,
-        PRIMARY KEY (ts, device_id)
-    )""",
+        value DOUBLE
+    )""",  # no PRIMARY KEY: indexed tables never reclaim deleted rows; the write SQL deduplicates
     "CREATE TABLE IF NOT EXISTS _staging_events (ts TIMESTAMP, device_id VARCHAR, value DOUBLE)",
 ])
 ```
@@ -408,11 +414,23 @@ execute_transaction([
 
 - Business tables go in any schema other than `main` (`main` is hidden by `airport_adapter`)
 - **Staging tables go in the `main` schema** (invisible to Airport clients, but accessible via SQL) — staging tables have no PK and are intended for bulk DoPut
+- **Business tables carry no `PRIMARY KEY` / `UNIQUE` / index**: DuckDB 1.5 does not vacuum indexed tables, so deleted rows are never reclaimed, and a composite key is never used by queries. Reasons and measurements: [`ingestor-dev-guide.md` 5.1](./ingestor-dev-guide.md#51-为什么业务表不建主键)
 - `CREATE SCHEMA IF NOT EXISTS` must be in the **same transaction** as `CREATE TABLE`; otherwise the next statement won't see the schema
 
 ### Step 2: Bulk Write Data (Staging Pattern)
 
-DuckDB Appender does not support `ON CONFLICT`. Solution: **DoPut → staging → INSERT ... ON CONFLICT DO NOTHING**.
+Solution: **DoPut → staging → INSERT with an anti-join**. `lo` and `hi` are the earliest and latest timestamps of the batch, inlined as constants so the subquery only scans that time range:
+
+```python
+def merge_sql(lo, hi):
+    return (
+        "INSERT INTO metrics.events "
+        "SELECT s.* FROM (SELECT DISTINCT ON (ts, device_id) * FROM _staging_events) s "
+        "ANTI JOIN (SELECT ts, device_id FROM metrics.events "
+        f"          WHERE ts BETWEEN TIMESTAMP '{lo}' AND TIMESTAMP '{hi}') t "
+        "ON s.ts = t.ts AND s.device_id = t.device_id"
+    )
+```
 
 ```python
 import pyarrow as pa
@@ -434,7 +452,7 @@ arrow = pa.Table.from_pylist([
 append_to_staging("main", "_staging_events", arrow)
 
 execute_transaction([
-    "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+    merge_sql(lo, hi),   # lo, hi = pc.min(arrow["ts"]).as_py(), pc.max(arrow["ts"]).as_py()
     "TRUNCATE _staging_events",
 ])
 ```
@@ -448,7 +466,7 @@ for offset in range(0, len(arrow), CHUNK_SIZE):
     execute_transaction(["TRUNCATE _staging_events"])
     append_to_staging("main", "_staging_events", chunk)
     execute_transaction([
-        "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+        merge_sql(pc.min(chunk["ts"]).as_py(), pc.max(chunk["ts"]).as_py()),
         "TRUNCATE _staging_events",
     ])
 ```
@@ -459,7 +477,7 @@ Recommended: update the watermark in the same transaction to guarantee atomic co
 
 ```python
 execute_transaction([
-    "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+    merge_sql(lo, hi),
     f"INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
     f"VALUES ('metrics.events', '{ingestor_name}', 900, 'event_time', NULL, '{latest_ts}', CURRENT_TIMESTAMP) "
     f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -473,7 +491,7 @@ execute_transaction([
 
 - If any statement in `duckport.execute_transaction` fails, the entire transaction is ROLLBACKed; clients should catch `FlightError` and retry
 - DoPut failures (schema mismatch, type error) do not pollute the table
-- `ON CONFLICT DO NOTHING` makes repeated DoPuts of the same batch **idempotent** — consumers resuming from a watermark checkpoint produce no side effects
+- The anti-join makes repeated DoPuts of the same batch **idempotent** — consumers resuming from a watermark checkpoint produce no side effects. duckport has a single writer connection, so concurrent writes cannot create duplicates
 
 ### Step 5 (Optional): Read-Only Queries
 
@@ -527,6 +545,7 @@ After completing, add the repo URL to `ingestor/registry.json` so `duckport inst
 | [`roadmap.md`](./roadmap.md) | Phase progress + pending TODOs |
 | [`deploy.md`](./deploy.md) | Production deployment, systemd, backup/restore, troubleshooting |
 | [`ingestor-dev-guide.md`](./ingestor-dev-guide.md) | Ingestor plugin development guidelines (reference: binance-ingestor) |
+| [`upgrade-1.1.md`](./upgrade-1.1.md) | Upgrading to 1.1.0: DuckDB 1.5.6, new retention, dropping primary keys from business tables (Chinese) |
 | [`migration-guide.md`](./migration-guide.md) | Migrating data from the old Python duckport |
 | [`extra-enhancement.md`](./extra-enhancement.md) | Concurrency model decision (D1a per-table actor vs D1b single-writer) |
 | [`path-b-retention-plan.md`](./path-b-retention-plan.md) | Parquet overlay transparent archival plan (large data volume path) |
@@ -537,7 +556,7 @@ After completing, add the repo URL to `ingestor/registry.json` so `duckport inst
 ## Versions and Dependencies
 
 - **Rust**: 1.85.1+ (edition 2021)
-- **DuckDB**: 1.5.1 (crate `duckdb 1.10501.0`, feature `bundled` — compiles inline)
+- **DuckDB**: 1.5.6 (crate `duckdb 1.10506.1`, feature `bundled` — compiles inline)
 - **Arrow**: 58.x (aligned with DuckDB crate)
 - **tonic**: 0.14 / **prost**: 0.14
 - **Python (ingestor + consumer)**: 3.10+, `pyarrow >= 15`
