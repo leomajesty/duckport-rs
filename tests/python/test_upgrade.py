@@ -86,7 +86,7 @@ def main():
     assert rc == 2 and keyed(client, "usdt_perp_1m") and count(client, "data.retention_tasks") == 1
 
     hr("full-upgrade plan judges as if the plugins were upgraded: no block")
-    rc, out = upgrade(OLD, "plan", "--assume-plugins-upgraded")
+    rc, out = upgrade(OLD, "plan", "--assume-upgraded")
     assert rc == 4 and "按升级后估计" in out and "阻断" not in out, rc
 
     hr("plan with upgraded plugins: needs a stop window, backup planned, deletions shown")

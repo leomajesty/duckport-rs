@@ -39,7 +39,7 @@ from reconcile.state import collect
 
 def check(dp, args):
     instances = load_instances(args.instances_file)
-    if args.assume_plugins_upgraded:
+    if args.assume_upgraded:
         # plan of a full `duckport upgrade`: stage 2 brings known plugins to at least their minimum
         for i in instances:
             minimum = PLUGIN_MIN_VERSION.get(i.exec)
@@ -48,7 +48,11 @@ def check(dp, args):
                 i.version = minimum
     state = collect(dp, instances)
     opts = Options(deep=args.deep, bloat_min_dead_rows=args.bloat_min_dead_rows)
-    return state, opts, run_rules(state, dp, opts)
+    findings = run_rules(state, dp, opts)
+    if args.assume_upgraded:
+        # ... and stage 1 replaces the server
+        findings = [f for f in findings if f.rule != "V1"]
+    return state, opts, findings
 
 
 def backup_path(args):
@@ -200,8 +204,9 @@ def main():
     ap.add_argument("--levels", default="online", help="apply: online or online,stop")
     ap.add_argument("--confirm-delete", action="store_true", help="apply: delete corrupted/duplicate rows (D1/D2)")
     ap.add_argument("--state-out", default="", help="plan: write WINDOW/BACKUP_OK/DELETE_ROWS for the CLI")
-    ap.add_argument("--assume-plugins-upgraded", action="store_true",
-                    help="plan: judge as if known plugins were at their minimum version (full upgrade plan)")
+    ap.add_argument("--assume-upgraded", action="store_true",
+                    help="plan: judge as after stages 1-2 of a full upgrade (server replaced, known plugins "
+                         "at least at their minimum version)")
     ap.add_argument("command", choices=["plan", "apply", "finalize", "rollback"])
     args = ap.parse_args()
     db_dir = os.path.dirname(os.path.abspath(args.db_path)) if args.db_path else ""

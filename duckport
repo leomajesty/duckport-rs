@@ -1000,7 +1000,7 @@ cmd_upgrade() {
     plan)
       _upgrade_plan_stages
       echo -e "\n${BOLD}▶ 3/3 数据对齐${NC}（按插件升级后的版本估计）"
-      plan_args=(--assume-plugins-upgraded)
+      plan_args=(--assume-upgraded)
       ;;
   esac
   _upgrade_db
