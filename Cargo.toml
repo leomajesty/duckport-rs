@@ -6,21 +6,22 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.4"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT"
 
 [workspace.dependencies]
-# DuckDB pinned to 1.5.1 (crate 1.10501.0 bundles DuckDB 1.5.1 and uses arrow 58.1.0)
-duckdb = { version = "=1.10501.0", features = [
+# DuckDB pinned to 1.5.6 (crate 1.10506.1 bundles DuckDB 1.5.6 and uses arrow 58).
+# 1.5.2+ fixes duckdb/duckdb#22279 (strings corrupted after a reverted append on a PK conflict).
+duckdb = { version = "=1.10506.1", features = [
     "bundled",
     "vtab-arrow",
     "appender-arrow",
     "r2d2",
 ] }
 
-# Arrow / Flight / RPC stack (all aligned to the versions duckdb 1.5.1 pulls in)
+# Arrow / Flight / RPC stack (all aligned to the versions duckdb 1.5.6 pulls in)
 arrow = "58"
 arrow-array = "58"
 arrow-schema = "58"
