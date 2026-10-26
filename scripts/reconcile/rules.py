@@ -92,6 +92,9 @@ def plugin_versions(state, dp, opts):
 
 def _writer_ready(state: State, table: str):
     """(ready, reason): can the table's writers handle a table without a key?"""
+    spec = state.spec(table)
+    if spec and spec.source == "registered" and spec.write_mode == "anti_join":
+        return True, f"表规格登记 write_mode=anti_join（{spec.plugin} v{spec.writer_version or '?'}）"
     if state.write_modes.get(table) == "anti_join":
         return True, "已登记 write_mode=anti_join"
     writers = state.writers(table)
@@ -158,6 +161,16 @@ def watermark_rows(state, dp, opts):
             col = state.watermark[name].get("time_column")
             if col and col not in state.tables[name].columns:
                 yield Finding("S2", "hint", name, f"watermark.time_column={col!r} 不是这张表的列")
+
+
+@rule("S3")
+def registered_specs(state, dp, opts):
+    for name in state.bad_specs:
+        yield Finding("S3", "hint", name, "data.table_specs 中这张表的规格无法解析，按内置规格或未知表处理",
+                      f"重启写入它的插件重新登记（{name}）")
+    for name, spec in sorted(state.registered.items()):
+        if name not in state.tables:
+            yield Finding("S3", "hint", name, f"{spec.plugin} 登记了规格，但表不存在")
 
 
 @rule("L1")
@@ -242,10 +255,13 @@ def bad_string_condition(spec, table) -> str:
         if col not in table.columns:
             continue
         c = q_ident(col)
-        cond = f"length({c}) > {chk.max_len}"
+        parts = []
+        if chk.max_len:
+            parts.append(f"length({c}) > {int(chk.max_len)}")
         if chk.pattern:
-            cond += f" OR NOT regexp_full_match({c}, {lit(chk.pattern)})"
-        conds.append(f"({c} IS NOT NULL AND ({cond}))")
+            parts.append(f"NOT regexp_full_match({c}, {lit(chk.pattern)})")
+        if parts:
+            conds.append(f"({c} IS NOT NULL AND ({' OR '.join(parts)}))")
     return " OR ".join(conds)
 
 

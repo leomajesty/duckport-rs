@@ -6,7 +6,9 @@ Metadata is read once; rules that need to scan table data query the server thems
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from reconcile.specs import LEFTOVER_SUFFIXES, RETIRED_TABLES, SYSTEM_TABLES, TOOL_TABLES, TableSpec, builtin_spec
+from reconcile.specs import (
+    LEFTOVER_SUFFIXES, RETIRED_TABLES, SYSTEM_TABLES, TOOL_TABLES, TableSpec, builtin_spec, registered_spec,
+)
 
 
 @dataclass
@@ -36,6 +38,8 @@ class State:
     db_size: dict
     instances: List[Instance] = field(default_factory=list)
     write_modes: Dict[str, str] = field(default_factory=dict)
+    registered: Dict[str, TableSpec] = field(default_factory=dict)   # data.table_specs
+    bad_specs: List[str] = field(default_factory=list)
 
     def business_tables(self) -> List[Table]:
         skip = set(SYSTEM_TABLES) | set(RETIRED_TABLES) | TOOL_TABLES
@@ -43,7 +47,8 @@ class State:
                 if name not in skip and not name.endswith(LEFTOVER_SUFFIXES)]
 
     def spec(self, table: str) -> Optional[TableSpec]:
-        return builtin_spec(table)
+        """The writer's registered spec, else the built-in one for known plugins."""
+        return self.registered.get(table) or builtin_spec(table)
 
     def writers(self, table: str) -> List[Instance]:
         """Plugin instances that write `table`: the watermark owner, or for tables
@@ -93,10 +98,17 @@ def collect(dp, instances: List[Instance]) -> State:
     size = (dp.query("SELECT total_blocks, used_blocks, free_blocks FROM pragma_database_size() "
                      "WHERE database_name = current_database()") or [{}])[0]
     write_modes = {k.split(":", 1)[1]: v for k, v in config.items() if k.startswith("write_mode:")}
+    registered, bad_specs = {}, []
+    if "table_specs" in tables:
+        for r in dp.query("SELECT * FROM data.table_specs"):
+            try:
+                registered[r["table_name"]] = registered_spec(r)
+            except (ValueError, TypeError, AttributeError):
+                bad_specs.append(r["table_name"])
     return State(
         server_version=ping.get("server_version", ""), tables=tables, staging=staging,
         config=config, watermark=watermark, retention_policies=policies, db_size=size,
-        instances=instances, write_modes=write_modes,
+        instances=instances, write_modes=write_modes, registered=registered, bad_specs=bad_specs,
     )
 
 

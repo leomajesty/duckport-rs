@@ -196,6 +196,27 @@ async fn shutdown_signal() {
 /// Ingestors own their business tables, but duckport-server owns shared metadata
 /// schema such as `data.watermark`. This keeps `duckport status` and future
 /// plugins on one stable contract.
+/// Business-table specs registered by the plugins that write them. `duckport doctor` /
+/// `duckport upgrade` check each table against its spec; JSON documents are stored as
+/// VARCHAR so no extension is needed.
+const TABLE_SPECS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS data.table_specs (
+        table_name      VARCHAR PRIMARY KEY,
+        writer          VARCHAR,
+        writer_version  VARCHAR,
+        kind            VARCHAR,
+        time_column     VARCHAR,
+        period_seconds  INTEGER,
+        dedup_key       VARCHAR[],
+        write_mode      VARCHAR,
+        columns         VARCHAR,
+        column_defaults VARCHAR,
+        string_checks   VARCHAR,
+        legacy_columns  VARCHAR[],
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+"#;
+
 async fn init_system_schema(backend: &Backend) -> Result<()> {
     backend
         .with_writer(|conn| {
@@ -224,11 +245,12 @@ async fn init_system_schema(backend: &Backend) -> Result<()> {
                 "#,
             )?;
             conn.execute_batch(retention::SYSTEM_SCHEMA_SQL)?;
+            conn.execute_batch(TABLE_SPECS_SQL)?;
             Ok(())
         })
         .await?;
     backend.bump_catalog_epoch();
-    info!("initialised duckport system schema data.config_dict + data.watermark + data.retention_policy/log");
+    info!("initialised duckport system schema data.config_dict + data.watermark + data.retention_policy/log + data.table_specs");
     Ok(())
 }
 

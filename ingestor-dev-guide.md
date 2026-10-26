@@ -193,7 +193,7 @@ class DuckportClient:
 |------|------|
 | 业务表 | 放 `data` schema（`data.my_kline_5m`） |
 | 业务表约束 | **不建 `PRIMARY KEY`、`UNIQUE` 或索引**，去重由写入 SQL 负责（原因见 [5.1](#51-为什么业务表不建主键)） |
-| 写入方式登记 | `init_schema` 时向 `data.config_dict` 写入 `write_mode:<表名> = anti_join`（见 [5.3](#53-登记写入方式)） |
+| 表规格登记 | `init_schema` 时把每张业务表的规格写入 `data.table_specs`，并保留 `data.config_dict` 的 `write_mode:<表名> = anti_join`（见 [5.3](#53-登记表规格)） |
 | staging 表 | 放 `main` schema（`_staging_my_kline_5m`），无 PK |
 | watermark 表 | `data.watermark`，由 duckport-rs 启动时创建/迁移，每张业务表对应一行 |
 | 通用元数据 | `data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)`，由 duckport-rs 启动时创建（系统表行数很少，保留主键是例外） |
@@ -228,9 +228,33 @@ self.execute_transaction([
 
 同一事务内先删后插，`DISTINCT ON` 代替主键保证 `(market, symbol)` 唯一。没有索引时，删除的行会在 checkpoint 时被回收；带主键时同样的刷新方式会让表无限膨胀（线上曾出现 1259 行有效数据、2.12 亿行物理存储）。
 
-### 5.3 登记写入方式
+### 5.3 登记表规格
 
-`duckport upgrade --data`（把旧库对齐到当前版本，其中包括把业务表重建为无主键表）只对确认写入方已改用 anti-join 的表去主键，因为旧写法 `INSERT ... ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错。内置插件按安装版本判断；第三方插件靠这条登记。插件在 `init_schema` 中为自己负责的每张业务表登记一次：
+`duckport doctor` / `duckport upgrade` 按表规格检查每张业务表：缺哪些列、按哪些列去重、哪些字符串列有长度或格式约束、时间列和采集周期是什么（用来核对 watermark）。规格由写这张表的插件登记在 `data.table_specs`（duckport-server ≥ 1.2.0 启动时创建）；没有登记的表只做通用检查。`write_mode = anti_join` 同时告诉 `duckport upgrade` 这张表可以去主键——旧写法 `INSERT ... ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错。
+
+| 列 | 说明 |
+|---|---|
+| `table_name` | 业务表名（`data` schema 下），主键 |
+| `writer` / `writer_version` | 插件的 console script 名（与 registry.json 的 `exec` 一致）和安装版本 |
+| `kind` | `append`（K 线、资金费率）或 `snapshot`（整表刷新，如 exginfo） |
+| `time_column` / `period_seconds` | append 表必填：时间列和相邻两行的间隔 |
+| `dedup_key` | 去重键，`VARCHAR[]` |
+| `write_mode` | `anti_join` |
+| `columns` | JSON：`{"列名": "类型"}`，插件期望的完整列定义；缺的列由 `duckport upgrade` 补上 |
+| `column_defaults` | JSON：补列时用的默认值，如 `{"created_time": "CURRENT_TIMESTAMP"}` |
+| `string_checks` | JSON：`{"列名": {"max_len": 64, "pattern": "[a-z0-9_]{1,32}"}}`，`pattern` 是全匹配的 RE2 正则；不合规的行由 `duckport upgrade` 列出，人工确认后隔离删除 |
+| `legacy_columns` | 旧版本插件有、现在不用的列（只提示，不删除） |
+
+插件在 `init_schema` 中建表之后、用单独的事务登记（参考 binance-ingestor 的 `_spec_sql` / `register_table_specs`）。JSON 用 ASCII 编码（`ensure_ascii=True`）。旧服务端没有这张表，登记失败只记日志、不能影响启动：
+
+```python
+f"INSERT OR REPLACE INTO {s}.table_specs (table_name, writer, writer_version, kind, time_column, "
+f"period_seconds, dedup_key, write_mode, columns, column_defaults, string_checks, legacy_columns, updated_at) "
+f"VALUES ('{target}', 'my-ingestor', '0.3.0', 'append', 'open_time', 300, ['open_time', 'symbol']::VARCHAR[], "
+f"'anti_join', '{columns_json}', '{{}}', '{checks_json}', []::VARCHAR[], CURRENT_TIMESTAMP)"
+```
+
+同时继续在 `init_schema` 的建表事务里登记 `write_mode`，服务端 1.1.0 只认这一条：
 
 ```python
 f"INSERT OR REPLACE INTO {s}.config_dict (key, value) VALUES ('write_mode:{target}', 'anti_join')"
@@ -630,7 +654,7 @@ PROXY_URL=
 
 1. **建表**：`init_schema` 里的业务表去掉 `PRIMARY KEY` / `UNIQUE`；快照类表按 [5.2](#52-快照类表) 处理。已存在的表不受 `CREATE TABLE IF NOT EXISTS` 影响，由用户之后执行迁移。
 2. **写入**：把 `INSERT ... ON CONFLICT DO NOTHING` 换成第 6 节的 anti-join 模板。新写法在旧的带主键表上同样正确，所以插件可以先于表结构升级。
-3. **登记**：`init_schema` 里加上 [5.3](#53-登记写入方式) 的 `write_mode:<表名>` 登记。
+3. **登记**：`init_schema` 里加上 [5.3](#53-登记表规格) 的表规格和 `write_mode:<表名>` 登记。
 4. **发版**：升级版本号并在 README 中说明需要 duckport-server ≥ 1.1.0。
 
 用户侧的升级顺序（必须先插件、后表结构）：

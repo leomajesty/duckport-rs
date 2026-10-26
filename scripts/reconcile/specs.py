@@ -4,6 +4,7 @@ Only the latest state is described here; there is no per-version upgrade logic. 
 databases are recognised by what they contain, not by a recorded version.
 """
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -36,6 +37,12 @@ SYSTEM_TABLES: Dict[str, Dict[str, str]] = {
         "dry_run": "BOOLEAN", "free_blocks_before": "BIGINT", "free_blocks_after": "BIGINT",
         "status": "VARCHAR", "error": "VARCHAR", "started_at": "TIMESTAMP", "finished_at": "TIMESTAMP",
     },
+    "table_specs": {
+        "table_name": "VARCHAR", "writer": "VARCHAR", "writer_version": "VARCHAR", "kind": "VARCHAR",
+        "time_column": "VARCHAR", "period_seconds": "INTEGER", "dedup_key": "VARCHAR[]",
+        "write_mode": "VARCHAR", "columns": "VARCHAR", "column_defaults": "VARCHAR",
+        "string_checks": "VARCHAR", "legacy_columns": "VARCHAR[]", "updated_at": "TIMESTAMP",
+    },
 }
 
 # DDL the server runs at startup (crates/duckport-server/src/main.rs init_system_schema and
@@ -57,6 +64,12 @@ SYSTEM_DDL: Dict[str, str] = {
         "first_day DATE, last_day DATE, rows_archived BIGINT, rows_deleted BIGINT, dry_run BOOLEAN, "
         "free_blocks_before BIGINT, free_blocks_after BIGINT, status VARCHAR, error VARCHAR, "
         "started_at TIMESTAMP, finished_at TIMESTAMP)"
+    ),
+    "table_specs": (
+        "CREATE TABLE IF NOT EXISTS data.table_specs (table_name VARCHAR PRIMARY KEY, writer VARCHAR, "
+        "writer_version VARCHAR, kind VARCHAR, time_column VARCHAR, period_seconds INTEGER, "
+        "dedup_key VARCHAR[], write_mode VARCHAR, columns VARCHAR, column_defaults VARCHAR, "
+        "string_checks VARCHAR, legacy_columns VARCHAR[], updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
     ),
 }
 # Defaults for system columns added to an existing table (others are added as plain NULL columns).
@@ -82,7 +95,7 @@ LEFTOVER_SUFFIXES = ("__pk_old", "__nopk")
 
 @dataclass(frozen=True)
 class StringCheck:
-    max_len: int
+    max_len: Optional[int] = None
     pattern: Optional[str] = None  # full-match regex (DuckDB RE2 syntax)
 
 
@@ -98,7 +111,9 @@ class TableSpec:
     string_checks: Dict[str, StringCheck] = field(default_factory=dict)
     legacy_columns: Tuple[str, ...] = ()  # columns older plugin versions had
     column_defaults: Dict[str, str] = field(default_factory=dict)  # used when a missing column is added
-    source: str = "builtin"
+    write_mode: Optional[str] = None    # registered by the writer: anti_join | on_conflict
+    writer_version: Optional[str] = None
+    source: str = "builtin"             # builtin | registered
 
 
 KLINE_COLUMNS = {
@@ -152,6 +167,28 @@ def builtin_spec(table: str) -> Optional[TableSpec]:
             legacy_columns=("funding_interval_hours", "source"),
         )
     return None
+
+
+def registered_spec(row: dict) -> TableSpec:
+    """TableSpec from a data.table_specs row (JSON documents stored as VARCHAR)."""
+    def doc(name):
+        return json.loads(row.get(name) or "{}")
+    checks = {}
+    for col, chk in doc("string_checks").items():
+        if isinstance(chk, str):          # {"market": "[a-z0-9_]{1,32}"}: a full-match pattern
+            checks[col] = StringCheck(pattern=chk)
+        else:                             # {"symbol": {"max_len": 64, "pattern": "..."}}
+            max_len = chk.get("max_len")
+            checks[col] = StringCheck(max_len=int(max_len) if max_len else None, pattern=chk.get("pattern"))
+    period = row.get("period_seconds")
+    return TableSpec(
+        table=row["table_name"], plugin=row.get("writer") or "", kind=row.get("kind") or "append",
+        columns=doc("columns"), dedup_key=tuple(row.get("dedup_key") or ()),
+        time_column=row.get("time_column"), period=timedelta(seconds=period) if period else None,
+        string_checks=checks, legacy_columns=tuple(row.get("legacy_columns") or ()),
+        column_defaults=doc("column_defaults"), write_mode=row.get("write_mode"),
+        writer_version=row.get("writer_version"), source="registered",
+    )
 
 
 def parse_version(v: Optional[str]) -> Tuple[int, ...]:

@@ -66,8 +66,8 @@ def has(findings, rule, level, target=None):
 
 def reset(client):
     tx(client, *[f"DROP TABLE IF EXISTS data.{t}" for t in TABLES],
-       "DROP TABLE IF EXISTS main._staging_usdt_perp_1m", "DELETE FROM data.config_dict",
-       "DELETE FROM data.watermark")
+       "DROP TABLE IF EXISTS main._staging_usdt_perp_1m", "DROP TABLE IF EXISTS data.oi_5m",
+       "DELETE FROM data.config_dict", "DELETE FROM data.watermark", "DELETE FROM data.table_specs")
     tx(client, "ALTER TABLE data.watermark ADD COLUMN IF NOT EXISTS max_lag_seconds INTEGER")
 
 

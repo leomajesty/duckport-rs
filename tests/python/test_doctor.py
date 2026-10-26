@@ -59,6 +59,27 @@ def main():
     assert has(f, "B1", "hint", "oi_5m") and rc == 1, (rc, f)
     tx(client, "DROP TABLE data.oi_5m")
 
+    hr("registered spec of a third-party table: full checks")
+    tx(client,
+       "CREATE TABLE data.oi_5m (t TIMESTAMP, s VARCHAR)",
+       "INSERT INTO data.oi_5m VALUES (TIMESTAMP '2026-10-26', 'BTCUSDT'), (TIMESTAMP '2026-10-26', 'BTCUSDT'), "
+       "(TIMESTAMP '2026-10-26 00:05', repeat('X', 50))",
+       "INSERT INTO data.table_specs (table_name, writer, writer_version, kind, time_column, period_seconds, "
+       "dedup_key, write_mode, columns, column_defaults, string_checks, legacy_columns) VALUES "
+       "('oi_5m', 'oi-ingestor', '1.0.0', 'append', 't', 300, ['t', 's'], 'anti_join', "
+       "'{\"t\": \"TIMESTAMP\", \"s\": \"VARCHAR\", \"oi\": \"DOUBLE\"}', '{}', "
+       "'{\"s\": {\"max_len\": 20}}', []), "
+       "('gone_5m', 'oi-ingestor', '1.0.0', 'append', 't', 300, ['t'], 'anti_join', '{}', '{}', '{}', []), "
+       "('broken_5m', 'oi-ingestor', '1.0.0', 'append', 't', 300, ['t'], 'anti_join', 'not json', '{}', '{}', [])")
+    rc, f = doctor(NEW)
+    for rule, level, target in [("B2", "online", "oi_5m"), ("D1", "online", "oi_5m"), ("D2", "online", "oi_5m"),
+                                ("S2", "online", "oi_5m"), ("S3", "hint", "gone_5m"), ("S3", "hint", "broken_5m")]:
+        assert has(f, rule, level, target), (rule, level, target)
+    tx(client, "DROP TABLE data.oi_5m", "CREATE TABLE data.oi_5m (t TIMESTAMP, s VARCHAR, oi DOUBLE, PRIMARY KEY (t, s))")
+    rc, f = doctor(NEW)
+    assert has(f, "B1", "stop", "oi_5m"), "a registered anti_join writer makes the rebuild possible"
+    tx(client, "DROP TABLE data.oi_5m", "DELETE FROM data.table_specs")
+
     hr("ingestor running: staging rows are only a hint")
     rc, f = doctor([dict(NEW[0], active=True), NEW[1]])
     assert has(f, "D3", "hint", "main._staging_usdt_perp_1m"), f
