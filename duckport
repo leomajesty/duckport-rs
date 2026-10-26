@@ -148,9 +148,35 @@ _resolve_instances() {
   fi
 }
 
-# 查询正在运行的 duckport-server 版本（duckport.ping 的 server_version）。
-_server_version() {
-  local port="$1"
+# 从 server.env 读取一项配置（去掉引号和空白）
+_server_env() {
+  grep "^$1=" "$DEPLOY_OPT/server.env" 2>/dev/null | tail -1 \
+    | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs
+}
+
+# 布尔配置的三态：输出 true | false | invalid（不区分大小写；兼容 macOS 自带的 bash 3.2）。
+# 与 duckport-server 的解析一致：未设置取默认值，其他无法识别的值（含空值）视为 invalid。
+_bool_state() {
+  local value="${1-__unset__}" default="${2:-false}"
+  [[ "$value" == "__unset__" ]] && { echo "$default"; return; }
+  case "$(echo "$value" | tr '[:upper:]' '[:lower:]' | xargs)" in
+    true|1|yes|on)  echo "true" ;;
+    false|0|no|off) echo "false" ;;
+    *)              echo "invalid" ;;
+  esac
+}
+
+# duckport-server 监听端口（来自 DUCKPORT_LISTEN_ADDR，默认 50051）
+_server_port() {
+  local addr port
+  addr=$(_server_env DUCKPORT_LISTEN_ADDR)
+  addr="${addr:-0.0.0.0:50051}"
+  port="${addr##*:}"
+  echo "${port:-50051}"
+}
+
+# 带 pyarrow 的 Python：优先用第一个 ingestor 实例的 venv，回退到系统 python3
+_flight_python() {
   local py candidate inst
   py=$(command -v python3)
   while IFS= read -r inst; do
@@ -161,6 +187,14 @@ _server_version() {
       break
     fi
   done <<< "$(_list_instances)"
+  echo "$py"
+}
+
+# 查询正在运行的 duckport-server 版本（duckport.ping 的 server_version）。
+_server_version() {
+  local port="$1"
+  local py
+  py=$(_flight_python)
 
   "$py" - "$port" << 'PY' 2>/dev/null || true
 import json
@@ -326,7 +360,138 @@ for _, row in wm.iterrows():
 PYEOF
     echo -e "  ${DIM}无法读取 data.watermark：缺少 pyarrow/pandas 或查询失败${NC}"
   }
+
+  local ret_enabled ret_dry
+  if grep -q '^DUCKPORT_RETENTION_ENABLED=' "$DEPLOY_OPT/server.env" 2>/dev/null; then
+    ret_enabled=$(_bool_state "$(_server_env DUCKPORT_RETENTION_ENABLED)" false)
+  else
+    ret_enabled=false
+  fi
+  if grep -q '^DUCKPORT_RETENTION_DRY_RUN=' "$DEPLOY_OPT/server.env" 2>/dev/null; then
+    ret_dry=$(_bool_state "$(_server_env DUCKPORT_RETENTION_DRY_RUN)" true)
+  else
+    ret_dry=true
+  fi
+  echo -e "\n${BOLD}Retention${NC}"
+  if [[ "$ret_enabled" == "invalid" || "$ret_dry" == "invalid" ]]; then
+    echo -e "  scheduler ${RED}✗ server.env 中 DUCKPORT_RETENTION_ENABLED / DRY_RUN 的值无效（只接受 true/false），服务端会拒绝启动${NC}"
+  elif [[ "$ret_enabled" == "true" ]]; then
+    if [[ "$ret_dry" == "true" ]]; then
+      echo -e "  scheduler ${YELLOW}● dry-run${NC}  ${DIM}(DUCKPORT_RETENTION_DRY_RUN=false 才会真正删除)${NC}"
+    else
+      echo -e "  scheduler ${GREEN}● enabled${NC}"
+    fi
+  else
+    echo -e "  scheduler ${DIM}○ disabled${NC}"
+  fi
+  "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>/dev/null \
+    || echo -e "  ${DIM}无法读取 data.retention_policy（服务端版本低于 1.1.0？）${NC}"
   echo ""
+}
+
+# ─── retention ────────────────────────────────────────────────────────────────
+
+cmd_retention() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    status|set|disable|dry-run|run|log) ;;
+    *) echo -e "${RED}用法：duckport retention [status|set|disable|dry-run|run|log] ...${NC}"; exit 1 ;;
+  esac
+  local port
+  port=$(_server_port)
+  nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
+  "$(_flight_python)" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$port" "$sub" "$@"
+}
+
+# ─── migrate ──────────────────────────────────────────────────────────────────
+
+# 把带主键的业务表重建为无主键表（retention 才能回收空间）。
+#   duckport migrate nopk [--yes] [--tables t1 t2]   预检 → 停 ingestor → 迁移 → 启动 ingestor
+#   duckport migrate nopk --plan                      只预检，不修改
+#   duckport migrate nopk --finalize                  删除迁移留下的 <表>__pk_old
+#   duckport migrate nopk --rollback                  把 <表>__pk_old 恢复为原表
+cmd_migrate() {
+  local what="${1:-}"
+  shift || true
+  [[ "$what" == "nopk" ]] || { echo -e "${RED}用法：duckport migrate nopk [--plan|--finalize|--rollback] [--yes] [--tables ...]${NC}"; exit 1; }
+
+  local mode="migrate" yes=0 tables=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --plan)     mode="plan" ;;
+      --finalize) mode="finalize" ;;
+      --rollback) mode="rollback" ;;
+      --yes|-y)   yes=1 ;;
+      --tables)   shift; while [[ $# -gt 0 && "$1" != --* ]]; do tables+=("$1"); shift; done; continue ;;
+      *) echo -e "${RED}未知参数：$1${NC}"; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ ${#tables[@]} -gt 0 && "$mode" != "migrate" && "$mode" != "plan" ]]; then
+    echo -e "${RED}--tables 只能用于迁移和 --plan${NC}"; exit 1
+  fi
+
+  local port py db script
+  port=$(_server_port)
+  py=$(_flight_python)
+  db=$(_server_env DUCKPORT_DB_PATH)
+  script="$REPO_DIR/scripts/migrate_nopk.py"
+  nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
+  local base=("$py" "$script" --addr "127.0.0.1:$port" --db-path "$db")
+  # 子命令必须在 --tables 之前：--tables 会吞掉其后的所有参数
+  local table_args=()
+  [[ ${#tables[@]} -gt 0 ]] && table_args=(--tables "${tables[@]}")
+
+  if [[ "$mode" == "plan" ]]; then
+    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"}
+    return
+  fi
+  _require_root
+
+  if [[ "$mode" == "finalize" ]]; then
+    # 只删除 <表>__pk_old，ingestor 不会写这些表，不需要停写
+    "${base[@]}" finalize
+    return
+  fi
+
+  if [[ "$mode" == "migrate" ]]; then
+    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"} \
+      || { echo -e "\n${RED}预检未通过，未做任何修改${NC}"; exit 1; }
+    echo -e "\n${YELLOW}迁移期间会停止所有 ingestor。建议先备份库文件：${db}${NC}"
+    if [[ $yes -ne 1 ]]; then
+      read -r -p "继续？[y/N] " ans
+      [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
+    fi
+  fi
+
+  # 改名期间不能有写入：先停掉正在运行的 ingestor，结束后按原状态拉起
+  local running=() inst
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    if [[ "$(_svc_is_active "duckport-ingestor@$inst")" == "active" ]]; then
+      running+=("$inst")
+      _svc_stop "duckport-ingestor@$inst"
+      echo -e "  ${DIM}stopped${NC} $inst"
+    fi
+  done <<< "$(_list_instances)"
+
+  local rc=0
+  if [[ "$mode" == "migrate" ]]; then
+    "${base[@]}" migrate ${table_args[@]+"${table_args[@]}"} || rc=$?
+  else
+    "${base[@]}" "$mode" || rc=$?
+  fi
+
+  for inst in ${running[@]+"${running[@]}"}; do
+    _svc_start "duckport-ingestor@$inst"
+    echo -e "  ${GREEN}✓${NC} started $inst"
+  done
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}${mode} 失败（exit=$rc）。已迁移的表保留为 <表>__pk_old，可执行 duckport migrate nopk --rollback${NC}"
+  fi
+  return $rc
 }
 
 # ─── start / stop / restart ───────────────────────────────────────────────────
@@ -840,6 +1005,12 @@ ${BOLD}服务控制：${NC}
 
 ${BOLD}数据操作：${NC}
   duckport ${CYAN}loadhist${NC} [实例名]              补历史数据（默认所有实例）
+  duckport ${CYAN}retention${NC} status               保留策略与最近一次执行结果
+  duckport ${CYAN}retention${NC} set <表> <天数>       设置保留天数（--archive-dir DIR 先归档再删）
+  duckport ${CYAN}retention${NC} disable <表>          停用某张表的策略
+  duckport ${CYAN}retention${NC} dry-run|run [表]      立即执行（dry-run 只统计不删除）
+  duckport ${CYAN}retention${NC} log [表]              执行日志
+  duckport ${CYAN}migrate${NC} nopk [--plan]           业务表去主键（--finalize 清理旧表，--rollback 回退）
 
 ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
@@ -872,6 +1043,8 @@ case "$CMD" in
   restart)  cmd_restart "${1:-all}" ;;
   logs)     cmd_logs    "${1:-}" ;;
   loadhist) cmd_loadhist "${1:-}" ;;
+  retention) cmd_retention "$@" ;;
+  migrate)  cmd_migrate "$@" ;;
   upgrade)  cmd_upgrade ;;
   help|-h|--help) cmd_help ;;
   *) echo -e "${RED}未知命令：$CMD${NC}"; cmd_help; exit 1 ;;

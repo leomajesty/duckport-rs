@@ -36,15 +36,21 @@ pub struct Config {
     /// DuckDB `memory_limit` PRAGMA (empty = DuckDB default).
     pub duckdb_memory_limit: String,
 
-    /// Whether the periodic retention scheduler (COPY+DELETE) is active.
-    /// **Plan A default: off** — keep all data in the hot DuckDB file.
-    /// Set `DUCKPORT_RETENTION_ENABLED=true` to re-enable legacy export+delete.
+    /// Whether the rolling-window retention scheduler runs (`DUCKPORT_RETENTION_ENABLED`).
+    /// Default off: keep all data. Policies live in `data.retention_policy`.
     pub retention_enabled: bool,
 
-    /// Fully-qualified table that stores per-market retention tasks.
-    /// Default: `data.retention_tasks`.
-    /// Set via `DUCKPORT_RETENTION_TABLE`.
-    pub retention_table: String,
+    /// Count rows only, never archive or delete (`DUCKPORT_RETENTION_DRY_RUN`, default true).
+    pub retention_dry_run: bool,
+
+    /// Pause between scheduled runs (`DUCKPORT_RETENTION_INTERVAL_SECS`, default 3600, min 60).
+    pub retention_interval: Duration,
+
+    /// Policies keeping fewer days are refused (`DUCKPORT_RETENTION_MIN_KEEP_DAYS`, default 7).
+    pub retention_min_keep_days: u32,
+
+    /// Pause between two DELETE batches (`DUCKPORT_RETENTION_BATCH_PAUSE_MS`, default 200).
+    pub retention_batch_pause: Duration,
 
     /// `name:token` entries. Empty disables every public peer; LAN stays open.
     pub auth_tokens: String,
@@ -89,11 +95,18 @@ impl Config {
         let threads = parse_env_u32("DUCKPORT_DUCKDB_THREADS", 0)?;
         let mem = env::var("DUCKPORT_DUCKDB_MEMORY_LIMIT").unwrap_or_else(|_| String::new());
 
-        let retention_enabled = env::var("DUCKPORT_RETENTION_ENABLED")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
-        let retention_table = env::var("DUCKPORT_RETENTION_TABLE")
-            .unwrap_or_else(|_| "data.retention_tasks".to_string());
+        let retention_enabled = parse_env_bool("DUCKPORT_RETENTION_ENABLED", false)?;
+        let retention_dry_run = parse_env_bool("DUCKPORT_RETENTION_DRY_RUN", true)?;
+        let retention_interval_secs =
+            parse_env_u64("DUCKPORT_RETENTION_INTERVAL_SECS", 3600)?.max(60);
+        let retention_min_keep_days = parse_env_u32("DUCKPORT_RETENTION_MIN_KEEP_DAYS", 7)?;
+        let retention_batch_pause_ms = parse_env_u64("DUCKPORT_RETENTION_BATCH_PAUSE_MS", 200)?;
+        if let Ok(v) = env::var("DUCKPORT_RETENTION_TABLE") {
+            tracing::warn!(
+                value = %v,
+                "DUCKPORT_RETENTION_TABLE is deprecated and ignored; retention policies now live in data.retention_policy"
+            );
+        }
         let auth_tokens = env::var("DUCKPORT_AUTH_TOKENS").unwrap_or_default();
         let trusted_raw = env::var("DUCKPORT_TRUSTED_CIDRS").unwrap_or_default();
         let trusted_cidrs = parse_cidrs(&trusted_raw)?;
@@ -112,7 +125,10 @@ impl Config {
             duckdb_threads: threads,
             duckdb_memory_limit: mem,
             retention_enabled,
-            retention_table,
+            retention_dry_run,
+            retention_interval: Duration::from_secs(retention_interval_secs),
+            retention_min_keep_days,
+            retention_batch_pause: Duration::from_millis(retention_batch_pause_ms),
             auth_tokens,
             trusted_cidrs,
             doget_max_bytes,
@@ -149,11 +165,48 @@ fn parse_env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+/// Unset means `default`. Anything other than true/false/1/0/yes/no/on/off (including an
+/// empty value) is an error: these flags guard data deletion, so a typo must not silently
+/// flip them.
+fn parse_env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    match env::var(key) {
+        Ok(v) => parse_bool(&v)
+            .ok_or_else(|| anyhow::anyhow!("{key}='{v}' is not a boolean (use true or false)")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
     match env::var(key) {
         Ok(v) => v
             .parse::<u32>()
             .map_err(|e| anyhow::anyhow!("{key}='{v}' is not a u32: {e}")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool;
+
+    #[test]
+    fn booleans_parse_strictly() {
+        for v in ["true", "TRUE", " 1 ", "yes", "on"] {
+            assert_eq!(parse_bool(v), Some(true), "{v}");
+        }
+        for v in ["false", "False", "0", "no", "off"] {
+            assert_eq!(parse_bool(v), Some(false), "{v}");
+        }
+        for v in ["", " ", "ture", "2", "enabled"] {
+            assert_eq!(parse_bool(v), None, "{v:?}");
+        }
     }
 }

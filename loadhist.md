@@ -9,7 +9,7 @@
 
 **duck_time 之前的数据已完整且准确，无需补录。**
 
-为保留 1 天冗余缓冲（应对边界行缺失、时钟漂移等），实际导入边界取 `duck_time - 1 day`，重叠部分由 `ON CONFLICT DO NOTHING` 幂等处理。
+为保留 1 天冗余缓冲（应对边界行缺失、时钟漂移等），实际导入边界取 `duck_time - 1 day`，重叠部分由 anti-join 去重（插件 0.2.0 起；旧版本为 `ON CONFLICT DO NOTHING`）幂等处理。
 
 ---
 
@@ -48,7 +48,7 @@ Step 3  增量导入
    │      对每个 Parquet（按文件名时间排序）：
    │        file_max < boundary  →  skip
    │        file_max >= boundary →  WHERE open_time >= boundary
-   │                                ON CONFLICT DO NOTHING 处理重叠
+   │                                anti-join 去重处理重叠  
    │      更新 duck_time = max(本次加载的 open_time)
    │
 完成提示：告知用户 Parquet 目录路径，可手动删除释放磁盘空间
@@ -80,7 +80,7 @@ boundary = duck_time - 1 day（duck_time 为 None 时 boundary 也为 None）
 
 file_max  < boundary   →  skip（文件内所有数据均早于边界，已在热库）
 file_max >= boundary   →  WHERE open_time >= boundary
-                           ON CONFLICT DO NOTHING（处理冗余 1 天重叠）
+                           anti-join 去重（处理冗余 1 天重叠）
 boundary 为 None       →  无 WHERE，全量写入（首次运行）
 ```
 
@@ -90,8 +90,8 @@ boundary 为 None       →  无 WHERE，全量写入（首次运行）
 |------|----------|-----------|----------|------|
 | 首次运行 | 任意 | None | None | 全量写入 ✓ |
 | 重跑，旧月份 | 2024-03-31 | 2025-01-20 | 2025-01-19 | skip ✓ |
-| 重跑，当月无新数据 | 2024-12-15 | 2024-12-15 | 2024-12-14 | 加载 Dec 14~15（ON CONFLICT 去重）✓ |
-| 重跑，当月有新 daily | 2024-12-20 | 2024-12-15 | 2024-12-14 | 加载 Dec 14~20，Dec 14~15 ON CONFLICT ✓ |
+| 重跑，当月无新数据 | 2024-12-15 | 2024-12-15 | 2024-12-14 | 加载 Dec 14~15（anti-join 去重）✓ |
+| 重跑，当月有新 daily | 2024-12-20 | 2024-12-15 | 2024-12-14 | 加载 Dec 14~20，Dec 14~15 由 anti-join 去重 ✓ |
 | 新月份文件 | 2025-02-28 | 2025-01-31 | 2025-01-30 | 加载 Jan 30 起全部数据 ✓ |
 
 ---
@@ -112,7 +112,7 @@ Parquet 文件导入后**默认保留**（不删除），程序结束时输出�
 |------|---------------|----|
 | 重跑性能 | 全量重走所有文件 | `file_max < boundary` 直接跳过 |
 | 增量边界 | 无 | `duck_time - 1 day` |
-| 冗余保障 | 无 | 1 天重叠，ON CONFLICT 幂等处理 |
+| 冗余保障 | 无 | 1 天重叠，anti-join 去重幂等处理 |
 | Parquet 写 | 直接覆盖，崩溃损坏 | `.tmp` + `os.replace()`，原子 |
 | 清洗增量 | 每次重跑所有文件 | `.ok` marker，未变化文件跳过 |
 | 时区处理 | tz-aware vs tz-naive 混用 | 清洗阶段统一 `tz_convert(None)` |

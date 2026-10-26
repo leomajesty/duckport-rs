@@ -32,7 +32,7 @@ dependencies = [
     "pyarrow>=15.0",
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
-    "duckdb==1.5.1",
+    "duckdb==1.5.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -85,7 +85,8 @@ Do not ask users to fill `DUCKPORT_ADDR`; derive it.
 
 - Business tables are in `data`, for example `data.usdt_perp_5m`.
 - Staging tables are in `main`, for example `_staging_usdt_perp_5m`.
-- Business tables should use a primary key appropriate for idempotency, commonly `(open_time, symbol)` for kline data.
+- Business tables carry no PRIMARY KEY / UNIQUE / index (DuckDB 1.5 never reclaims deleted rows of indexed tables, and composite keys are not used by queries). Deduplicate in the write SQL instead.
+- Register `write_mode:<table> = anti_join` in `data.config_dict` from `init_schema` so `duckport migrate nopk` knows the table can drop its key.
 - `data.watermark` and `data.config_dict` are system tables created by duckport-rs.
 - Use `CREATE TABLE IF NOT EXISTS` and `CREATE SCHEMA IF NOT EXISTS`.
 - If a schema is created and used in the same setup flow, put those statements in one `execute_transaction`.
@@ -98,7 +99,7 @@ Real-time write:
 TRUNCATE _staging_target
 DoPut Arrow data into _staging_target
 execute_transaction:
-  INSERT INTO data.target SELECT * FROM _staging_target ON CONFLICT DO NOTHING
+  INSERT INTO data.target ... ANTI JOIN data.target (dedup, see ingestor-dev-guide.md section 6)
   UPSERT data.watermark for target
   TRUNCATE _staging_target
 ```
@@ -109,13 +110,22 @@ Bulk load:
 for each chunk:
   TRUNCATE _staging_target
   DoPut chunk into _staging_target
-  INSERT target ON CONFLICT DO NOTHING
+  INSERT target with anti-join dedup (sort chunk by time first)
   TRUNCATE _staging_target
 after all chunks:
   replace duck_time once
 ```
 
-`ON CONFLICT DO NOTHING` makes repeated loads idempotent.
+Anti-join template (`lo`/`hi` = batch min/max time, inlined as constants):
+
+```sql
+INSERT INTO data.target
+SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM _staging_target) s
+ANTI JOIN (SELECT open_time, symbol FROM data.target WHERE open_time BETWEEN TIMESTAMP 'lo' AND TIMESTAMP 'hi') t
+  ON s.open_time = t.open_time AND s.symbol = t.symbol
+```
+
+It makes repeated loads idempotent; keep both `DISTINCT ON` and the two bounds.
 
 ## Watermark
 

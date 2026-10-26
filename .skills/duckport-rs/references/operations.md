@@ -55,6 +55,7 @@ DUCKPORT_READ_POOL_SIZE=4
 DUCKPORT_DUCKDB_THREADS=0
 DUCKPORT_DUCKDB_MEMORY_LIMIT=4GB
 DUCKPORT_RETENTION_ENABLED=false
+DUCKPORT_RETENTION_DRY_RUN=true
 RUST_LOG=info
 ```
 
@@ -120,3 +121,16 @@ RUST_LOG=duckport_server=info,airport=info \
 4. Run `duckport.ping`
 5. Query `data.watermark` through `duckport.query`
 6. Only then consider restart, loadhist, schema changes, or data repair
+
+## Retention (1.1.0+)
+
+Rolling-window retention keeps the last N days per table. Rules live in `data.retention_policy`, results in `data.retention_log`.
+
+```bash
+duckport retention set <table> <keep_days> [--archive-dir DIR]
+duckport retention dry-run [table]     # counts only
+duckport retention run [table]         # deletes now (ignores DUCKPORT_RETENTION_DRY_RUN)
+duckport retention status | log [table]
+```
+
+The scheduler runs only with `DUCKPORT_RETENTION_ENABLED=true` and deletes only with `DUCKPORT_RETENTION_DRY_RUN=false`. Tables with a PRIMARY KEY / UNIQUE / index are skipped (`skipped_has_index`); rebuild them with `sudo duckport migrate nopk` (see `upgrade-1.1.md`).

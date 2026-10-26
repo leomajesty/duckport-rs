@@ -34,6 +34,7 @@ use tracing::debug;
 use crate::access;
 use crate::backend::Backend;
 use crate::read_limit::{self, recover_status};
+use crate::retention;
 
 /// Shorthand for the boxed, pinned, `Send + 'static` streams every Flight RPC uses.
 pub type DuckportStream<T> =
@@ -45,6 +46,7 @@ pub struct DuckportService {
     airport: Arc<airport::flight::Server>,
     backend: Backend,
     catalog_name: String,
+    retention: retention::Settings,
 }
 
 impl DuckportService {
@@ -52,11 +54,13 @@ impl DuckportService {
         airport: Arc<airport::flight::Server>,
         backend: Backend,
         catalog_name: String,
+        retention: retention::Settings,
     ) -> Self {
         Self {
             airport,
             backend,
             catalog_name,
+            retention,
         }
     }
 }
@@ -229,7 +233,8 @@ impl FlightService for DuckportService {
 
         if action.r#type.starts_with(actions::PREFIX) {
             debug!(action = %action.r#type, "handling duckport.* action locally");
-            return actions::handle(&self.backend, &self.catalog_name, action).await;
+            return actions::handle(&self.backend, &self.catalog_name, &self.retention, action)
+                .await;
         }
 
         let req = Request::from_parts(meta, ext, action);

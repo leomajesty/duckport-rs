@@ -40,7 +40,7 @@
               │  └───────┬─────────────────────────┘ │
               │          │ duckdb FFI                │
               │          ▼                           │
-              │      duckport.db (DuckDB 1.5.1)      │
+              │      duckport.db (DuckDB 1.5.6)      │
               └──────────────────────────────────────┘
 ```
 
@@ -186,6 +186,9 @@ duckport status                     # 查看服务状态和数据水位
 duckport config binance-5m          # 编辑实例配置文件
 duckport logs binance-5m            # 实时查看日志
 duckport loadhist binance-5m        # 补历史数据
+duckport retention set usdt_perp_1m 120   # 只保留最近 120 天（需 DUCKPORT_RETENTION_ENABLED=true）
+duckport retention status           # 保留策略与最近一次执行结果
+sudo duckport migrate nopk --plan   # 1.1.0 升级：检查哪些业务表还带主键（见 upgrade-1.1.md）
 ```
 
 ### 本地开发
@@ -211,7 +214,7 @@ import pyarrow.flight as flight, json
 client = flight.FlightClient("grpc://localhost:50051")
 resp = list(client.do_action(flight.Action("duckport.ping", b"")))
 print(json.loads(resp[0].body.to_pybytes()))
-# {'server': 'duckport', 'server_version': '1.0.4', 'catalog': 'duckport', 'duckdb_version': 'v1.5.1'}
+# {'server': 'duckport', 'server_version': '1.1.0', 'catalog': 'duckport', 'duckdb_version': 'v1.5.6'}
 ```
 
 ### 端到端测试
@@ -239,8 +242,12 @@ pytest test_phase1_airport_read.py test_phase2a_write_plane.py test_phase2b_appe
 | `DUCKPORT_READ_POOL_SIZE` | `4` | 读连接池大小 |
 | `DUCKPORT_DUCKDB_THREADS` | `0` (DuckDB 默认) | DuckDB `threads` PRAGMA |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | 空 (DuckDB 默认) | DuckDB `memory_limit` PRAGMA，如 `"2GB"` |
-| `DUCKPORT_RETENTION_ENABLED` | `false` | Plan A：不跑周期 `COPY+DELETE`；`true` 启用旧版归档任务 |
-| `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 任务表（ingestor 在 `RETENTION_ENABLED=true` 时写入行） |
+| `DUCKPORT_RETENTION_ENABLED` | `false` | 启动按天滚动删除的 retention；保留规则在 `data.retention_policy`（`duckport retention set`） |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对 `duckport retention log` 后改为 `false`。只接受 true/false，空值或拼错时服务端拒绝启动 |
+| `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | 两次执行的间隔（最小 60） |
+| `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | 保留天数低于该值的策略拒绝执行 |
+| `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | 两批删除之间让出写连接的时间 |
+| `DUCKPORT_RETENTION_TABLE` | — | 已废弃（1.1.0），设置后只打印警告 |
 | `DUCKPORT_AUTH_TOKENS` | 空 | `name:token` 列表，逗号分隔。空则拒绝全部公网访问。本机不鉴权；未配置令牌时局域网仍可读写 |
 | `DUCKPORT_TRUSTED_CIDRS` | 空 | 额外视为局域网的 CIDR，允许写入。不能把地址变成免鉴权的本机 |
 | `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 仅公网 DoGet 的 Arrow 字节上限（16MiB）。`0` 关闭 |
@@ -395,9 +402,8 @@ execute_transaction([
     """CREATE TABLE IF NOT EXISTS metrics.events (
         ts TIMESTAMP,
         device_id VARCHAR,
-        value DOUBLE,
-        PRIMARY KEY (ts, device_id)
-    )""",
+        value DOUBLE
+    )""",  # 不建 PRIMARY KEY：带索引的表删除后回收不了空间，去重由写入 SQL 负责
     "CREATE TABLE IF NOT EXISTS _staging_events (ts TIMESTAMP, device_id VARCHAR, value DOUBLE)",
 ])
 ```
@@ -406,11 +412,23 @@ execute_transaction([
 
 - 业务表放任意非 `main` 的 schema（`main` 被 airport_adapter 屏蔽）
 - **staging 表放 `main` schema**（对 Airport 客户端不可见，但 SQL 可访问）——staging 表无 PK，供 DoPut 批量写入
+- **业务表不建 `PRIMARY KEY` / `UNIQUE` / 索引**：DuckDB 1.5 不整理带索引的表，删除的行回收不了；联合主键也不会被查询使用。原因和实测数据见 [`ingestor-dev-guide.md` 5.1](./ingestor-dev-guide.md#51-为什么业务表不建主键)
 - `CREATE SCHEMA IF NOT EXISTS` 必须和 `CREATE TABLE` 在**同一事务**里，否则下一语句会看不见 schema
 
 ### 步骤 2：批量写数据（staging 模式）
 
-DuckDB Appender 不支持 `ON CONFLICT`。解决方案：**DoPut → staging → INSERT ... ON CONFLICT DO NOTHING**。
+解决方案：**DoPut → staging → anti-join 去重后 INSERT**。`lo`、`hi` 是这一批数据的最早、最晚时间，作为常量写进 SQL，让子查询只扫描这段时间：
+
+```python
+def merge_sql(lo, hi):
+    return (
+        "INSERT INTO metrics.events "
+        "SELECT s.* FROM (SELECT DISTINCT ON (ts, device_id) * FROM _staging_events) s "
+        "ANTI JOIN (SELECT ts, device_id FROM metrics.events "
+        f"          WHERE ts BETWEEN TIMESTAMP '{lo}' AND TIMESTAMP '{hi}') t "
+        "ON s.ts = t.ts AND s.device_id = t.device_id"
+    )
+```
 
 ```python
 import pyarrow as pa
@@ -431,8 +449,9 @@ arrow = pa.Table.from_pylist([
 
 append_to_staging("main", "_staging_events", arrow)
 
+lo, hi = pc.min(arrow["ts"]).as_py(), pc.max(arrow["ts"]).as_py()   # import pyarrow.compute as pc
 execute_transaction([
-    "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+    merge_sql(lo, hi),
     "TRUNCATE _staging_events",
 ])
 ```
@@ -446,7 +465,7 @@ for offset in range(0, len(arrow), CHUNK_SIZE):
     execute_transaction(["TRUNCATE _staging_events"])
     append_to_staging("main", "_staging_events", chunk)
     execute_transaction([
-        "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+        merge_sql(pc.min(chunk["ts"]).as_py(), pc.max(chunk["ts"]).as_py()),
         "TRUNCATE _staging_events",
     ])
 ```
@@ -457,7 +476,7 @@ for offset in range(0, len(arrow), CHUNK_SIZE):
 
 ```python
 execute_transaction([
-    "INSERT INTO metrics.events SELECT * FROM _staging_events ON CONFLICT DO NOTHING",
+    merge_sql(lo, hi),
     f"INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
     f"VALUES ('metrics.events', '{ingestor_name}', 900, 'event_time', NULL, '{latest_ts}', CURRENT_TIMESTAMP) "
     f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -471,7 +490,7 @@ execute_transaction([
 
 - `duckport.execute_transaction` 任一语句失败，整个事务 ROLLBACK；客户端应捕获 `FlightError` 并重试
 - DoPut 失败（schema 不匹配、类型错误）不会污染表
-- `ON CONFLICT DO NOTHING` 使得同一批数据重复 DoPut 是**幂等**的，消费侧从 watermark 断点续传不会产生副作用
+- anti-join 去重使得同一批数据重复 DoPut 是**幂等**的，消费侧从 watermark 断点续传不会产生副作用；duckport 只有一个写连接，不会因并发写入产生重复
 
 ### 步骤 5（可选）：只读查询
 
@@ -525,6 +544,7 @@ duckport-my-ingestor/           # 仓库名建议以 duckport- 为前缀
 | [`roadmap.md`](./roadmap.md) | 阶段进度 + 未完成待办 |
 | [`deploy.md`](./deploy.md) | 生产部署、systemd、备份恢复、故障排查 |
 | [`ingestor-dev-guide.md`](./ingestor-dev-guide.md) | Ingestor 插件开发规范（参考 binance-ingestor） |
+| [`upgrade-1.1.md`](./upgrade-1.1.md) | 升级到 1.1.0：DuckDB 1.5.6、新 retention、业务表去主键迁移 |
 | [`migration-guide.md`](./migration-guide.md) | 从旧版 Python duckport 迁移数据 |
 | [`extra-enhancement.md`](./extra-enhancement.md) | 并发模型决策（D1a per-table actor vs D1b 单写者） |
 | [`path-b-retention-plan.md`](./path-b-retention-plan.md) | Parquet 归档透明化改造方案（大数据量路径） |
@@ -535,7 +555,7 @@ duckport-my-ingestor/           # 仓库名建议以 duckport- 为前缀
 ## 版本与依赖
 
 - **Rust**：1.85.1+（edition 2021）
-- **DuckDB**：1.5.1（crate `duckdb 1.10501.0`，特性 `bundled` 内联编译）
+- **DuckDB**：1.5.6（crate `duckdb 1.10506.1`，特性 `bundled` 内联编译）
 - **Arrow**：58.x（跟随 DuckDB crate 对齐）
 - **tonic**：0.14 / **prost**：0.14
 - **Python（ingestor + consumer）**：3.10+，`pyarrow >= 15`

@@ -147,7 +147,7 @@ cargo build --release --bin duckport-server
 
 产物路径：`target/release/duckport-server`
 
-> **注意**：首次编译会从源码构建 DuckDB 1.5.1（bundled 模式），耗时约 5–10 分钟。
+> **注意**：首次编译会从源码构建 DuckDB 1.5.6（bundled 模式），耗时约 5–10 分钟。
 
 ### 6.2 交叉编译（可选）
 
@@ -180,8 +180,12 @@ duckport-server 通过**环境变量**配置，所有变量以 `DUCKPORT_` 为�
 | `DUCKPORT_READ_POOL_SIZE` | `4` | 读连接池大小（最小 1） |
 | `DUCKPORT_DUCKDB_THREADS` | `0` | DuckDB 工作线程数（0 = DuckDB 自动检测） |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(空)* | DuckDB 内存上限（如 `4GB`，空 = 不限制） |
-| `DUCKPORT_RETENTION_ENABLED` | `false` | **Plan A 默认关闭**：不启动周期 `COPY+DELETE`；设为 `true` 启用旧版热数据归档 |
-| `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 周期任务行所在表（由 ingestor 在 `RETENTION_ENABLED=true` 时写入） |
+| `DUCKPORT_RETENTION_ENABLED` | `false` | 启动按天滚动删除的 retention（见 [4.3](#43-数据保留retention)）；默认关闭，保留全部数据 |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对日志后改为 `false`。这两个开关只接受 `true`/`false`（或 `1`/`0`、`yes`/`no`、`on`/`off`），空值或拼错时服务端拒绝启动 |
+| `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | 两次执行的间隔（最小 60） |
+| `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | 保留天数低于该值的策略拒绝执行 |
+| `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | 两批删除之间让出写连接的时间 |
+| `DUCKPORT_RETENTION_TABLE` | — | 1.1.0 起废弃，设置后只打印警告 |
 | `DUCKPORT_AUTH_TOKENS` | *(空)* | `名字:令牌`，逗号分隔。空则拒绝全部公网访问。本机始终不鉴权；局域网在未配置令牌时仍可读写 |
 | `DUCKPORT_TRUSTED_CIDRS` | *(空)* | 额外视为局域网的 CIDR。不能把地址变成免鉴权的本机 |
 | `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 仅公网 DoGet 的 Arrow 字节上限（16MiB）。`0` 表示不限制 |
@@ -209,8 +213,9 @@ DUCKPORT_CATALOG_NAME=duckport
 DUCKPORT_READ_POOL_SIZE=4
 DUCKPORT_DUCKDB_THREADS=0
 DUCKPORT_DUCKDB_MEMORY_LIMIT=4GB
-# Plan A: 不开启周期导出+删除，热数据仅保留在 duckport.db
-# DUCKPORT_RETENTION_ENABLED=true
+# 数据保留：默认关闭。开启后先 dry-run，核对 duckport retention log 再改为 false
+DUCKPORT_RETENTION_ENABLED=false
+DUCKPORT_RETENTION_DRY_RUN=true
 RUST_LOG=info
 ```
 
@@ -218,6 +223,40 @@ RUST_LOG=info
 > - `READ_POOL_SIZE` 设为 CPU 核数的 50–100%，一般 2–8 足够
 > - `DUCKDB_MEMORY_LIMIT` 设为物理内存的 50–70%，避免 OOM
 > - 数据库文件应放在 SSD 上，避免 NFS/网络文件系统
+
+### 4.3 数据保留（retention）
+
+只需要近期数据的机器（例如策略实盘机）可以开启 retention，按表保留最近 N 天。每次执行对每张表：
+
+1. 跳过带 `PRIMARY KEY` / `UNIQUE` / 索引的表（DuckDB 1.5 回收不了它们删除的行，先按 [`upgrade-1.1.md`](./upgrade-1.1.md) 迁移）；
+2. 截止日 = `least(duck_time, now())` 当天 − 保留天数（`duck_time`、时间列取自 `data.watermark`）；
+3. 按天分批 DELETE，每批单独提交，批间让出写连接；可选先归档为 parquet 并核对行数；
+4. CHECKPOINT，记录前后的空闲块数，写入 `data.retention_log`。
+
+```bash
+# 1. server.env：DUCKPORT_RETENTION_ENABLED=true（DRY_RUN 默认 true），然后
+sudo duckport restart server
+# 2. 设置保留天数（--archive-dir DIR 可先归档再删除）
+duckport retention set usdt_perp_1m 120
+duckport retention set usdt_spot_1m 120
+# 3. 立即 dry-run，核对截止日和预计删除行数
+duckport retention dry-run
+duckport retention log
+# 4. 确认无误后 server.env 改 DUCKPORT_RETENTION_DRY_RUN=false 并重启
+```
+
+| `retention_log.status` | 含义 |
+|------|------|
+| `ok` | 已删除；删除量达到一个行组（约 12.3 万行）时，空闲块确有增加 |
+| `ok_pending_reclaim` | 已删除，但 CHECKPOINT 时有其他事务在跑，空间要等下一次 CHECKPOINT 回收 |
+| `ok_nothing_to_do` | 没有早于截止日的数据 |
+| `dry_run` | 只统计，`rows_deleted` 为预计删除行数 |
+| `skipped_has_index` | 表带主键/唯一约束/索引，未处理 |
+| `skipped_keep_days_below_min` | 保留天数低于 `DUCKPORT_RETENTION_MIN_KEEP_DAYS` |
+| `skipped_no_watermark` / `skipped_no_duck_time` / `skipped_missing_table` | watermark 缺行、还没有数据、表不存在 |
+| `error` | 出错，`error` 列为原因；其他表不受影响 |
+
+> DuckDB 删除后不会缩小库文件，释放的块留给后续写入复用。需要真正缩小文件时，停服后用 `COPY FROM DATABASE` 复制到新文件再替换（见 `upgrade-1.1.md`）。
 
 ---
 
@@ -245,7 +284,7 @@ sudo mkdir -p /data/duckport/hist
 sudo chown -R duckport:duckport /data/duckport
 ```
 
-> **重要**：`PARQUET_DIR` 供 loadhist、以及可选的「旧版」周期 retention（`DUCKPORT_RETENTION_ENABLED=true` 且 `RETENTION_ENABLED=true`）使用。**Plan A** 下默认不跑周期 retention，但历史导入/备份仍可能写入 Parquet，目录需与数据规划一致、权限正确。
+> **重要**：`PARQUET_DIR` 供 loadhist 使用。retention 的归档目录由每条策略的 `archive_dir` 单独指定（按天写 `<archive_dir>/<表名>/<表名>_<日期>.parquet`），不要指向 `PARQUET_DIR`，避免与 loadhist 的文件混在一起。
 
 ---
 
@@ -429,7 +468,7 @@ duckport start binance-5m
 4. **Step 3** — 读取 Parquet → Arrow → `bulk_write_kline()` 分块写入 duckport-rs
 
 > **耗时**：取决于历史数据量和网络带宽，首次全量导入可能需要数小时。
-> `bulk_write_kline` 按 200K 行分块写入，支持中断后幂等重跑（ON CONFLICT DO NOTHING）。
+> `bulk_write_kline` 按 200K 行分块写入，支持中断后幂等重跑（anti-join 去重）。
 
 ---
 
@@ -647,7 +686,7 @@ duckport update binance-5m
 duckport restart binance-5m
 ```
 
-> **注意**：DuckDB 版本已锁定为 1.5.1（Rust crate `=1.10501.0`，Python `duckdb==1.5.1`）。升级 DuckDB 版本需同步更新 `Cargo.toml` 并重新编译，且需评估数据库文件兼容性。
+> **注意**：DuckDB 版本已锁定为 1.5.6（Rust crate `=1.10506.1`，Python `duckdb==1.5.6`）。升级 DuckDB 版本需同步更新 `Cargo.toml` 并重新编译，且需评估数据库文件兼容性。
 
 ---
 
@@ -733,7 +772,10 @@ DuckDB 单写模型意味着**同一个数据库文件只能被一个 duckport-s
 | `DUCKPORT_DUCKDB_THREADS` | `0` | 否 |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(空)* | 否 |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | 否 |
-| `DUCKPORT_RETENTION_TABLE` | `data.retention_tasks` | 否 |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 否 |
+| `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | 否 |
+| `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | 否 |
+| `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | 否 |
 | `DUCKPORT_AUTH_TOKENS` | *(空)* | 否 |
 | `DUCKPORT_TRUSTED_CIDRS` | *(空)* | 否 |
 | `DUCKPORT_DOGET_MAX_BYTES` | `16777216` | 否 |
@@ -762,7 +804,7 @@ DuckDB 单写模型意味着**同一个数据库文件只能被一个 duckport-s
 
 | 组件 | 版本 |
 |------|------|
-| DuckDB (Rust crate) | `=1.10501.0` (DuckDB 1.5.1) |
+| DuckDB (Rust crate) | `=1.10506.1` (DuckDB 1.5.6) |
 | Arrow / Arrow Flight | 58 |
 | tonic (gRPC) | 0.14 |
 | prost (protobuf) | 0.14 |

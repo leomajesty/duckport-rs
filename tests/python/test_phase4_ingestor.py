@@ -2,15 +2,17 @@
 """Phase 4 — DuckportClient ingestor migration end-to-end test.
 
 Covers: ping, schema init, interval verify, write_kline, Airport read-back,
-        duck_time watermark, ON CONFLICT DO NOTHING, save_exginfo, replace
-        exginfo, multi-market writes, batch duck_time read.
+        duck_time watermark, anti-join dedup (overlap and duplicates inside a
+        batch), tables without PRIMARY KEY + write_mode registration, writes into
+        a legacy keyed table, save_exginfo, replace exginfo, exginfo refresh not
+        growing, multi-market writes, batch duck_time read.
 
 Prerequisites:
   duckport-rs server running (empty DB, no seed):
     DUCKPORT_DB_PATH=/tmp/duckport_phase4.db cargo run --bin duckport-server
 
-  Run from duckport-rs root:
-    python tests/python/test_phase4_ingestor.py
+  Run from duckport-rs root, pointing at a duckport-binance-ingestor checkout:
+    BINANCE_INGESTOR_SRC=../duckport-binance-ingestor python tests/python/test_phase4_ingestor.py
 """
 
 import os
@@ -18,11 +20,16 @@ import sys
 import traceback
 from datetime import datetime, timezone, timedelta
 
+import json
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.flight as flight
 
-INGESTOR_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "ingestor")
+INGESTOR_ROOT = os.getenv(
+    "BINANCE_INGESTOR_SRC",
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "duckport-binance-ingestor"),
+)
 sys.path.insert(0, os.path.abspath(INGESTOR_ROOT))
 from binance_ingestor.duckport_client import DuckportClient
 
@@ -91,6 +98,7 @@ def make_exginfo_df(market, symbols=None):
             "contract_type": "PERPETUAL" if "perp" in market else "",
             "margin_asset": "USDT",
             "pre_market": False,
+            "underlying_type": "COIN",
         })
     return pd.DataFrame(rows)
 
@@ -101,6 +109,16 @@ def main():
     print(f"{'='*60}\n")
 
     client = DuckportClient(addr=ADDR, schema="data")
+    reader = flight.FlightClient(f"grpc://{ADDR}")
+
+    def scalar(sql):
+        ticket = flight.Ticket(json.dumps({"type": "duckport.query", "sql": sql}).encode())
+        rows = reader.do_get(ticket).read_all().to_pylist()
+        return list(rows[0].values())[0]
+
+    def keys(table):
+        return scalar("SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'data' "
+                      f"AND table_name = '{table}' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')")
 
     # ── 1: Ping ─────────────────────────────────────────────────
     def test_ping():
@@ -115,6 +133,16 @@ def main():
         client.init_schema(MARKETS, INTERVAL, DATA_SOURCES)
 
     run_test("init_schema", test_init_schema)
+
+    def test_tables_have_no_key_and_register_write_mode():
+        for t in ("usdt_perp_5m", "usdt_spot_5m", "exginfo"):
+            assert keys(t) == 0, f"data.{t} still has a key"
+            mode = scalar(f"SELECT value FROM data.config_dict WHERE key = 'write_mode:{t}'")
+            assert mode == "anti_join", f"write_mode:{t} = {mode}"
+        n = scalar("SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'data' AND table_name = 'retention_tasks'")
+        assert n == 0, "data.retention_tasks should no longer be created"
+
+    run_test("no PRIMARY KEY + write_mode registered", test_tables_have_no_key_and_register_write_mode)
 
     # ── 3: Verify kline interval ────────────────────────────────
     def test_verify_interval():
@@ -153,7 +181,7 @@ def main():
 
     run_test("read_duck_time", test_read_duck_time)
 
-    # ── 7: Write overlapping kline (ON CONFLICT DO NOTHING) ────
+    # ── 7: Write overlapping kline (anti-join dedup) ───────────
     def test_write_kline_overlap():
         df_overlap = make_kline_df(
             n_symbols=3, n_bars=7,
@@ -169,7 +197,62 @@ def main():
             f"expected {expected_rows}, got {table.num_rows}"
         )
 
-    run_test("write_kline overlap (ON CONFLICT DO NOTHING)", test_write_kline_overlap)
+    run_test("write_kline overlap (anti-join dedup)", test_write_kline_overlap)
+
+    def test_duplicates_inside_one_batch():
+        df = make_kline_df(n_symbols=3, n_bars=2, base_time=base_time + timedelta(hours=2))
+        resp = client.write_kline(pd.concat([df, df]), "usdt_perp", INTERVAL, current_time)
+        assert resp["rows_affected"][0] == 6, resp
+        dups = scalar("SELECT count(*) - count(DISTINCT (open_time, symbol)) FROM data.usdt_perp_5m")
+        assert dups == 0, f"{dups} duplicate keys"
+
+    run_test("duplicates inside one batch are written once", test_duplicates_inside_one_batch)
+
+    def test_bulk_write_dedup():
+        # 20 bars x 3 symbols starting at base_time; the first 10 bars are already stored.
+        df = make_kline_df(n_symbols=3, n_bars=20, base_time=base_time)
+        already = scalar("SELECT count(*) FROM data.usdt_perp_5m "
+                         "WHERE open_time BETWEEN TIMESTAMP '2026-04-22 00:00:00' AND TIMESTAMP '2026-04-22 01:35:00' "
+                         "AND symbol IN ('SYM1USDT', 'SYM2USDT', 'SYM3USDT')")
+        before = scalar("SELECT count(*) FROM data.usdt_perp_5m")
+        arrow = pa.Table.from_pandas(df, preserve_index=False)
+        client.bulk_write_kline(arrow, "usdt_perp", INTERVAL, "", chunk_size=7, sync_duck_time=False)
+        after = scalar("SELECT count(*) FROM data.usdt_perp_5m")
+        assert already == 30 and after - before == 60 - already, (already, before, after)
+        dups = scalar("SELECT count(*) - count(DISTINCT (open_time, symbol)) FROM data.usdt_perp_5m")
+        assert dups == 0, f"{dups} duplicate keys"
+
+    run_test("bulk_write_kline dedup across chunks", test_bulk_write_dedup)
+
+    def test_bulk_write_time_zone_and_null_batches():
+        before = scalar("SELECT count(*) FROM data.usdt_perp_5m")
+        # Rows already stored, expressed in Asia/Shanghai: must be recognised as duplicates.
+        df = make_kline_df(n_symbols=3, n_bars=4, base_time=base_time)
+        df["open_time"] = df["open_time"].dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
+        client.bulk_write_kline(pa.Table.from_pandas(df, preserve_index=False), "usdt_perp", INTERVAL, "",
+                                sync_duck_time=False)
+        assert scalar("SELECT count(*) FROM data.usdt_perp_5m") == before, "tz-aware duplicates inserted"
+        # A batch without any open_time is skipped instead of failing.
+        nulls = make_kline_df(n_symbols=2, n_bars=1, base_time=base_time)
+        nulls["open_time"] = pd.NaT
+        client.bulk_write_kline(pa.Table.from_pandas(nulls, preserve_index=False), "usdt_perp", INTERVAL, "",
+                                sync_duck_time=False)
+        assert scalar("SELECT count(*) FROM data.usdt_perp_5m") == before
+
+    run_test("bulk_write_kline: tz-aware duplicates and null-time batches", test_bulk_write_time_zone_and_null_batches)
+
+    def test_legacy_keyed_table():
+        # A table created by an older plugin keeps its key; the new write path must work on it.
+        client.execute(f"CREATE TABLE IF NOT EXISTS data.usdt_perp_15m ({', '.join(client.KLINE_COL_DEFS)}, "
+                       "PRIMARY KEY (open_time, symbol))")
+        client.init_schema(["usdt_perp"], "15m", DATA_SOURCES)
+        assert keys("usdt_perp_15m") == 1
+        df = make_kline_df(n_symbols=2, n_bars=4, base_time=base_time)
+        client.write_kline(df, "usdt_perp", "15m", current_time)
+        client.write_kline(pd.concat([df, df]), "usdt_perp", "15m", current_time)
+        assert scalar("SELECT count(*) FROM data.usdt_perp_15m") == 8
+
+    run_test("new write path on a legacy keyed table", test_legacy_keyed_table)
 
     # ── 8: Save exginfo ─────────────────────────────────────────
     def test_save_exginfo():
@@ -193,6 +276,17 @@ def main():
 
     run_test("replace_exginfo", test_replace_exginfo)
 
+    def test_exginfo_refresh_does_not_grow():
+        df = make_exginfo_df("usdt_perp", symbols=[f"S{i}USDT" for i in range(300)])
+        for _ in range(150):
+            client.save_exginfo(df, "usdt_perp")
+        client.execute("CHECKPOINT")
+        assert scalar("SELECT count(*) FROM data.exginfo WHERE market = 'usdt_perp'") == 300
+        groups = scalar("SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('data.exginfo')")
+        assert groups <= 2, f"exginfo has {groups} row groups after 150 refreshes"
+
+    run_test("exginfo refresh does not grow (no key)", test_exginfo_refresh_does_not_grow)
+
     # ── 10: Write kline for second market ───────────────────────
     def test_write_second_market():
         df = make_kline_df(n_symbols=2, n_bars=3)
@@ -214,6 +308,7 @@ def main():
 
     # ── Summary ─────────────────────────────────────────────────
     client.close()
+    reader.close()
     total = passed + failed
     print(f"\n{'='*60}")
     print(f"Results: {passed}/{total} passed, {failed} failed")
