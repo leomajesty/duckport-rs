@@ -112,8 +112,7 @@ def legacy_state(client):
        "INSERT INTO data.usdt_perp_funding VALUES (TIMESTAMP '2026-10-26 00:00', 'BTCUSDT', 0.0001, 1, 'api')",
        "CREATE TABLE data.retention_tasks (market VARCHAR, interval VARCHAR, PRIMARY KEY (market, interval))",
        "INSERT INTO data.retention_tasks VALUES ('usdt_perp', '1m')",
-       "INSERT INTO data.config_dict VALUES ('usdt_perp_duck_time', '2026-10-26 02:00:00'), "
-       "('usdt_perp_1m_pqt_time', '2026-10-01 00:00:00')",
+       "INSERT INTO data.config_dict VALUES ('usdt_perp_duck_time', '2026-10-26 02:00:00')",
        "INSERT INTO main._staging_usdt_perp_1m (open_time, symbol) VALUES (TIMESTAMP '2026-10-26 01:00', 'S1')",
        "UPDATE data.watermark SET duck_time = TIMESTAMP '2026-11-30' WHERE table_name = 'usdt_perp_funding'",
        )

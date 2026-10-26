@@ -73,11 +73,9 @@ TOOL_TABLES = {"upgrade_log"}
 # Tables that must not exist any more.
 RETIRED_TABLES = {"retention_tasks": "1.1.0 起由 data.retention_policy 取代"}
 
-# config_dict keys that must not exist any more: pattern -> reason.
-RETIRED_CONFIG_KEYS = {
-    r"^(?P<market>[a-z0-9_]+)_duck_time$": "duck_time 已移到 data.watermark",
-    r"^.+_pqt_time$": "beta_v2.2 的 Parquet 切分水位，duckport-rs 不再使用",
-}
+# config_dict key the first plugin versions kept duck_time in (moved to data.watermark).
+# Databases imported from the Python beta_v2.2 are not covered.
+RETIRED_DUCK_TIME_KEY = re.compile(r"^(?P<market>[a-z0-9_]+)_duck_time$")
 
 LEFTOVER_SUFFIXES = ("__pk_old", "__nopk")
 

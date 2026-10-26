@@ -8,14 +8,13 @@ Each rule yields Findings. A finding's level says how it would be fixed:
 The fixes for these findings live in reconcile.fixes and reuse the conditions below.
 """
 
-import re
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import Callable, Iterable, List
 
 from duckport_flight import lit
 from reconcile.specs import (
-    LEFTOVER_SUFFIXES, PLUGIN_MIN_VERSION, RETIRED_CONFIG_KEYS, RETIRED_TABLES,
+    LEFTOVER_SUFFIXES, PLUGIN_MIN_VERSION, RETIRED_DUCK_TIME_KEY, RETIRED_TABLES,
     SERVER_MIN_VERSION, SYSTEM_TABLES, version_at_least,
 )
 from reconcile.state import State, q_ident
@@ -168,22 +167,17 @@ def retired_tables(state, dp, opts):
             yield Finding("L1", "online", name, f"废弃的表仍存在（{why}）", "删除")
 
 
-@rule("L2")  # also reports L3
-def retired_config_keys(state, dp, opts):
+@rule("L2")
+def retired_duck_time_keys(state, dp, opts):
     for key in sorted(state.config):
-        for pattern, why in RETIRED_CONFIG_KEYS.items():
-            m = re.match(pattern, key)
-            if not m:
-                continue
-            if "market" in m.groupdict():
-                market = m.group("market")
-                targets = [n for n in state.watermark if n.startswith(market + "_")]
-                has_time = any(state.watermark[n].get("duck_time") for n in targets)
-                fix = "删除" if has_time else "先把值迁入 data.watermark（对应表还没有 duck_time），再删除"
-                yield Finding("L2", "online", f"config_dict:{key}", f"废弃的 key（{why}）", fix)
-            else:
-                yield Finding("L3", "online", f"config_dict:{key}", f"废弃的 key（{why}）", "删除")
-            break
+        m = RETIRED_DUCK_TIME_KEY.match(key)
+        if not m:
+            continue
+        market = m.group("market")
+        targets = [n for n in state.watermark if n.startswith(market + "_")]
+        has_time = any(state.watermark[n].get("duck_time") for n in targets)
+        fix = "删除" if has_time else "先把值迁入 data.watermark（对应表还没有 duck_time），再删除"
+        yield Finding("L2", "online", f"config_dict:{key}", "废弃的 key（duck_time 已移到 data.watermark）", fix)
 
 
 @rule("C1")
@@ -292,7 +286,7 @@ def bad_strings(state, dp, opts):
         if n:
             yield Finding("D1", "online", t.name,
                           f"{n:,} 行字符串不合规（{', '.join(spec.string_checks)}；常见于 DuckDB ≤ 1.5.1 的 duckdb#22279）",
-                          "导出到隔离文件后删除")
+                          "人工确认后导出到隔离文件并删除")
 
 
 @rule("D2")
@@ -306,7 +300,7 @@ def duplicate_keys(state, dp, opts):
         n = dp.scalar(f"SELECT count(*) - count(DISTINCT ({key})) FROM data.{q_ident(t.name)}{where}")
         if n:
             yield Finding("D2", "online", t.name, f"{scope}有 {n:,} 行重复（按 {', '.join(spec.dedup_key)}）",
-                          "每组保留一行，其余导出到隔离文件后删除")
+                          "人工确认后每组保留最后写入的一行，其余导出到隔离文件并删除")
 
 
 @rule("D3")

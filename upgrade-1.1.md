@@ -51,7 +51,7 @@ duckport status                   # 确认 watermark 继续推进
 sudo duckport upgrade --plan
 ```
 
-它和 `duckport doctor` 做同样的检查（规则见 [升级对齐方案](http://192.168.9.20:8088/duckport-upgrade-reconcile-plan.html)），列出每项修正属于“在线”还是“停写”，以及停写窗口要做什么：带主键的业务表重建为无主键表、`exginfo` 去膨胀、删除废弃的 `data.retention_tasks` 和 `config_dict` 旧 key、隔离损坏的行等。写这张表的插件还是旧版本时会阻断，先完成第 2 步。
+它和 `duckport doctor` 做同样的检查（规则见 [升级对齐方案](http://192.168.9.20:8088/duckport-upgrade-reconcile-plan.html)），列出每项修正属于“在线”还是“停写”，以及停写窗口要做什么：带主键的业务表重建为无主键表、`exginfo` 去膨胀、删除废弃的 `data.retention_tasks` 和 `config_dict` 旧 key、列出损坏或重复的行（删除前人工确认）等。写这张表的插件还是旧版本时会阻断，先完成第 2 步。
 
 然后执行：
 
@@ -64,7 +64,8 @@ sudo duckport upgrade --data
 - **备份**：服务端用 `COPY FROM DATABASE` 把整个库复制到 `<库目录>/backup/duckport-<run_id>.db`，逐表核对行数后才开始修改。恢复：停服后用它替换 `duckport.db`（并删除 `duckport.db.wal`）。不带主键的表复制约 2 GB/s；带主键的表要在副本里重建索引，约 150 万行/秒，每行约需 100 字节内存。
 - **磁盘或内存不够备份**：计划里会给出警告（例如 pro.studio 升级前 19.6 亿行带主键，重建索引约需 196 GB 内存，远超 `memory_limit`）。`--data` 会要求输入 `go on without backup` 才继续；也可以直接加 `--no-backup`。不备份也能回退：重建时原表保留为 `<表>__pk_old`，删除的行都先导出到 `<库目录>/quarantine/<run_id>/*.parquet`。磁盘连重建都不够时直接阻断。
 - 重建：对每张表建一张同结构、无约束的新表，按月 `INSERT ... ORDER BY 时间列` 拷贝 → 核对行数 → 在一个事务里把原表改名为 `<表>__pk_old`、新表改为原名。
-- `exginfo` 一并重建：只拷贝有效行，带主键时累积的已删除行随之消失；`market` / `symbol` 不合规的损坏行先隔离再删除。
+- `exginfo` 一并重建：只拷贝有效行，带主键时累积的已删除行随之消失。
+- **损坏或重复的行要人工确认**：计划里列出行数和样例（损坏的字符串截短显示长度，重复的列出键和份数），`--data` 会单独询问是否删除；确认后先导出到隔离文件再删除，重复的每组保留最后写入的一行。不确认就保留这些行，其他修正照常执行。`--yes` 不包括这一项，非交互执行要删除时加 `--delete-bad-rows`。
 - 每一步记入 `data.upgrade_log`（`run_id` 与备份、隔离目录同名）。中途失败可以直接再次执行，已对齐的部分会跳过。
 - 耗时参考（2026-10-26 在 pro.studio 库文件副本上实测，19.6 亿行、186 GB）：重建共 130 秒（`usdt_perp_1m` 8.8 亿行 56 秒，`usdt_spot_1m` 10.7 亿行 72 秒，其余不到 2 秒）；期间库文件临时涨到 273 GB。回退 2 秒，finalize 2 秒。重建后 consumer 常用查询的耗时不变。
 - 重建后数据按时间重新排序，数据部分比原来按 symbol/月导入的布局大 20%–28%（压缩率略低），但去掉了主键索引，整体占用从 71 万块降到 40.5 万块（约 99 GiB）。

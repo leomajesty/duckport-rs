@@ -6,7 +6,8 @@ taken first; doctor clean afterwards; a second run does nothing; no row lost exc
 quarantined ones (which are in their parquet files); rebuilt tables keep defaults and are
 stored in time order; rollback restores the keyed tables with every row written since;
 finalize removes the old tables and nothing else; not enough memory for the backup is
-reported (exit 5); a failed backup changes nothing.
+reported (exit 5); a failed backup changes nothing; corrupted and duplicate rows are only
+deleted after an operator confirmed (--confirm-delete).
 
 Prerequisites:
   DUCKPORT_DB_PATH=/tmp/upgrade.db cargo run --bin duckport-server    (fresh database)
@@ -84,9 +85,12 @@ def main():
     rc, _ = upgrade(OLD, "apply", "--run-id", "r0", "--levels", "online")
     assert rc == 2 and keyed(client, "usdt_perp_1m") and count(client, "data.retention_tasks") == 1
 
-    hr("plan with upgraded plugins: needs a stop window, backup planned")
-    rc, out = upgrade(RUNNING, "plan")
+    hr("plan with upgraded plugins: needs a stop window, backup planned, deletions shown")
+    state_file = os.path.join(QDIR, "plan.state")
+    rc, out = upgrade(RUNNING, "plan", "--state-out", state_file)
     assert rc == 4 and "停写窗口" in out and "备份到" in out, rc
+    assert "需要人工确认的删除" in out and "copies=2" in out and "…(" in out, "samples of D1/D2 rows"
+    assert open(state_file).read().split() == ["WINDOW=1", "BACKUP_OK=1", "DELETE_ROWS=11"]
 
     hr("not enough memory to rebuild the indexes in a backup: exit 5")
     limit = scalar(client, "SELECT current_setting('memory_limit')")
@@ -95,12 +99,20 @@ def main():
     tx(client, f"SET memory_limit = '{limit}'")
     assert rc == 5 and "内存不足以备份" in out, rc
 
-    hr("online fixes while ingestors run")
-    rc, _ = upgrade(RUNNING, "apply", "--run-id", "r1", "--levels", "online")
+    hr("online fixes without confirmation: corrupted and duplicate rows stay")
+    rc, _ = upgrade(RUNNING, "apply", "--run-id", "r1a", "--levels", "online")
+    assert rc == 0, rc
+    assert count(client, "data.exginfo") == 501 and count(client, "data.usdt_spot_1m") == 20
+    assert scalar(client, "SELECT string_agg(rule || ':' || status, ',' ORDER BY rule) FROM data.upgrade_log "
+                          "WHERE run_id = 'r1a' AND rule IN ('D1', 'D2')") == "D1:skipped,D2:skipped"
+    assert not exists(client, "retention_tasks"), "the other online fixes ran"
+
+    hr("online fixes, deletions confirmed")
+    rc, _ = upgrade(RUNNING, "apply", "--run-id", "r1", "--levels", "online", "--confirm-delete")
     assert rc == 0, rc
     assert scalar(client, "SELECT count(*) FROM duckdb_columns() WHERE table_name = 'watermark' "
                           "AND column_name = 'max_lag_seconds'") == 1
-    assert not exists(client, "retention_tasks") and quarantined("r1", "L1", "retention_tasks") == 1
+    assert quarantined("r1a", "L1", "retention_tasks") == 1
     assert scalar(client, "SELECT count(*) FROM data.config_dict WHERE ends_with(key, '_time')") == 0
     assert str(scalar(client, "SELECT duck_time FROM data.watermark WHERE table_name = 'usdt_perp_1m'")) \
         == "2026-10-26 02:00:00", "L2 moves the config_dict value into the empty watermark row"
@@ -143,8 +155,8 @@ def main():
     log = scalar(client, "SELECT count(*) FILTER (status = 'ok') || '/' || count(*) FROM data.upgrade_log "
                          "WHERE run_id = 'r1'")
     print("upgrade_log r1:", log)
-    # online: S1 S2 L2 L3 L1 D1 D2 B2; window: BACKUP D3 B1x4 D5 D4
-    assert log == "16/16", log
+    # online (r1a did S1 S2 L2 L1 B2): D1 D2; window: BACKUP D3 B1x4 D5 D4
+    assert log == "10/10", log
     assert scalar(client, "SELECT detail FROM data.upgrade_log WHERE run_id = 'r1' AND rule = 'D4'") \
         == "duck_time 2026-11-30 00:00:00 → 2026-10-26 00:00:00"
 

@@ -31,7 +31,7 @@ def main():
         ("B1", "block", "usdt_perp_1m"), ("B1", "block", "exginfo"), ("B1", "block", "usdt_perp_funding"),
         ("S1", "online", "watermark"), ("B2", "online", "usdt_perp_1m"), ("B2", "hint", "usdt_perp_funding"),
         ("L1", "online", "retention_tasks"), ("L2", "online", "config_dict:usdt_perp_duck_time"),
-        ("L3", "online", "config_dict:usdt_perp_1m_pqt_time"), ("C1", "hint", "usdt_perp_1m__pk_old"),
+        ("C1", "hint", "usdt_perp_1m__pk_old"),
         ("D1", "online", "exginfo"), ("D3", "stop", "main._staging_usdt_perp_1m"),
         ("D4", "stop", "usdt_perp_funding"), ("D5", "stop", "exginfo"),
     ]:

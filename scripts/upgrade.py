@@ -4,17 +4,21 @@
 Usually run through `sudo duckport upgrade --data`, which stops the ingestors around the
 stop window. The same checks as `duckport doctor`; every online/stop finding has a fix.
 
-    upgrade.py --addr ... --instances-file f.json --db-path DB plan
+    upgrade.py --addr ... --instances-file f.json --db-path DB plan [--state-out F]
     upgrade.py ... apply --levels online                    # ingestors running
     upgrade.py ... apply --levels online,stop [--backup]    # ingestors stopped; backup first
+    upgrade.py ... apply ... --confirm-delete               # also delete corrupted/duplicate rows (D1/D2)
     upgrade.py ... finalize                                 # drop <table>__pk_old
     upgrade.py ... rollback                                 # put <table>__pk_old back
 
 plan exit code: 0 nothing to do, 1 online fixes only, 4 needs a stop window,
                 5 needs a stop window but there is not enough disk or memory for the backup,
                 2 blocked, 3 failed.
-apply exit code: 0 done, 1 some fixes failed (or the backup failed: nothing changed),
-                 2 blocked (nothing changed), 3 failed.
+--state-out writes WINDOW=0|1, BACKUP_OK=0|1, DELETE_ROWS=<n> for the CLI.
+apply exit code: 0 done (unconfirmed D1/D2 skipped), 1 some fixes failed (or the backup
+                 failed: nothing changed), 2 blocked (nothing changed), 3 failed.
+Corrupted or duplicate rows (D1/D2) are deleted only with --confirm-delete: the plan shows
+how many and a sample, the operator decides.
 """
 
 import argparse
@@ -27,7 +31,7 @@ import pyarrow as pa
 from doctor import load_instances, print_report
 from duckport_flight import Duckport
 from reconcile import backup, rebuild
-from reconcile.fixes import Context, Result, actionable, apply, log_result
+from reconcile.fixes import NEEDS_CONFIRMATION, Context, Result, actionable, apply, log_result, preview
 from reconcile.rules import Finding, Options, run_rules
 from reconcile.specs import UPGRADE_LOG_DDL
 from reconcile.state import collect
@@ -43,8 +47,32 @@ def backup_path(args):
     return os.path.join(args.backup_dir, f"duckport-{args.run_id}.db")
 
 
+def write_state(path, **values):
+    if path:
+        with open(path, "w") as f:
+            f.writelines(f"{k.upper()}={int(v)}\n" for k, v in values.items())
+
+
+def show_deletions(dp, state, findings, opts):
+    """Print what D1/D2 would delete; returns the number of rows."""
+    todo = [f for f in actionable(findings, {"online", "stop"}) if f.rule in NEEDS_CONFIRMATION]
+    if not todo:
+        return 0
+    total = 0
+    print("\n需要人工确认的删除（先导出到隔离文件，再删除）：")
+    for f in todo:
+        n, rows = preview(dp, state, f, opts)
+        total += n
+        print(f"  [{f.rule}] {f.target}: {n:,} 行（{f.message}）")
+        for r in rows:
+            print("      " + "  ".join(f"{k}={v}" for k, v in r.items()))
+        if n > len(rows) and f.rule == "D1":
+            print(f"      …（共 {n:,} 行）")
+    return total
+
+
 def cmd_plan(dp, args):
-    state, _, findings = check(dp, args)
+    state, opts, findings = check(dp, args)
     res = backup.estimate(dp, state, findings, args.db_path)
     if res.fatal and actionable(findings, {"stop"}):
         findings.insert(0, Finding("DISK", "block", args.db_path, res.fatal, "腾出空间后重试"))
@@ -54,6 +82,7 @@ def cmd_plan(dp, args):
         return 2
     online, stop = actionable(findings, {"online"}), actionable(findings, {"stop"})
     if not online and not stop:
+        write_state(args.state_out, window=0, backup_ok=1, delete_rows=0)
         return 0
     if not stop:
         print(f"\n计划：在线修正 {len(online)} 项，ingestor 不停")
@@ -69,8 +98,10 @@ def cmd_plan(dp, args):
         print(f"  2. 修正；预计窗口共 {res.window_seconds(res.backup_possible):.0f}s"
               + (f"（重建复制约 {res.rebuild_rows:,} 行）" if res.rebuild_rows else ""))
         print("  重建的表保留为 <表>__pk_old，可 --rollback；确认无误后 --finalize 删除")
-    if any(f.rule in ("D1", "D2", "D3", "L1") for f in online + stop):
+    if any(f.rule in ("D3", "L1") for f in online + stop):
         print(f"  删除的行先导出到 {args.quarantine_dir or '<quarantine>'}/<run_id>/（parquet）")
+    deletions = show_deletions(dp, state, findings, opts)
+    write_state(args.state_out, window=bool(stop), backup_ok=res.backup_possible, delete_rows=deletions)
     if stop:
         return 4 if res.backup_possible else 5
     return 1
@@ -103,10 +134,10 @@ def cmd_apply(dp, args):
             return 1
         print(f"    ✓ {detail}（{(datetime.now() - started).total_seconds():.0f}s）", flush=True)
         log_result(ctx, Result(Finding("BACKUP", "stop", path, "备份"), "ok", 0, detail, 0), started)
-    results = apply(ctx, state, findings, levels)
+    results = apply(ctx, state, findings, levels, confirmed=args.confirm_delete)
     if "stop" in levels:
         dp.execute("CHECKPOINT")
-    return 1 if any(r.status != "ok" for r in results) else 0
+    return 1 if any(r.status == "error" for r in results) else 0
 
 
 def _log_command(dp, args, rule, detail):
@@ -154,11 +185,13 @@ def main():
     ap.add_argument("--db-path", default="")
     ap.add_argument("--deep", action="store_true", help="whole-table duplicate scan")
     ap.add_argument("--bloat-min-dead-rows", type=int, default=Options.bloat_min_dead_rows)
-    ap.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
+    ap.add_argument("--run-id", default=f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}")
     ap.add_argument("--quarantine-dir", default="")
     ap.add_argument("--backup-dir", default="")
     ap.add_argument("--backup", action="store_true", help="apply: back up the database before any fix")
     ap.add_argument("--levels", default="online", help="apply: online or online,stop")
+    ap.add_argument("--confirm-delete", action="store_true", help="apply: delete corrupted/duplicate rows (D1/D2)")
+    ap.add_argument("--state-out", default="", help="plan: write WINDOW/BACKUP_OK/DELETE_ROWS for the CLI")
     ap.add_argument("command", choices=["plan", "apply", "finalize", "rollback"])
     args = ap.parse_args()
     db_dir = os.path.dirname(os.path.abspath(args.db_path)) if args.db_path else ""

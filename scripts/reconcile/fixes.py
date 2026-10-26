@@ -17,13 +17,15 @@ from duckport_flight import lit, text
 from reconcile import rebuild
 from reconcile.rules import Finding, Options, bad_string_condition, dup_scope, is_bloated, storage_rows
 from reconcile.specs import (
-    RETIRED_CONFIG_KEYS, SYSTEM_COLUMN_DEFAULTS, SYSTEM_DDL, SYSTEM_TABLES,
+    RETIRED_DUCK_TIME_KEY, SYSTEM_COLUMN_DEFAULTS, SYSTEM_DDL, SYSTEM_TABLES,
 )
 from reconcile.state import State, q_ident
 
 # Fixes run in this order: system tables and watermark rows first (L2 moves values into
 # watermark rows), deletes before rebuilds, columns last so they land on rebuilt tables.
-ORDER = ["S1", "S2", "L2", "L3", "L1", "D1", "D2", "D3", "B1", "D5", "D4", "B2"]
+ORDER = ["S1", "S2", "L2", "L1", "D1", "D2", "D3", "B1", "D5", "D4", "B2"]
+# Deleting corrupted or duplicate business rows needs an operator's confirmation.
+NEEDS_CONFIRMATION = {"D1", "D2"}
 
 
 @dataclass
@@ -59,12 +61,19 @@ def actionable(findings: List[Finding], levels) -> List[Finding]:
     return sorted(todo, key=lambda f: (ORDER.index(f.rule), f.target))
 
 
-def apply(ctx: Context, state: State, findings: List[Finding], levels) -> List[Result]:
+def apply(ctx: Context, state: State, findings: List[Finding], levels, confirmed=False) -> List[Result]:
+    """Fix every actionable finding; D1/D2 deletions only when `confirmed`."""
     results = []
     for f in actionable(findings, levels):
         started = datetime.now()
         t0 = time.time()
         print(f"  [{f.rule}] {f.target} …", flush=True)
+        if f.rule in NEEDS_CONFIRMATION and not confirmed:
+            res = Result(f, "skipped", 0, "未经人工确认，未删除", 0)
+            print(f"    - {res.detail}", flush=True)
+            log_result(ctx, res, started)
+            results.append(res)
+            continue
         try:
             rows, detail = FIXES[f.rule](ctx, state, f)
             res = Result(f, "ok", rows, detail, time.time() - t0)
@@ -175,8 +184,7 @@ def _config_key(f):
 def fix_retired_duck_time(ctx, state, f):
     key = _config_key(f)
     value = state.config.get(key)
-    market = next(m.group("market") for m in (re.match(p, key) for p in RETIRED_CONFIG_KEYS)
-                  if m and "market" in m.groupdict())
+    market = RETIRED_DUCK_TIME_KEY.match(key).group("market")
     res = ctx.dp.transaction([
         f"UPDATE data.watermark SET duck_time = TRY_CAST({lit(value)} AS TIMESTAMP), "
         "updated_at = CURRENT_TIMESTAMP "
@@ -185,13 +193,6 @@ def fix_retired_duck_time(ctx, state, f):
     ])
     moved = res["rows_affected"][0]
     return moved, (f"{moved} 行 watermark 的 duck_time 取自它；" if moved else "") + f"已删除（原值 {value}）"
-
-
-@fix("L3")
-def fix_retired_key(ctx, state, f):
-    key = _config_key(f)
-    ctx.dp.execute(f"DELETE FROM data.config_dict WHERE key = {lit(key)}")
-    return 1, f"已删除（原值 {state.config.get(key)}）"
 
 
 @fix("D1")
@@ -212,6 +213,33 @@ def fix_duplicates(ctx, state, f):
              f"(PARTITION BY {key} ORDER BY rowid DESC) AS rn FROM data.{q_ident(t.name)}{where}) WHERE rn > 1)")
     rows, detail = quarantine_delete(ctx, f"data.{q_ident(t.name)}", extra, f"D2.{t.name}")
     return rows, f"{scope}：{detail}"
+
+
+def _shown(col, width=40):
+    """A column for display: long strings cut, with their length."""
+    c = q_ident(col)
+    return (f"CASE WHEN length(CAST({c} AS VARCHAR)) > {width} THEN left(CAST({c} AS VARCHAR), {width}) "
+            f"|| '…(' || length(CAST({c} AS VARCHAR)) || ')' ELSE CAST({c} AS VARCHAR) END AS {c}")
+
+
+def preview(dp, state: State, f: Finding, opts: Options, limit=5) -> Tuple[int, List[dict]]:
+    """For a D1/D2 finding: (rows the fix would delete, a few sample rows to show the operator)."""
+    t = _table(state, f.target)
+    spec = state.spec(t.name)
+    rel = f"data.{q_ident(t.name)}"
+    if f.rule == "D1":
+        cond = bad_string_condition(spec, t)
+        cols = [c for c in (*spec.dedup_key, *spec.string_checks) if c in t.columns]
+        cols = list(dict.fromkeys(cols))
+        n = dp.scalar(f"SELECT count(*) FROM {rel} WHERE {cond}")
+        rows = dp.query(f"SELECT {', '.join(_shown(c) for c in cols)} FROM {rel} WHERE {cond} LIMIT {limit}")
+        return n, rows
+    where, _ = dup_scope(spec, t, opts)
+    key = ", ".join(q_ident(c) for c in spec.dedup_key)
+    n = dp.scalar(f"SELECT count(*) - count(DISTINCT ({key})) FROM {rel}{where}")
+    rows = dp.query(f"SELECT {', '.join(_shown(c) for c in spec.dedup_key)}, count(*) AS copies FROM {rel}{where} "
+                    f"GROUP BY {key} HAVING count(*) > 1 ORDER BY copies DESC LIMIT {limit}")
+    return n, rows
 
 
 @fix("D3")

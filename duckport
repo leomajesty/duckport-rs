@@ -948,15 +948,16 @@ except: pass
 # 升级。
 #   duckport upgrade                          git pull + deploy.sh（替换服务端 binary，不重启）
 #   duckport upgrade --plan [--deep]          对照当前版本的期望状态列出修正计划，不修改
-#   duckport upgrade --data [--yes] [--deep] [--no-backup]
+#   duckport upgrade --data [--yes] [--deep] [--no-backup] [--delete-bad-rows]
 #                                             只有在线修正时直接执行；需要停写时在一个窗口里
 #                                             （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
 #   duckport upgrade --finalize               删除重建留下的 <表>__pk_old
 #   duckport upgrade --rollback               把 <表>__pk_old 恢复为原表（停写）
 # 磁盘或内存不够备份时给出警告，输入 go on without backup 才继续（--no-backup 跳过备份）。
+# 损坏或重复的行先列出样例，人工确认后才删除；--yes 不包括这一项（--delete-bad-rows 才包括）。
 # 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。可重复执行。
 cmd_upgrade() {
-  local mode="env" yes=0 no_backup=0 extra=()
+  local mode="env" yes=0 no_backup=0 delete_bad=0 extra=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --plan)     mode="plan" ;;
@@ -965,6 +966,7 @@ cmd_upgrade() {
       --rollback) mode="rollback" ;;
       --yes|-y)   yes=1 ;;
       --no-backup) no_backup=1 ;;
+      --delete-bad-rows) delete_bad=1 ;;
       --deep)     extra+=(--deep) ;;
       *) echo -e "${RED}未知参数：$1${NC}"; exit 1 ;;
     esac
@@ -980,7 +982,7 @@ cmd_upgrade() {
   py=$(_flight_python)
   db=$(_server_env DUCKPORT_DB_PATH)
   nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 3; }
-  run_id=$(date +%Y%m%d-%H%M%S)
+  run_id="$(date +%Y%m%d-%H%M%S)-$$"   # 同一秒内的两次执行不能共用备份和隔离目录
   inv=$(mktemp)
   local base=("$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db"
               --run-id "$run_id" --instances-file "$inv" ${extra[@]+"${extra[@]}"})
@@ -1018,14 +1020,38 @@ cmd_upgrade() {
 
   _require_root
   _instances_json "$inv"
-  local plan_rc=0
-  "${base[@]}" plan || plan_rc=$?
+  local plan_rc=0 st DELETE_ROWS=0
+  st=$(mktemp)
+  "${base[@]}" plan --state-out "$st" || plan_rc=$?
+  # shellcheck disable=SC1090
+  source "$st"
+  rm -f "$st"
   case $plan_rc in
     0) echo -e "\n${GREEN}✓ 已与期望状态一致，无需修改${NC}"; rm -f "$inv"; return 0 ;;
     1|4|5) ;;
     *) rm -f "$inv"; return $plan_rc ;;
   esac
-  local window=0 backup_args=(--backup)
+
+  # 损坏或重复的行：样例已在计划里列出，删除前必须人工确认
+  local delete_args=() declined=0
+  if [[ ${DELETE_ROWS:-0} -gt 0 ]]; then
+    if [[ $delete_bad -eq 1 ]]; then
+      delete_args=(--confirm-delete)
+    elif [[ $yes -eq 1 ]]; then
+      declined=1
+      echo -e "\n${YELLOW}--yes 不包括删除损坏/重复的行，这 ${DELETE_ROWS} 行保留（确认删除：--delete-bad-rows）${NC}"
+    else
+      read -r -p "确认删除上面列出的 ${DELETE_ROWS} 行损坏/重复数据？（先导出到隔离文件）[y/N] " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        delete_args=(--confirm-delete)
+      else
+        declined=1
+        echo "  这些行保留，其他修正照常执行"
+      fi
+    fi
+  fi
+
+  local window=0 confirmed=$yes backup_args=(--backup)
   [[ $plan_rc -ge 4 ]] && window=1
   if [[ $window -eq 1 && $no_backup -eq 1 ]]; then
     backup_args=()
@@ -1036,9 +1062,9 @@ cmd_upgrade() {
     echo -e "${YELLOW}  不备份也能回退：重建的表保留为 <表>__pk_old，删除的行导出在 quarantine 目录。${NC}"
     read -r -p "确认不备份继续，请输入 go on without backup：" ans
     [[ "$ans" == "go on without backup" ]] || { echo "已取消"; rm -f "$inv"; exit 0; }
-    yes=1
+    confirmed=1
   fi
-  if [[ $yes -ne 1 ]]; then
+  if [[ $confirmed -ne 1 ]]; then
     if [[ $window -eq 1 ]]; then
       echo -e "\n${YELLOW}停写窗口会停止所有 ingestor（服务端不停）。${NC}"
     fi
@@ -1049,14 +1075,15 @@ cmd_upgrade() {
   local failed=0
   if [[ $window -eq 0 ]]; then
     echo -e "\n${BOLD}在线修正${NC}"
-    "${base[@]}" apply --levels online || failed=1
+    "${base[@]}" apply --levels online ${delete_args[@]+"${delete_args[@]}"} || failed=1
   else
     # 备份要在任何修改之前完成，所以在线修正也放进窗口
     echo -e "\n${BOLD}停写窗口${NC}"
     trap _start_stopped_ingestors EXIT
     _stop_running_ingestors
     _instances_json "$inv"
-    "${base[@]}" apply --levels online,stop ${backup_args[@]+"${backup_args[@]}"} || failed=1
+    "${base[@]}" apply --levels online,stop ${backup_args[@]+"${backup_args[@]}"} \
+      ${delete_args[@]+"${delete_args[@]}"} || failed=1
     _start_stopped_ingestors
     trap - EXIT
   fi
@@ -1067,6 +1094,11 @@ cmd_upgrade() {
   "$py" "$REPO_DIR/scripts/doctor.py" --addr "127.0.0.1:$port" --instances-file "$inv" \
     ${extra[@]+"${extra[@]}"} || doctor_rc=$?
   rm -f "$inv"
+  if [[ $failed -eq 0 && $doctor_rc -eq 1 && $declined -eq 1 ]]; then
+    echo -e "\n${YELLOW}损坏/重复的行未经确认，没有删除（复检里的 D1/D2）。各步骤结果见 data.upgrade_log（run_id=${run_id}）。${NC}"
+    echo -e "  确认后：sudo duckport upgrade --data（交互确认）或加 --delete-bad-rows"
+    return 1
+  fi
   if [[ $failed -ne 0 || $doctor_rc -ne 0 ]]; then
     echo -e "\n${RED}仍有未对齐的项。各步骤结果见 data.upgrade_log（run_id=${run_id}）；处理后可再次执行。${NC}"
     return 1
@@ -1135,7 +1167,8 @@ ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
   duckport ${CYAN}upgrade${NC} --plan                 数据对齐计划（只读）
   duckport ${CYAN}upgrade${NC} --data [--yes]         执行数据对齐：在线修正，或停写窗口（先备份）+ 复检
-                                       （--no-backup 不备份；磁盘或内存不够备份时会询问）
+                                       （--no-backup 不备份；磁盘或内存不够备份时会询问；
+                                        损坏/重复的行需人工确认，--delete-bad-rows 直接确认）
   duckport ${CYAN}upgrade${NC} --finalize|--rollback  删除 / 恢复重建前的旧表
 
 ${BOLD}示例：${NC}

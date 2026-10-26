@@ -44,7 +44,7 @@ sudo duckport upgrade --data       # apply; one stop window (ingestors only), ba
 sudo duckport upgrade --finalize   # drop <table>__pk_old after the rebuild looks fine (--rollback undoes it)
 ```
 
-`upgrade --data` warns when disk or memory is too small for the backup and continues only after the operator types `go on without backup` (or passes `--no-backup`).
+`upgrade --data` warns when disk or memory is too small for the backup and continues only after the operator types `go on without backup` (or passes `--no-backup`). Corrupted or duplicate business rows are listed with samples and deleted only after the operator confirms (`--yes` does not cover it; `--delete-bad-rows` does).
 
 `duckport loadhist <instance>` is preferred over manual loadhist because loadhist and the matching ingestor must not run concurrently.
 
