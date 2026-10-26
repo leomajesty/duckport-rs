@@ -27,7 +27,7 @@ ARCHIVE_DIR = os.getenv("DUCKPORT_TEST_ARCHIVE_DIR", "/tmp/duckport-retention-ar
 KEEP_DAYS = 10
 DAYS = 30
 SYMBOLS = 4
-TABLES = ("rt_kline", "rt_pk", "rt_arch", "rt_small", "rt_side", "rt_big")
+TABLES = ("rt_kline", "rt_pk", "rt_arch", "rt_small", "rt_side", "rt_big", "rt_fail")
 
 
 def hr(title):
@@ -113,7 +113,7 @@ def main():
     cutoff = min(last_hour, now_utc()).date() - timedelta(days=KEEP_DAYS)
     first_day = (last_hour - timedelta(days=DAYS - 1)).date()
     expected_days = (cutoff - first_day).days
-    for t in ("rt_kline", "rt_arch", "rt_small", "rt_side"):
+    for t in ("rt_kline", "rt_arch", "rt_small", "rt_side", "rt_fail"):
         create_kline(client, t, last_hour)
     create_kline(client, "rt_pk", last_hour, primary_key=True)
     total = scalar(client, "SELECT count(*) FROM data.rt_kline")
@@ -134,6 +134,8 @@ def main():
     assert r["status"] == "dry_run", r
     assert r["rows_deleted"] == expected, r
     assert r["cutoff"] == str(cutoff), r
+    assert r["first_day"] == str(first_day), r
+    assert r["last_day"] == str(cutoff - timedelta(days=1)), r
     assert scalar(client, "SELECT count(*) FROM data.rt_kline") == total
 
     hr("real run deletes everything before the cutoff, writes going on meanwhile")
@@ -186,6 +188,33 @@ def main():
     assert not glob.glob(os.path.join(ARCHIVE_DIR, "rt_arch", "*.tmp"))
     archived_rows = sum(pq.read_metadata(f).num_rows for f in files)
     assert archived_rows == expected, archived_rows
+
+    hr("archive: rows backfilled into an archived day are merged into its file")
+    day0 = first_day.strftime("%Y-%m-%d")
+    do_action(client, "duckport.execute", {"sql":
+        f"INSERT INTO data.rt_arch VALUES (TIMESTAMP '{day0} 12:34:00', 'BACKFILL', 1.0)"})
+    r = table_report(do_action(client, "duckport.retention_run", {"table": "rt_arch", "dry_run": False}), "rt_arch")
+    print(r)
+    assert r["status"] == "ok" and r["rows_archived"] == 1 and r["rows_deleted"] == 1, r
+    day_file = os.path.join(ARCHIVE_DIR, "rt_arch", f"rt_arch_{day0}.parquet")
+    merged = pq.read_table(day_file)
+    assert merged.num_rows == SYMBOLS * 24 + 1, merged.num_rows
+    assert "BACKFILL" in merged.column("symbol").to_pylist()
+
+    hr("a failure after some batches still reports what was deleted")
+    # A directory where the third day's archive file should go makes that batch fail.
+    bad_day = (first_day + timedelta(days=2)).strftime("%Y-%m-%d")
+    os.makedirs(os.path.join(ARCHIVE_DIR, "rt_fail", f"rt_fail_{bad_day}.parquet"), exist_ok=True)
+    set_policy(client, "rt_fail", KEEP_DAYS, ARCHIVE_DIR)
+    r = table_report(do_action(client, "duckport.retention_run", {"table": "rt_fail", "dry_run": False}), "rt_fail")
+    print(r)
+    assert r["status"] == "error", r
+    assert r["rows_deleted"] == 2 * SYMBOLS * 24 and r["rows_archived"] == r["rows_deleted"], r
+    assert r["first_day"] == str(first_day) and r["cutoff"] == str(cutoff), r
+    assert r["free_blocks_after"] is not None, r
+    assert scalar(client, f"SELECT count(*) FROM data.rt_fail WHERE open_time < DATE '{bad_day}'") == 0
+    logged = query(client, "SELECT rows_deleted, status FROM data.retention_log WHERE table_name = 'rt_fail'")
+    assert logged == [{"rows_deleted": 2 * SYMBOLS * 24, "status": "error"}], logged
 
     hr("more than a row group deleted: CHECKPOINT frees blocks")
     create_kline(client, "rt_big", last_hour, symbols=8, minutes=True)

@@ -146,10 +146,6 @@ impl TableReport {
         }
     }
 
-    fn with_status(mut self, status: &'static str) -> Self {
-        self.status = status;
-        self
-    }
 }
 
 struct Policy {
@@ -219,14 +215,18 @@ pub async fn run(
     let mut tables = Vec::with_capacity(policies.len());
     for policy in &policies {
         let started_at = now_utc();
-        let report = match process_table(backend, settings, policy, dry_run).await {
-            Ok(r) => r,
-            Err(e) => {
-                let mut r = TableReport::new(&policy.table).with_status("error");
-                r.error = Some(format!("{e:#}"));
-                r
+        let mut report = TableReport::new(&policy.table);
+        if let Err(e) = process_table(backend, settings, policy, dry_run, &mut report).await {
+            report.status = "error";
+            report.error = Some(format!("{e:#}"));
+            // Batches deleted before the failure are committed: keep their counts in the
+            // report and still try to reclaim their space.
+            if !dry_run && report.rows_deleted > 0 {
+                if let Err(e) = finish_deletes(backend, &mut report).await {
+                    warn!(err = ?e, table = %report.table, "retention: CHECKPOINT after a failed run failed");
+                }
             }
-        };
+        }
         match report.status {
             "error" => error!(table = %report.table, err = report.error.as_deref().unwrap_or(""), "retention: table failed"),
             s if s.starts_with("skipped") => warn!(table = %report.table, status = s, "retention: table skipped"),
@@ -296,19 +296,22 @@ async fn process_table(
     settings: &Settings,
     policy: &Policy,
     dry_run: bool,
-) -> Result<TableReport> {
-    let mut report = TableReport::new(&policy.table);
+    report: &mut TableReport,
+) -> Result<()> {
     validate_ident(&policy.table)?;
 
     if policy.keep_days < settings.min_keep_days as i32 {
-        return Ok(report.with_status("skipped_keep_days_below_min"));
+        report.status = "skipped_keep_days_below_min";
+        return Ok(());
     }
     let Some(time_column) = policy.time_column.clone() else {
-        return Ok(report.with_status("skipped_no_watermark"));
+        report.status = "skipped_no_watermark";
+        return Ok(());
     };
     validate_ident(&time_column)?;
     let Some(duck_time) = policy.duck_time.as_deref() else {
-        return Ok(report.with_status("skipped_no_duck_time"));
+        report.status = "skipped_no_duck_time";
+        return Ok(());
     };
 
     // Never let a duck_time in the future move the cutoff forward.
@@ -334,10 +337,12 @@ async fn process_table(
         })
         .await?;
     if exists == 0 {
-        return Ok(report.with_status("skipped_missing_table"));
+        report.status = "skipped_missing_table";
+        return Ok(());
     }
     if keyed > 0 {
-        return Ok(report.with_status("skipped_has_index"));
+        report.status = "skipped_has_index";
+        return Ok(());
     }
 
     let target = Target {
@@ -346,50 +351,55 @@ async fn process_table(
         column: format!("\"{time_column}\""),
     };
 
-    // Start at the oldest day that still holds rows before the cutoff. The filter lets
+    // One scan for every day that still holds rows before the cutoff. The filter lets
     // zonemaps skip every row group at or after the cutoff.
-    let first_day: Option<NaiveDate> = {
+    let days: Vec<(NaiveDate, u64)> = {
         let t = target.clone();
         let cutoff_s = fmt_day(cutoff);
         backend
             .with_reader(move |conn| {
-                let v: Option<String> = conn.query_row(
-                    &format!(
-                        "SELECT CAST(CAST(min({col}) AS DATE) AS VARCHAR) FROM {qt} WHERE {col} < ?::TIMESTAMP",
-                        col = t.column,
-                        qt = t.qualified
-                    ),
-                    params![cutoff_s],
-                    |r| r.get(0),
-                )?;
-                v.map(|s| parse_day(&s)).transpose()
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT CAST(CAST({col} AS DATE) AS VARCHAR), count(*) FROM {qt} \
+                     WHERE {col} < ?::TIMESTAMP GROUP BY 1 ORDER BY 1",
+                    col = t.column,
+                    qt = t.qualified
+                ))?;
+                let rows = stmt
+                    .query_map(params![cutoff_s], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(d, n)| Ok((parse_day(&d)?, n as u64)))
+                    .collect()
             })
             .await?
     };
-    let Some(mut day) = first_day else {
-        return Ok(report.with_status(if dry_run { "dry_run" } else { "ok_nothing_to_do" }));
+    let (Some(first), Some(last)) = (days.first(), days.last()) else {
+        report.status = if dry_run { "dry_run" } else { "ok_nothing_to_do" };
+        return Ok(());
     };
 
-    let free_before = if dry_run { None } else { Some(free_blocks(backend).await?) };
+    if dry_run {
+        report.first_day = Some(first.0);
+        report.last_day = Some(last.0);
+        report.rows_deleted = days.iter().map(|(_, n)| n).sum();
+        report.status = "dry_run";
+        return Ok(());
+    }
+
+    report.free_blocks_before = Some(free_blocks(backend).await?);
     let batch_days = policy.batch_days.max(1) as u64;
-    while day < cutoff {
+    let mut i = 0;
+    while i < days.len() {
+        let day = days[i].0;
         let end = day
             .checked_add_days(Days::new(batch_days))
             .ok_or_else(|| anyhow!("day out of range"))?
             .min(cutoff);
-        let (archived, deleted) = if dry_run {
-            let t = target.clone();
-            let n = backend
-                .with_reader(move |conn| count_range(conn, &t, day, end))
-                .await?;
-            (0, n)
-        } else {
-            let t = target.clone();
-            let dir = policy.archive_dir.clone();
-            backend
-                .with_writer(move |conn| delete_batch(conn, &t, day, end, dir.as_deref()))
-                .await?
-        };
+        let t = target.clone();
+        let dir = policy.archive_dir.clone();
+        let (archived, deleted) = backend
+            .with_writer(move |conn| delete_batch(conn, &t, day, end, dir.as_deref()))
+            .await?;
         if deleted > 0 {
             if report.first_day.is_none() {
                 report.first_day = Some(day);
@@ -397,20 +407,31 @@ async fn process_table(
             report.last_day = end.pred_opt();
             report.rows_archived += archived;
             report.rows_deleted += deleted;
-            if !dry_run {
-                tokio::time::sleep(settings.batch_pause).await;
-            }
+            tokio::time::sleep(settings.batch_pause).await;
         }
-        day = end;
+        while i < days.len() && days[i].0 < end {
+            i += 1;
+        }
     }
 
-    if dry_run {
-        return Ok(report.with_status("dry_run"));
-    }
     if report.rows_deleted == 0 {
-        return Ok(report.with_status("ok_nothing_to_do"));
+        report.status = "ok_nothing_to_do";
+        return Ok(());
     }
+    let reclaimed = finish_deletes(backend, report).await?;
+    // Space is reclaimed per row group, so a run that deleted less than one row group's
+    // worth of rows is not expected to free a block.
+    let expect_reclaim = report.rows_deleted >= ROW_GROUP_ROWS;
+    report.status = if reclaimed || !expect_reclaim {
+        "ok"
+    } else {
+        "ok_pending_reclaim"
+    };
+    Ok(())
+}
 
+/// CHECKPOINT after deletes and record free blocks. Returns whether free blocks grew.
+async fn finish_deletes(backend: &Backend, report: &mut TableReport) -> Result<bool> {
     backend.bump_catalog_epoch();
     backend
         .with_writer(|conn| {
@@ -419,18 +440,9 @@ async fn process_table(
         })
         .await
         .context("CHECKPOINT after retention")?;
-    let free_after = free_blocks(backend).await?;
-    report.free_blocks_before = free_before;
-    report.free_blocks_after = Some(free_after);
-    // Space is reclaimed per row group, so a run that deleted less than one row group's
-    // worth of rows is not expected to free a block.
-    let reclaimed = free_before.is_some_and(|b| free_after > b);
-    let expect_reclaim = report.rows_deleted >= ROW_GROUP_ROWS;
-    Ok(report.with_status(if reclaimed || !expect_reclaim {
-        "ok"
-    } else {
-        "ok_pending_reclaim"
-    }))
+    let after = free_blocks(backend).await?;
+    report.free_blocks_after = Some(after);
+    Ok(report.free_blocks_before.is_some_and(|b| after > b))
 }
 
 #[derive(Clone)]
@@ -479,9 +491,13 @@ fn delete_batch(
     Ok((archived, deleted as u64))
 }
 
-/// Write `[day, end)` to `<dir>/<table>/<table>_<day>.parquet` via a `.tmp` file and verify
-/// the row count before renaming. An existing archive with the expected row count (left
-/// by an interrupted run) is accepted as is.
+/// Write `[day, end)` to `<dir>/<table>/<table>_<day>.parquet` via a `.tmp` file, verify
+/// it and rename it into place. Returns the number of table rows archived.
+///
+/// If the file already exists (an interrupted run that archived but did not delete, rows
+/// backfilled into an already archived day, or a changed `batch_days`), the table rows are
+/// merged into it with `UNION`, which also drops rows the file already holds. The merged
+/// file must contain every table row of the range before anything is deleted.
 fn archive_batch(
     conn: &duckdb::Connection,
     t: &Target,
@@ -494,38 +510,46 @@ fn archive_batch(
     fs::create_dir_all(&dir_path)
         .with_context(|| format!("create archive dir {}", dir_path.display()))?;
     let final_path = dir_path.join(format!("{}_{}.parquet", t.table, fmt_day(day)));
-    if final_path.exists() {
-        let n = parquet_rows(conn, &final_path)?;
-        if n == expected {
-            return Ok(n);
-        }
-        bail!(
-            "archive {} already exists with {n} rows, expected {expected}; not deleting",
-            final_path.display()
-        );
-    }
     let tmp_path = final_path.with_extension("parquet.tmp");
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM {qt} WHERE {col} >= TIMESTAMP '{lo}' AND {col} < TIMESTAMP '{hi}' ORDER BY {col}) \
-         TO '{path}' (FORMAT parquet)",
+    let range = format!(
+        "SELECT * FROM {qt} WHERE {col} >= TIMESTAMP '{lo}' AND {col} < TIMESTAMP '{hi}'",
         qt = t.qualified,
         col = t.column,
         lo = fmt_day(day),
         hi = fmt_day(end),
+    );
+    let source = if final_path.exists() {
+        format!("SELECT * FROM read_parquet('{}') UNION {range}", sql_path(&final_path)?)
+    } else {
+        range.clone()
+    };
+    let total: i64 = conn.query_row(&format!("SELECT count(*) FROM ({source})"), [], |r| r.get(0))?;
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM ({source}) ORDER BY {col}) TO '{path}' (FORMAT parquet)",
+        col = t.column,
         path = sql_path(&tmp_path)?
     ))
     .with_context(|| format!("COPY to {}", tmp_path.display()))?;
-    let n = parquet_rows(conn, &tmp_path)?;
-    if n != expected {
+
+    let written = parquet_rows(conn, &tmp_path)?;
+    let missing: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM ({range} EXCEPT SELECT * FROM read_parquet('{}'))",
+            sql_path(&tmp_path)?
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if written != total as u64 || missing != 0 {
         let _ = fs::remove_file(&tmp_path);
         bail!(
-            "archive {} has {n} rows, expected {expected}; not deleting",
+            "archive {} has {written} rows (expected {total}, {missing} table rows missing); not deleting",
             tmp_path.display()
         );
     }
     fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
-    Ok(n)
+    Ok(expected)
 }
 
 fn parquet_rows(conn: &duckdb::Connection, path: &Path) -> Result<u64> {

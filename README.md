@@ -243,7 +243,7 @@ pytest test_phase1_airport_read.py test_phase2a_write_plane.py test_phase2b_appe
 | `DUCKPORT_DUCKDB_THREADS` | `0` (DuckDB 默认) | DuckDB `threads` PRAGMA |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | 空 (DuckDB 默认) | DuckDB `memory_limit` PRAGMA，如 `"2GB"` |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | 启动按天滚动删除的 retention；保留规则在 `data.retention_policy`（`duckport retention set`） |
-| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对 `duckport retention log` 后改为 `false` |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对 `duckport retention log` 后改为 `false`。只接受 true/false，空值或拼错时服务端拒绝启动 |
 | `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | 两次执行的间隔（最小 60） |
 | `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | 保留天数低于该值的策略拒绝执行 |
 | `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | 两批删除之间让出写连接的时间 |

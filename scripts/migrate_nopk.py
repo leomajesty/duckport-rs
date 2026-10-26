@@ -8,9 +8,9 @@ a constraint-free twin, verifies the row count and swaps the names.
 Usually run through `sudo duckport migrate nopk`, which stops the ingestors first.
 
     migrate_nopk.py --addr 127.0.0.1:50051 --db-path /data/duckport/duckport.db plan
-    migrate_nopk.py ... migrate     # copy + verify + swap; old table kept as <t>__pk_old
-    migrate_nopk.py ... finalize    # drop every <t>__pk_old, then CHECKPOINT
-    migrate_nopk.py ... rollback    # put every <t>__pk_old back under its original name
+    migrate_nopk.py ... migrate [--tables t1 t2]  # copy + verify + swap; old table kept as <t>__pk_old
+    migrate_nopk.py ... finalize                  # drop every <t>__pk_old, then CHECKPOINT
+    migrate_nopk.py ... rollback                  # put every <t>__pk_old back under its original name
 
 A table is only migrated when the plugin writing it is ready for constraint-free tables,
 i.e. it registered `write_mode:<table> = anti_join` in `data.config_dict`. Older writers
@@ -18,13 +18,12 @@ use `INSERT ... ON CONFLICT DO NOTHING`, which fails on a table without a key.
 """
 
 import argparse
-import json
 import os
 import shutil
 import sys
 import time
 
-import pyarrow.flight as flight
+from duckport_flight import Duckport, lit, q
 
 SYSTEM_TABLES = {"config_dict", "watermark", "retention_policy", "retention_log"}
 OLD_SUFFIX = "__pk_old"
@@ -35,41 +34,16 @@ MIN_SERVER = (1, 1, 0)
 EXGINFO_KEEP = "regexp_full_match(market, '[a-z0-9_]{1,32}') AND length(symbol) <= 64"
 
 
-class Duckport:
-    def __init__(self, addr):
-        self.client = flight.FlightClient(f"grpc://{addr}")
-
-    def action(self, kind, body=None):
-        payload = json.dumps(body).encode() if body is not None else b""
-        res = list(self.client.do_action(flight.Action(kind, payload)))
-        return json.loads(res[0].body.to_pybytes())
-
-    def execute(self, sql):
-        return self.action("duckport.execute", {"sql": sql})["rows_affected"]
-
-    def transaction(self, statements):
-        return self.action("duckport.execute_transaction", {"statements": statements})
-
-    def query(self, sql):
-        ticket = flight.Ticket(json.dumps({"type": "duckport.query", "sql": sql}).encode())
-        try:
-            return self.client.do_get(ticket).read_all().to_pylist()
-        except flight.FlightInternalError as e:
-            if "never sent a data message" in str(e):
-                return []
-            raise
-
-    def scalar(self, sql):
-        rows = self.query(sql)
-        return list(rows[0].values())[0] if rows else None
+def data_tables(dp):
+    """Every base table in schema data. Suffixes are matched in Python: `_` is a LIKE wildcard."""
+    return [r["table_name"] for r in dp.query(
+        "SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data' ORDER BY table_name")]
 
 
-def q(name):
-    return '"' + name.replace('"', '""') + '"'
-
-
-def lit(value):
-    return "'" + str(value).replace("'", "''") + "'"
+def has_key(dp, table):
+    return bool(dp.scalar(
+        "SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'data' "
+        f"AND table_name = {lit(table)} AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')"))
 
 
 def keyed_tables(dp):
@@ -92,18 +66,13 @@ def keyed_tables(dp):
 
 
 def ready_tables(dp):
-    rows = dp.query("SELECT key, value FROM data.config_dict WHERE key LIKE 'write_mode:%'")
+    rows = dp.query("SELECT key, value FROM data.config_dict WHERE starts_with(key, 'write_mode:')")
     return {r["key"].split(":", 1)[1] for r in rows if r["value"] == "anti_join"}
 
 
 def time_columns(dp):
     rows = dp.query("SELECT table_name, time_column FROM data.watermark WHERE time_column IS NOT NULL")
     return {r["table_name"]: r["time_column"] for r in rows}
-
-
-def table_exists(dp, name):
-    return bool(dp.scalar(
-        f"SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'data' AND table_name = {lit(name)}"))
 
 
 def create_twin_sql(dp, table):
@@ -145,6 +114,10 @@ def preflight(dp, args):
     keyed = keyed_tables(dp)
     if args.tables:
         wanted = set(args.tables)
+        unknown = wanted - {t["table_name"] for t in keyed}
+        if unknown:
+            print(f"  ✗ 不是带主键的业务表：{', '.join(sorted(unknown))}")
+            ok = False
         keyed = [t for t in keyed if t["table_name"] in wanted]
     ready = ready_tables(dp)
     tcols = time_columns(dp)
@@ -171,12 +144,9 @@ def preflight(dp, args):
         if todo and free < size:
             print("  ✗ 空闲空间小于库文件大小；迁移期间新旧两份数据会同时存在")
             ok = False
-    leftovers = dp.query(
-        "SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data' "
-        f"AND (table_name LIKE '%{OLD_SUFFIX}' OR table_name LIKE '%{NEW_SUFFIX}')")
+    leftovers = [t for t in data_tables(dp) if t.endswith(OLD_SUFFIX) or t.endswith(NEW_SUFFIX)]
     if leftovers:
-        print("\n  ✗ 上一次迁移还没收尾：" + ", ".join(r["table_name"] for r in leftovers)
-              + "（先执行 finalize 或 rollback）")
+        print("\n  ✗ 上一次迁移还没收尾：" + ", ".join(leftovers) + "（先执行 finalize 或 rollback）")
         ok = False
     return todo, ok
 
@@ -231,7 +201,7 @@ def cmd_migrate(dp, args):
         t0 = time.time()
         n = copy_table(dp, table, None if table == "exginfo" else tcols.get(table))
         print(f"  ✓ {n:,} rows，{time.time() - t0:.1f}s；原表保留为 data.{table}{OLD_SUFFIX}", flush=True)
-    if table_exists(dp, "retention_tasks"):
+    if "retention_tasks" in data_tables(dp):
         dp.execute("DROP TABLE data.retention_tasks")
         print("\n已删除废弃的 data.retention_tasks")
     dp.execute("CHECKPOINT")
@@ -241,53 +211,69 @@ def cmd_migrate(dp, args):
 
 
 def cmd_finalize(dp, _args):
-    olds = dp.query(f"SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data' "
-                    f"AND table_name LIKE '%{OLD_SUFFIX}' ORDER BY table_name")
+    olds = [t for t in data_tables(dp) if t.endswith(OLD_SUFFIX)]
     if not olds:
         print("没有待清理的旧表。")
         return 0
-    for r in olds:
-        dp.execute(f"DROP TABLE data.{q(r['table_name'])}")
-        print(f"  dropped data.{r['table_name']}")
+    for old in olds:
+        dp.execute(f"DROP TABLE data.{q(old)}")
+        print(f"  dropped data.{old}")
     dp.execute("CHECKPOINT")
     print("完成。释放的空间会被后续写入复用；库文件本身不会变小。")
     return 0
 
 
+def restore_statements(dp, table, old, time_col):
+    """Statements that move rows written since the migration from data.<table> into
+    data.<old> (which still has its key); returns (statements, note)."""
+    new, prev = f"data.{q(table)}", f"data.{q(old)}"
+    if table == "exginfo":
+        # Snapshot table: the new copy is the current state.
+        return [f"DELETE FROM {prev}", f"INSERT INTO {prev} SELECT * FROM {new}"], "exginfo 用当前快照替换"
+    if not has_key(dp, old):
+        # Only an index, no constraint to resolve conflicts against: copy rows not present.
+        return [f"INSERT INTO {prev} SELECT * FROM {new} EXCEPT SELECT * FROM {prev}"], "补回了新表中多出的行"
+    if not time_col:
+        return [f"INSERT INTO {prev} SELECT * FROM {new} ON CONFLICT DO NOTHING"], "按主键补回了新写入的数据"
+
+    col = q(time_col)
+    old_max = dp.scalar(f"SELECT CAST(max({col}) AS VARCHAR) FROM {prev}")
+    if old_max is None:
+        # The old table was empty: everything in the new one was written after the migration.
+        return [f"INSERT INTO {prev} SELECT * FROM {new} WHERE {col} IS NOT NULL ON CONFLICT DO NOTHING"], \
+            "原表为空，新写入的数据已全部补回"
+    stmts = [f"INSERT INTO {prev} SELECT * FROM {new} WHERE {col} > TIMESTAMP {lit(old_max)} ON CONFLICT DO NOTHING"]
+    note = "迁移后新写入的数据已补回"
+    older_new = dp.scalar(f"SELECT count(*) FROM {new} WHERE {col} <= TIMESTAMP {lit(old_max)}")
+    older_old = dp.scalar(f"SELECT count(*) FROM {prev} WHERE {col} <= TIMESTAMP {lit(old_max)}")
+    if older_new != older_old:
+        # Backfilled (or deleted) rows inside the old range: copy whatever the old table lacks.
+        stmts.append(f"INSERT INTO {prev} SELECT * FROM {new} WHERE {col} <= TIMESTAMP {lit(old_max)} "
+                     "ON CONFLICT DO NOTHING")
+        note += f"；{lit(old_max)} 之前的行数不一致（{older_new} vs {older_old}），已按主键补齐"
+    return stmts, note
+
+
 def cmd_rollback(dp, _args):
-    olds = dp.query(f"SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data' "
-                    f"AND table_name LIKE '%{OLD_SUFFIX}' ORDER BY table_name")
+    tables = data_tables(dp)
+    olds = [t for t in tables if t.endswith(OLD_SUFFIX)]
     if not olds:
         print("没有可回退的旧表。")
         return 0
     tcols = time_columns(dp)
-    for r in olds:
-        old = r["table_name"]
+    for old in olds:
         table = old[: -len(OLD_SUFFIX)]
-        stmts = []
-        note = ""
-        if table_exists(dp, table):
-            new, prev = f"data.{q(table)}", f"data.{q(old)}"
-            col = tcols.get(table)
-            if table == "exginfo":
-                # Snapshot table: the new copy is the current state.
-                stmts += [f"DELETE FROM {prev}", f"INSERT INTO {prev} SELECT * FROM {new}"]
-                note = "，exginfo 用当前快照替换"
-            elif col:
-                # Keep rows ingested after the migration (the old table still has its key).
-                stmts.append(
-                    f"INSERT INTO {prev} SELECT * FROM {new} WHERE {q(col)} > "
-                    f"(SELECT max({q(col)}) FROM {prev}) ON CONFLICT DO NOTHING")
-                note = "，迁移后新写入的数据已补回"
-            else:
-                note = "，迁移后新写入的数据已丢弃（没有时间列可比对）"
-            stmts.append(f"DROP TABLE {new}")
+        stmts, note = [], ""
+        if table in tables:
+            stmts, note = restore_statements(dp, table, old, tcols.get(table))
+            stmts.append(f"DROP TABLE data.{q(table)}")
+            note = "，" + note
         stmts.append(f"ALTER TABLE data.{q(old)} RENAME TO {q(table)}")
         dp.transaction(stmts)
         print(f"  restored data.{table}{note}")
-    for r in dp.query(f"SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data' "
-                      f"AND table_name LIKE '%{NEW_SUFFIX}'"):
-        dp.execute(f"DROP TABLE data.{q(r['table_name'])}")
+    for t in data_tables(dp):
+        if t.endswith(NEW_SUFFIX):
+            dp.execute(f"DROP TABLE data.{q(t)}")
     dp.execute("CHECKPOINT")
     return 0
 
@@ -296,9 +282,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--addr", default="127.0.0.1:50051")
     ap.add_argument("--db-path", default="")
-    ap.add_argument("--tables", nargs="*", help="only these tables (default: every ready table)")
     ap.add_argument("command", choices=["plan", "migrate", "finalize", "rollback"])
+    ap.add_argument("--tables", nargs="+", help="plan/migrate only these tables (default: every ready table)")
     args = ap.parse_args()
+    if args.tables and args.command not in ("plan", "migrate"):
+        ap.error("--tables only applies to plan and migrate")
     dp = Duckport(args.addr)
     if args.command == "plan":
         _, ok = preflight(dp, args)

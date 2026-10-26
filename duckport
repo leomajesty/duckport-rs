@@ -154,12 +154,16 @@ _server_env() {
     | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs
 }
 
-# 判断 true/1/yes/on（不区分大小写；兼容 macOS 自带的 bash 3.2）
-_is_true() {
-  case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes|on) return 0 ;;
+# 布尔配置的三态：输出 true | false | invalid（不区分大小写；兼容 macOS 自带的 bash 3.2）。
+# 与 duckport-server 的解析一致：未设置取默认值，其他无法识别的值（含空值）视为 invalid。
+_bool_state() {
+  local value="${1-__unset__}" default="${2:-false}"
+  [[ "$value" == "__unset__" ]] && { echo "$default"; return; }
+  case "$(echo "$value" | tr '[:upper:]' '[:lower:]' | xargs)" in
+    true|1|yes|on)  echo "true" ;;
+    false|0|no|off) echo "false" ;;
+    *)              echo "invalid" ;;
   esac
-  return 1
 }
 
 # duckport-server 监听端口（来自 DUCKPORT_LISTEN_ADDR，默认 50051）
@@ -358,11 +362,21 @@ PYEOF
   }
 
   local ret_enabled ret_dry
-  ret_enabled=$(_server_env DUCKPORT_RETENTION_ENABLED)
-  ret_dry=$(_server_env DUCKPORT_RETENTION_DRY_RUN)
+  if grep -q '^DUCKPORT_RETENTION_ENABLED=' "$DEPLOY_OPT/server.env" 2>/dev/null; then
+    ret_enabled=$(_bool_state "$(_server_env DUCKPORT_RETENTION_ENABLED)" false)
+  else
+    ret_enabled=false
+  fi
+  if grep -q '^DUCKPORT_RETENTION_DRY_RUN=' "$DEPLOY_OPT/server.env" 2>/dev/null; then
+    ret_dry=$(_bool_state "$(_server_env DUCKPORT_RETENTION_DRY_RUN)" true)
+  else
+    ret_dry=true
+  fi
   echo -e "\n${BOLD}Retention${NC}"
-  if _is_true "$ret_enabled"; then
-    if [[ -z "$ret_dry" ]] || _is_true "$ret_dry"; then
+  if [[ "$ret_enabled" == "invalid" || "$ret_dry" == "invalid" ]]; then
+    echo -e "  scheduler ${RED}✗ server.env 中 DUCKPORT_RETENTION_ENABLED / DRY_RUN 的值无效（只接受 true/false），服务端会拒绝启动${NC}"
+  elif [[ "$ret_enabled" == "true" ]]; then
+    if [[ "$ret_dry" == "true" ]]; then
       echo -e "  scheduler ${YELLOW}● dry-run${NC}  ${DIM}(DUCKPORT_RETENTION_DRY_RUN=false 才会真正删除)${NC}"
     else
       echo -e "  scheduler ${GREEN}● enabled${NC}"
@@ -415,6 +429,10 @@ cmd_migrate() {
     shift
   done
 
+  if [[ ${#tables[@]} -gt 0 && "$mode" != "migrate" && "$mode" != "plan" ]]; then
+    echo -e "${RED}--tables 只能用于迁移和 --plan${NC}"; exit 1
+  fi
+
   local port py db script
   port=$(_server_port)
   py=$(_flight_python)
@@ -422,16 +440,25 @@ cmd_migrate() {
   script="$REPO_DIR/scripts/migrate_nopk.py"
   nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
   local base=("$py" "$script" --addr "127.0.0.1:$port" --db-path "$db")
-  [[ ${#tables[@]} -gt 0 ]] && base+=(--tables "${tables[@]}")
+  # 子命令必须在 --tables 之前：--tables 会吞掉其后的所有参数
+  local table_args=()
+  [[ ${#tables[@]} -gt 0 ]] && table_args=(--tables "${tables[@]}")
 
   if [[ "$mode" == "plan" ]]; then
-    "${base[@]}" plan
+    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"}
     return
   fi
   _require_root
 
+  if [[ "$mode" == "finalize" ]]; then
+    # 只删除 <表>__pk_old，ingestor 不会写这些表，不需要停写
+    "${base[@]}" finalize
+    return
+  fi
+
   if [[ "$mode" == "migrate" ]]; then
-    "${base[@]}" plan || { echo -e "\n${RED}预检未通过，未做任何修改${NC}"; exit 1; }
+    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"} \
+      || { echo -e "\n${RED}预检未通过，未做任何修改${NC}"; exit 1; }
     echo -e "\n${YELLOW}迁移期间会停止所有 ingestor。建议先备份库文件：${db}${NC}"
     if [[ $yes -ne 1 ]]; then
       read -r -p "继续？[y/N] " ans
@@ -451,7 +478,11 @@ cmd_migrate() {
   done <<< "$(_list_instances)"
 
   local rc=0
-  "${base[@]}" "$mode" || rc=$?
+  if [[ "$mode" == "migrate" ]]; then
+    "${base[@]}" migrate ${table_args[@]+"${table_args[@]}"} || rc=$?
+  else
+    "${base[@]}" "$mode" || rc=$?
+  fi
 
   for inst in ${running[@]+"${running[@]}"}; do
     _svc_start "duckport-ingestor@$inst"

@@ -181,7 +181,7 @@ duckport-server 通过**环境变量**配置，所有变量以 `DUCKPORT_` 为�
 | `DUCKPORT_DUCKDB_THREADS` | `0` | DuckDB 工作线程数（0 = DuckDB 自动检测） |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(空)* | DuckDB 内存上限（如 `4GB`，空 = 不限制） |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | 启动按天滚动删除的 retention（见 [4.3](#43-数据保留retention)）；默认关闭，保留全部数据 |
-| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对日志后改为 `false` |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | 只统计、不删除；核对日志后改为 `false`。这两个开关只接受 `true`/`false`（或 `1`/`0`、`yes`/`no`、`on`/`off`），空值或拼错时服务端拒绝启动 |
 | `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | 两次执行的间隔（最小 60） |
 | `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | 保留天数低于该值的策略拒绝执行 |
 | `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | 两批删除之间让出写连接的时间 |

@@ -244,7 +244,7 @@ All parameters are passed via environment variables, all prefixed with `DUCKPORT
 | `DUCKPORT_DUCKDB_THREADS` | `0` (DuckDB default) | DuckDB `threads` PRAGMA |
 | `DUCKPORT_DUCKDB_MEMORY_LIMIT` | *(empty, DuckDB default)* | DuckDB `memory_limit` PRAGMA, e.g. `"2GB"` |
 | `DUCKPORT_RETENTION_ENABLED` | `false` | Start the rolling-window retention; per-table rules live in `data.retention_policy` (`duckport retention set`) |
-| `DUCKPORT_RETENTION_DRY_RUN` | `true` | Count rows only, never delete; switch to `false` after checking `duckport retention log` |
+| `DUCKPORT_RETENTION_DRY_RUN` | `true` | Count rows only, never delete; switch to `false` after checking `duckport retention log`. Only true/false are accepted; an empty or misspelled value stops the server from starting |
 | `DUCKPORT_RETENTION_INTERVAL_SECS` | `3600` | Pause between runs (minimum 60) |
 | `DUCKPORT_RETENTION_MIN_KEEP_DAYS` | `7` | Policies keeping fewer days are refused |
 | `DUCKPORT_RETENTION_BATCH_PAUSE_MS` | `200` | Pause between two DELETE batches so ingestor writes interleave |

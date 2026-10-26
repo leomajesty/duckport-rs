@@ -57,6 +57,13 @@ def setup(client):
        "DROP TABLE IF EXISTS data.mg_kline", "DROP TABLE IF EXISTS data.mg_kline__pk_old",
        "DROP TABLE IF EXISTS data.mg_other", "DROP TABLE IF EXISTS data.exginfo",
        "DROP TABLE IF EXISTS data.exginfo__pk_old",
+       "DROP TABLE IF EXISTS data.mg_empty", "DROP TABLE IF EXISTS data.mg_empty__pk_old",
+       "DROP TABLE IF EXISTS data.ab_pk_old", "DROP TABLE IF EXISTS data.orders_nopk",
+       # decoys: their names end like the migration suffixes but are ordinary tables
+       "CREATE TABLE data.ab_pk_old (x INTEGER)", "INSERT INTO data.ab_pk_old VALUES (1)",
+       "CREATE TABLE data.orders_nopk (x INTEGER)", "INSERT INTO data.orders_nopk VALUES (2)",
+       # empty at migration time; rows arrive afterwards
+       "CREATE TABLE data.mg_empty (ts TIMESTAMP, k VARCHAR, PRIMARY KEY (ts, k))",
        "CREATE TABLE data.mg_kline (open_time TIMESTAMP, symbol VARCHAR, close DOUBLE, PRIMARY KEY (open_time, symbol))",
        # three months, inserted out of time order on purpose
        "INSERT INTO data.mg_kline SELECT TIMESTAMP '2026-01-01' + INTERVAL (h) HOUR, 'S' || s, h "
@@ -73,8 +80,10 @@ def setup(client):
        "INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time) "
        "VALUES ('mg_kline', 'test', 3600, 'open_time', TIMESTAMP '2026-01-01', TIMESTAMP '2026-03-31 23:00:00') "
        "ON CONFLICT (table_name) DO UPDATE SET time_column = excluded.time_column",
+       "INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column) "
+       "VALUES ('mg_empty', 'test', 3600, 'ts') ON CONFLICT (table_name) DO UPDATE SET time_column = excluded.time_column",
        "INSERT OR REPLACE INTO data.config_dict VALUES ('write_mode:mg_kline', 'anti_join'), "
-       "('write_mode:exginfo', 'anti_join')",
+       "('write_mode:exginfo', 'anti_join'), ('write_mode:mg_empty', 'anti_join')",
        )
 
 
@@ -88,6 +97,14 @@ def main():
     assert rc == 0, rc
     assert "mg_kline" in out and "mg_other" in out and "writer not upgraded" in out
     assert keys(client, "mg_kline") == 1
+
+    hr("--tables comes after the subcommand and limits the plan")
+    rc, out = migrate("plan", "--tables", "mg_kline")
+    assert rc == 0 and "mg_kline" in out and "exginfo" not in out, out
+    rc, _ = migrate("plan", "--tables", "mg_kline", "no_such_table")
+    assert rc == 1
+    rc, _ = migrate("finalize", "--tables", "mg_kline")
+    assert rc != 0, "--tables must be refused for finalize"
 
     hr("migrate rebuilds ready tables without keys")
     rc, out = migrate("migrate")
@@ -114,13 +131,21 @@ def main():
 
     hr("rollback restores the keyed tables and keeps rows written after the migration")
     tx(client, "INSERT INTO data.mg_kline VALUES (TIMESTAMP '2026-04-01 00:00:00', 'NEW', 1)",
-       "DELETE FROM data.exginfo WHERE symbol = 'ETHUSDT'")
+       # a backfilled row inside the old time range
+       "INSERT INTO data.mg_kline VALUES (TIMESTAMP '2026-01-15 00:30:00', 'BACKFILL', 1)",
+       "DELETE FROM data.exginfo WHERE symbol = 'ETHUSDT'",
+       "INSERT INTO data.mg_empty VALUES (TIMESTAMP '2026-05-01', 'a'), (TIMESTAMP '2026-05-02', 'b')")
+    assert keys(client, "mg_empty") == 0
     rc, _ = migrate("rollback")
     assert rc == 0
     assert keys(client, "mg_kline") == 1 and not exists(client, "mg_kline__pk_old")
-    assert scalar(client, "SELECT count(*) FROM data.mg_kline") == total + 1
+    assert scalar(client, "SELECT count(*) FROM data.mg_kline") == total + 2
     assert keys(client, "exginfo") == 1
     assert scalar(client, "SELECT count(*) FROM data.exginfo") == 1
+    assert keys(client, "mg_empty") == 1
+    assert scalar(client, "SELECT count(*) FROM data.mg_empty") == 2, "rows written into an empty table were lost"
+    assert scalar(client, "SELECT count(*) FROM data.ab_pk_old") == 1, "decoy table was touched"
+    assert scalar(client, "SELECT count(*) FROM data.orders_nopk") == 1, "decoy table was touched"
 
     hr("migrate again, then finalize drops the old tables")
     rc, _ = migrate("migrate")
@@ -129,10 +154,13 @@ def main():
     assert rc == 0
     assert not exists(client, "mg_kline__pk_old") and not exists(client, "exginfo__pk_old")
     assert keys(client, "mg_kline") == 0
-    assert scalar(client, "SELECT count(*) FROM data.mg_kline") == total + 1
+    assert scalar(client, "SELECT count(*) FROM data.mg_kline") == total + 2
+    assert exists(client, "ab_pk_old") and exists(client, "orders_nopk"), "finalize dropped a decoy table"
 
     tx(client, "DROP TABLE IF EXISTS data.mg_kline", "DROP TABLE IF EXISTS data.mg_other",
-       "DROP TABLE IF EXISTS data.exginfo", "DELETE FROM data.watermark WHERE table_name = 'mg_kline'",
+       "DROP TABLE IF EXISTS data.exginfo", "DROP TABLE IF EXISTS data.mg_empty",
+       "DROP TABLE IF EXISTS data.ab_pk_old", "DROP TABLE IF EXISTS data.orders_nopk",
+       "DELETE FROM data.watermark WHERE table_name IN ('mg_kline', 'mg_empty')",
        "DELETE FROM data.config_dict WHERE key LIKE 'write_mode:%'")
     print("\nALL MIGRATE_NOPK TESTS PASSED")
 

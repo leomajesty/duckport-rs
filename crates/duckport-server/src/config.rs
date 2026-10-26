@@ -95,8 +95,8 @@ impl Config {
         let threads = parse_env_u32("DUCKPORT_DUCKDB_THREADS", 0)?;
         let mem = env::var("DUCKPORT_DUCKDB_MEMORY_LIMIT").unwrap_or_else(|_| String::new());
 
-        let retention_enabled = parse_env_bool("DUCKPORT_RETENTION_ENABLED", false);
-        let retention_dry_run = parse_env_bool("DUCKPORT_RETENTION_DRY_RUN", true);
+        let retention_enabled = parse_env_bool("DUCKPORT_RETENTION_ENABLED", false)?;
+        let retention_dry_run = parse_env_bool("DUCKPORT_RETENTION_DRY_RUN", true)?;
         let retention_interval_secs =
             parse_env_u64("DUCKPORT_RETENTION_INTERVAL_SECS", 3600)?.max(60);
         let retention_min_keep_days = parse_env_u32("DUCKPORT_RETENTION_MIN_KEEP_DAYS", 7)?;
@@ -165,10 +165,22 @@ fn parse_env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
-fn parse_env_bool(key: &str, default: bool) -> bool {
+/// Unset means `default`. Anything other than true/false/1/0/yes/no/on/off (including an
+/// empty value) is an error: these flags guard data deletion, so a typo must not silently
+/// flip them.
+fn parse_env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
     match env::var(key) {
-        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on"),
-        Err(_) => default,
+        Ok(v) => parse_bool(&v)
+            .ok_or_else(|| anyhow::anyhow!("{key}='{v}' is not a boolean (use true or false)")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -178,5 +190,23 @@ fn parse_env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
             .parse::<u32>()
             .map_err(|e| anyhow::anyhow!("{key}='{v}' is not a u32: {e}")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool;
+
+    #[test]
+    fn booleans_parse_strictly() {
+        for v in ["true", "TRUE", " 1 ", "yes", "on"] {
+            assert_eq!(parse_bool(v), Some(true), "{v}");
+        }
+        for v in ["false", "False", "0", "no", "off"] {
+            assert_eq!(parse_bool(v), Some(false), "{v}");
+        }
+        for v in ["", " ", "ture", "2", "enabled"] {
+            assert_eq!(parse_bool(v), None, "{v:?}");
+        }
     }
 }

@@ -12,37 +12,14 @@ Usually run through `duckport retention ...`.
 """
 
 import argparse
-import json
 import re
 import sys
 
 import pyarrow as pa
-import pyarrow.flight as flight
+
+from duckport_flight import Duckport, lit
 
 IDENT = re.compile(r"^[A-Za-z0-9_]{1,128}$")
-
-
-class Duckport:
-    def __init__(self, addr):
-        self.client = flight.FlightClient(f"grpc://{addr}")
-
-    def action(self, kind, body=None):
-        payload = json.dumps(body).encode() if body is not None else b""
-        res = list(self.client.do_action(flight.Action(kind, payload)))
-        return json.loads(res[0].body.to_pybytes())
-
-    def query(self, sql):
-        ticket = flight.Ticket(json.dumps({"type": "duckport.query", "sql": sql}).encode())
-        try:
-            return self.client.do_get(ticket).read_all().to_pylist()
-        except flight.FlightInternalError as e:
-            if "never sent a data message" in str(e):
-                return []
-            raise
-
-
-def lit(value):
-    return "'" + str(value).replace("'", "''") + "'"
 
 
 def check_table(name):

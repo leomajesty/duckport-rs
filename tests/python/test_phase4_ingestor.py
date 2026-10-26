@@ -224,6 +224,23 @@ def main():
 
     run_test("bulk_write_kline dedup across chunks", test_bulk_write_dedup)
 
+    def test_bulk_write_time_zone_and_null_batches():
+        before = scalar("SELECT count(*) FROM data.usdt_perp_5m")
+        # Rows already stored, expressed in Asia/Shanghai: must be recognised as duplicates.
+        df = make_kline_df(n_symbols=3, n_bars=4, base_time=base_time)
+        df["open_time"] = df["open_time"].dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
+        client.bulk_write_kline(pa.Table.from_pandas(df, preserve_index=False), "usdt_perp", INTERVAL, "",
+                                sync_duck_time=False)
+        assert scalar("SELECT count(*) FROM data.usdt_perp_5m") == before, "tz-aware duplicates inserted"
+        # A batch without any open_time is skipped instead of failing.
+        nulls = make_kline_df(n_symbols=2, n_bars=1, base_time=base_time)
+        nulls["open_time"] = pd.NaT
+        client.bulk_write_kline(pa.Table.from_pandas(nulls, preserve_index=False), "usdt_perp", INTERVAL, "",
+                                sync_duck_time=False)
+        assert scalar("SELECT count(*) FROM data.usdt_perp_5m") == before
+
+    run_test("bulk_write_kline: tz-aware duplicates and null-time batches", test_bulk_write_time_zone_and_null_batches)
+
     def test_legacy_keyed_table():
         # A table created by an older plugin keeps its key; the new write path must work on it.
         client.execute(f"CREATE TABLE IF NOT EXISTS data.usdt_perp_15m ({', '.join(client.KLINE_COL_DEFS)}, "

@@ -26,7 +26,7 @@ sudo duckport restart server
 duckport status            # 版本显示 v1.1.0，并多出 Retention 一节
 ```
 
-服务端启动时会自动创建 `data.retention_policy` 和 `data.retention_log`。通过 Airport 连接的 DuckDB 客户端，`duckdb` 版本同步升到 1.5.6。
+服务端启动时会自动创建 `data.retention_policy` 和 `data.retention_log`。`DUCKPORT_RETENTION_ENABLED` / `DUCKPORT_RETENTION_DRY_RUN` 现在只接受 `true`/`false`（或 `1`/`0`、`yes`/`no`、`on`/`off`），空值或拼错会让服务端拒绝启动，升级前先检查 server.env。通过 Airport 连接的 DuckDB 客户端，`duckdb` 版本同步升到 1.5.6。
 
 回退：重新部署 v1.0.4。
 
@@ -60,7 +60,7 @@ sudo duckport migrate nopk
 它会依次：停止正在运行的 ingestor → 对每张可迁移的表建一张同结构、无约束的新表，按月 `INSERT ... ORDER BY 时间列` 拷贝 → 核对行数 → 在一个事务里把原表改名为 `<表>__pk_old`、新表改为原名 → 删除废弃的 `data.retention_tasks` → CHECKPOINT → 启动 ingestor。
 
 - `exginfo` 一并重建：只拷贝有效行，带主键时累积的已删除行随之消失；`market` 不是普通标识符（超过 32 个字符等）的损坏行会被剔除。
-- 只想迁移部分表：`sudo duckport migrate nopk --tables usdt_perp_1m usdt_spot_1m`。
+- 只想迁移部分表：`sudo duckport migrate nopk --tables usdt_perp_1m usdt_spot_1m`（`--plan --tables ...` 先看计划）。
 - 耗时参考：测试中约 2000 万行/秒（1.3 亿行 6 秒）。20 亿行的库纯计算约 2 分钟，加上冷读库文件，预计 5 到 15 分钟。
 
 **回退**（第 4 步之前随时可以）：
@@ -69,7 +69,7 @@ sudo duckport migrate nopk
 sudo duckport migrate nopk --rollback
 ```
 
-把 `<表>__pk_old` 恢复为原表。有时间列的表，迁移后新写入的数据会补回旧表；`exginfo` 用当前快照替换。新插件在带主键的表上也能正常写入，回退后不需要降级插件。
+把 `<表>__pk_old` 恢复为原表，迁移后新写入的数据会按主键补回旧表（包括迁移时为空的表，以及回填到旧时间段的数据）；`exginfo` 用当前快照替换。新插件在带主键的表上也能正常写入，回退后不需要降级插件。
 
 ### 4. 清理旧表（观察 24 小时后）
 
@@ -77,7 +77,7 @@ sudo duckport migrate nopk --rollback
 sudo duckport migrate nopk --finalize
 ```
 
-删除所有 `<表>__pk_old` 并 CHECKPOINT。释放的空间留给后续写入复用，库文件本身不会变小；主键索引占用的内存随之释放。
+删除所有 `<表>__pk_old` 并 CHECKPOINT（只删这些旧表，不需要停 ingestor）。释放的空间留给后续写入复用，库文件本身不会变小；主键索引占用的内存随之释放。
 
 ### 5. 开启 retention（按需）
 
