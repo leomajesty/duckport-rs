@@ -1,5 +1,7 @@
 # 升级到 duckport-rs 1.1.0
 
+> 从 1.2.0 起，从任何旧版本升级都只需要 `sudo duckport upgrade`（见 [`upgrade.md`](./upgrade.md)）。下面保留 1.1.0 的分步说明和实测数据。
+
 1.1.0 带来三项变化：
 
 - **DuckDB 1.5.1 → 1.5.6**。修复 [duckdb#22279](https://github.com/duckdb/duckdb/issues/22279)：带主键的表在主键冲突导致写入回滚后，后续写入的字符串会混入被回滚的内容并落盘。存储格式不变，不需要转换库文件。

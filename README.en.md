@@ -190,7 +190,7 @@ duckport loadhist binance-5m        # Backfill historical data
 duckport retention set usdt_perp_1m 120   # Keep only the last 120 days (needs DUCKPORT_RETENTION_ENABLED=true)
 duckport retention status           # Retention policies and the latest run
 sudo duckport doctor                # read-only: compare database, system tables and plugin versions with this release's desired state (--deep, --json)
-sudo duckport upgrade --plan        # data alignment plan (read-only); --data applies it (backup first when a stop window is needed), --finalize / --rollback; see upgrade-1.1.md
+sudo duckport upgrade               # upgrade server -> plugins -> data alignment (--plan to preview, --proxy for network); see upgrade.md
 ```
 
 ### Local Development

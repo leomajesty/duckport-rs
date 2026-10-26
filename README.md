@@ -189,7 +189,7 @@ duckport loadhist binance-5m        # 补历史数据
 duckport retention set usdt_perp_1m 120   # 只保留最近 120 天（需 DUCKPORT_RETENTION_ENABLED=true）
 duckport retention status           # 保留策略与最近一次执行结果
 sudo duckport doctor                # 只读：对照当前版本的期望状态检查库、系统表和插件版本（--deep 全表查重，--json）
-sudo duckport upgrade --plan        # 数据对齐计划（只读）；--data 执行（需要停写时先备份），--finalize / --rollback；见 upgrade-1.1.md
+sudo duckport upgrade               # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划，--proxy 走代理）；见 upgrade.md
 ```
 
 ### 本地开发

@@ -1,0 +1,79 @@
+name: Upgrade
+
+# Every historical database state (tests/fixtures, F1–F6) must upgrade to the desired state
+# of this checkout, and doctor / upgrade / table-spec tests must pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: sjmc-quant/duckport-binance-ingestor
+          path: plugins/duckport-binance-ingestor
+
+      - uses: actions/checkout@v4
+        with:
+          repository: sjmc-quant/duckport-binance-funding
+          path: plugins/duckport-binance-funding
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build duckport-server
+        run: cargo build --release --bin duckport-server
+
+      - name: Unit tests
+        run: cargo test -p duckport-server
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Python environment
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python pyarrow \
+            ./plugins/duckport-binance-ingestor ./plugins/duckport-binance-funding
+
+      - name: Cache old server binaries and plugin venvs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/duckport-fixtures
+          key: fixtures-${{ hashFiles('tests/fixtures/build_fixtures.py') }}
+
+      - name: Build fixtures F1–F6
+        run: |
+          .venv/bin/python tests/fixtures/build_fixtures.py --out /tmp/fixtures \
+            --current-bin target/release/duckport-server
+
+      - name: Upgrade every fixture
+        env:
+          FIXTURES_DIR: /tmp/fixtures
+          DUCKPORT_BIN: target/release/duckport-server
+        run: .venv/bin/python tests/python/test_fixtures.py
+
+      - name: doctor / upgrade / table spec tests
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+          BINANCE_INGESTOR_SRC: ${{ github.workspace }}/plugins/duckport-binance-ingestor
+          BINANCE_FUNDING_SRC: ${{ github.workspace }}/plugins/duckport-binance-funding
+          TAIL: "20"
+        run: tests/python/run_with_server.sh test_doctor.py test_upgrade.py test_table_specs.py test_retention.py
+
+      - name: Plugin unit tests (binance-funding)
+        working-directory: plugins/duckport-binance-funding
+        run: ../../.venv/bin/python -m unittest discover -s tests

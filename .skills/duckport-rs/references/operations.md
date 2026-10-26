@@ -37,10 +37,10 @@ duckport logs all
 duckport config <instance>
 duckport install binance_ingestor
 duckport loadhist <instance>
-duckport upgrade                   # git pull + deploy.sh
+sudo duckport upgrade --plan       # what an upgrade would do: server, plugins, data (read-only)
+sudo duckport upgrade [--proxy URL] # server (pull, deploy, restart if changed) -> plugins -> data
 duckport doctor                    # read-only: database vs. this release's desired state
-sudo duckport upgrade --plan       # what upgrade --data would change (read-only)
-sudo duckport upgrade --data       # apply; one stop window (ingestors only), backup first
+sudo duckport upgrade --data       # data only; one stop window (ingestors only), backup first
 sudo duckport upgrade --finalize   # drop <table>__pk_old after the rebuild looks fine (--rollback undoes it)
 ```
 

@@ -10,7 +10,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Tuple
 
 from duckport_flight import lit, text
@@ -287,9 +287,14 @@ def fix_watermark_time(ctx, state, f):
     latest = ctx.dp.scalar(f"SELECT CAST(max({tc}) AS VARCHAR) FROM data.{q_ident(f.target)}")
     if latest is None:
         return 0, "表已为空，未修改"
+    # re-read: an earlier fix in the same run (L2) may already have set it
+    slack = int((2 * (spec.period or timedelta(0))).total_seconds())
+    old = ctx.dp.scalar(f"SELECT CAST(duck_time AS VARCHAR) FROM data.watermark WHERE table_name = {lit(f.target)}")
+    if old is not None and ctx.dp.scalar(
+            f"SELECT TIMESTAMP {lit(old)} <= TIMESTAMP {lit(latest)} + INTERVAL {slack} SECOND"):
+        return 0, f"duck_time={old} 已与数据一致，未修改"
     ctx.dp.execute(f"UPDATE data.watermark SET duck_time = TIMESTAMP {lit(latest)}, "
                    f"updated_at = CURRENT_TIMESTAMP WHERE table_name = {lit(f.target)}")
-    old = (state.watermark.get(f.target) or {}).get("duck_time")
     return 1, f"duck_time {old} → {latest}"
 
 

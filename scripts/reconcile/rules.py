@@ -91,24 +91,28 @@ def plugin_versions(state, dp, opts):
 
 
 def _writer_ready(state: State, table: str):
-    """(ready, reason): can the table's writers handle a table without a key?"""
+    """(ready, reason): can the table's writers handle a table without a key?
+
+    For plugins duckport knows (with a minimum version) the installed version decides, so a
+    rolled-back instance is caught even though the newer version registered anti_join.
+    Other writers count as ready only through their registration (table_specs or the
+    write_mode key); without one the answer is unknown (None).
+    """
+    writers = state.writers(table)
+    if writers and all(PLUGIN_MIN_VERSION.get(w.exec) for w in writers):
+        old = [f"{w.name}（{w.exec} v{w.version or '?'}）" for w in writers
+               if version_at_least(w.version, PLUGIN_MIN_VERSION[w.exec]) is not True]
+        if old:
+            return False, "写入方仍是旧写法：" + "、".join(old)
+        return True, "写入方插件版本满足要求"
     spec = state.spec(table)
     if spec and spec.source == "registered" and spec.write_mode == "anti_join":
         return True, f"表规格登记 write_mode=anti_join（{spec.plugin} v{spec.writer_version or '?'}）"
     if state.write_modes.get(table) == "anti_join":
         return True, "已登记 write_mode=anti_join"
-    writers = state.writers(table)
     if not writers:
         return None, "找不到写入这张表的插件实例，也没有 write_mode 登记"
-    old = []
-    for w in writers:
-        minimum = PLUGIN_MIN_VERSION.get(w.exec)
-        ok = version_at_least(w.version, minimum) if minimum else None
-        if ok is not True:
-            old.append(f"{w.name}（{w.exec} v{w.version or '?'}）")
-    if old:
-        return False, "写入方仍是旧写法：" + "、".join(old)
-    return True, "写入方插件版本满足要求"
+    return None, "写入方插件不在已知列表里，也没有登记 write_mode"
 
 
 @rule("V3")
