@@ -191,6 +191,7 @@ duckport retention set usdt_perp_1m 120   # Keep only the last 120 days (needs D
 duckport retention status           # Retention policies and the latest run
 sudo duckport migrate nopk --plan   # 1.1.0 upgrade: list business tables that still carry a primary key (see upgrade-1.1.md)
 sudo duckport doctor                # read-only: compare database, system tables and plugin versions with this release's desired state (--deep, --json)
+sudo duckport upgrade --plan        # data alignment plan; --data applies it (online fixes + stop window + recheck), --finalize / --rollback
 ```
 
 ### Local Development

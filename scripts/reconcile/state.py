@@ -6,7 +6,7 @@ Metadata is read once; rules that need to scan table data query the server thems
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from reconcile.specs import LEFTOVER_SUFFIXES, RETIRED_TABLES, SYSTEM_TABLES, TableSpec, builtin_spec
+from reconcile.specs import LEFTOVER_SUFFIXES, RETIRED_TABLES, SYSTEM_TABLES, TOOL_TABLES, TableSpec, builtin_spec
 
 
 @dataclass
@@ -38,7 +38,7 @@ class State:
     write_modes: Dict[str, str] = field(default_factory=dict)
 
     def business_tables(self) -> List[Table]:
-        skip = set(SYSTEM_TABLES) | set(RETIRED_TABLES)
+        skip = set(SYSTEM_TABLES) | set(RETIRED_TABLES) | TOOL_TABLES
         return [t for name, t in sorted(self.tables.items())
                 if name not in skip and not name.endswith(LEFTOVER_SUFFIXES)]
 

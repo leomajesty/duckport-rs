@@ -38,6 +38,38 @@ SYSTEM_TABLES: Dict[str, Dict[str, str]] = {
     },
 }
 
+# DDL the server runs at startup (crates/duckport-server/src/main.rs init_system_schema and
+# retention.rs SYSTEM_SCHEMA_SQL); used to recreate a missing system table without a restart.
+SYSTEM_DDL: Dict[str, str] = {
+    "config_dict": "CREATE TABLE IF NOT EXISTS data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)",
+    "watermark": (
+        "CREATE TABLE IF NOT EXISTS data.watermark (table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, "
+        "max_lag_seconds INTEGER, time_column VARCHAR NOT NULL, start_time TIMESTAMP, duck_time TIMESTAMP, "
+        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    ),
+    "retention_policy": (
+        "CREATE TABLE IF NOT EXISTS data.retention_policy (table_name VARCHAR PRIMARY KEY, "
+        "keep_days INTEGER NOT NULL, batch_days INTEGER NOT NULL DEFAULT 1, archive_dir VARCHAR, "
+        "enabled BOOLEAN NOT NULL DEFAULT true, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    ),
+    "retention_log": (
+        "CREATE TABLE IF NOT EXISTS data.retention_log (run_id VARCHAR, table_name VARCHAR, cutoff DATE, "
+        "first_day DATE, last_day DATE, rows_archived BIGINT, rows_deleted BIGINT, dry_run BOOLEAN, "
+        "free_blocks_before BIGINT, free_blocks_after BIGINT, status VARCHAR, error VARCHAR, "
+        "started_at TIMESTAMP, finished_at TIMESTAMP)"
+    ),
+}
+# Defaults for system columns added to an existing table (others are added as plain NULL columns).
+SYSTEM_COLUMN_DEFAULTS = {("watermark", "updated_at"): "CURRENT_TIMESTAMP"}
+
+# Written by `duckport upgrade` itself; not a business table, not checked by S1.
+UPGRADE_LOG_DDL = (
+    "CREATE TABLE IF NOT EXISTS data.upgrade_log (run_id VARCHAR, phase VARCHAR, rule VARCHAR, "
+    "target VARCHAR, action VARCHAR, status VARCHAR, rows BIGINT, detail VARCHAR, "
+    "started_at TIMESTAMP, finished_at TIMESTAMP)"
+)
+TOOL_TABLES = {"upgrade_log"}
+
 # Tables that must not exist any more.
 RETIRED_TABLES = {"retention_tasks": "1.1.0 起由 data.retention_policy 取代"}
 
@@ -67,6 +99,7 @@ class TableSpec:
     period: Optional[timedelta] = None  # expected spacing of time_column values
     string_checks: Dict[str, StringCheck] = field(default_factory=dict)
     legacy_columns: Tuple[str, ...] = ()  # columns older plugin versions had
+    column_defaults: Dict[str, str] = field(default_factory=dict)  # used when a missing column is added
     source: str = "builtin"
 
 
@@ -111,6 +144,7 @@ def builtin_spec(table: str) -> Optional[TableSpec]:
             dedup_key=("market", "symbol"),
             string_checks={"market": MARKET_CHECK, "symbol": StringCheck(max_len=64),
                            "status": StringCheck(max_len=32)},
+            column_defaults={"created_time": "CURRENT_TIMESTAMP"},
         )
     if table == "usdt_perp_funding":
         return TableSpec(

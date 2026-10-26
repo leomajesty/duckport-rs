@@ -6,6 +6,7 @@ Each rule yields Findings. A finding's level says how it would be fixed:
   online - fixed while everything runs
   hint   - reported only
 Rules marked slow scan table data and are skipped by `doctor --summary`.
+The fixes for these findings live in reconcile.fixes and reuse the conditions below.
 """
 
 import re
@@ -120,7 +121,7 @@ def writer_compat(state, dp, opts):
         if ready is False:
             yield Finding("V3", "block", t.name,
                           f"表已没有主键，但{reason}；这些实例的写入会全部失败（ON CONFLICT 报 Binder Error）",
-                          "立即升级这些插件实例；或者对这张表执行 duckport migrate nopk --rollback")
+                          "立即升级这些插件实例；<表>__pk_old 还在时也可以 duckport upgrade --rollback")
 
 
 # ── system tables and retired objects ─────────────────────────────────────────
@@ -194,7 +195,7 @@ def leftovers(state, dp, opts):
         if name.endswith(LEFTOVER_SUFFIXES):
             kind = "去主键迁移保留的旧表" if name.endswith("__pk_old") else "迁移中断留下的半成品"
             yield Finding("C1", "hint", name, kind,
-                          "确认无误后 duckport migrate nopk --finalize；有问题 --rollback")
+                          "确认无误后 duckport upgrade --finalize；有问题 --rollback")
 
 
 # ── business table structure ──────────────────────────────────────────────────
@@ -205,10 +206,18 @@ def keyed_business_tables(state, dp, opts):
         if not t.keyed:
             continue
         ready, reason = _writer_ready(state, t.name)
-        if ready:
+        if ready and t.name + "__pk_old" in state.tables:
+            yield Finding("B1", "block", t.name, f"上次去主键留下的 {t.name}__pk_old 还在",
+                          "先 duckport upgrade --finalize 或 --rollback")
+        elif ready:
             yield Finding("B1", "stop", t.name,
                           f"带主键/唯一约束/索引（约 {t.estimated_size:,} 行）；{reason}",
-                          "重建为无主键表（duckport migrate nopk）")
+                          "重建为无主键表，原表保留为 <表>__pk_old")
+        elif ready is None:
+            # Unknown writer (e.g. a third-party plugin): never rebuilt automatically.
+            yield Finding("B1", "hint", t.name, f"带主键/唯一约束/索引；{reason}，不会自动去主键",
+                          f"写入方改用 anti-join 后，在 data.config_dict 登记 write_mode:{t.name}=anti_join，"
+                          "duckport upgrade 会自动去主键")
         else:
             yield Finding("B1", "block", t.name, f"带主键/唯一约束/索引，但{reason}",
                           "先升级写入它的插件，再去主键")
@@ -235,24 +244,54 @@ def business_columns(state, dp, opts):
 
 # ── data health ───────────────────────────────────────────────────────────────
 
+def bad_string_condition(spec, table) -> str:
+    """WHERE condition matching rows that break the spec's string checks ('' if none apply)."""
+    conds = []
+    for col, chk in (spec.string_checks if spec else {}).items():
+        if col not in table.columns:
+            continue
+        c = q_ident(col)
+        cond = f"length({c}) > {chk.max_len}"
+        if chk.pattern:
+            cond += f" OR NOT regexp_full_match({c}, {lit(chk.pattern)})"
+        conds.append(f"({c} IS NOT NULL AND ({cond}))")
+    return " OR ".join(conds)
+
+
+def dup_scope(spec, table, opts):
+    """(WHERE clause or '', description) limiting the duplicate scan."""
+    if spec.time_column and not opts.deep:
+        tc = q_ident(spec.time_column)
+        return (f" WHERE {tc} >= (SELECT max({tc}) FROM data.{q_ident(table.name)}) "
+                f"- INTERVAL {int(opts.dup_window_days)} DAY"), f"最近 {opts.dup_window_days} 天"
+    return "", "全表"
+
+
+def storage_rows(dp, table):
+    """(physical rows incl. deleted ones, live rows)."""
+    first = next(iter(table.columns), None)
+    if not first:
+        return 0, 0
+    physical = dp.scalar(
+        f"SELECT sum(count) FROM pragma_storage_info({lit('data.' + table.name)}) "
+        f"WHERE column_name = {lit(first)} AND segment_type <> 'VALIDITY'") or 0
+    if not physical:
+        return 0, 0
+    return physical, dp.scalar(f"SELECT count(*) FROM data.{q_ident(table.name)}") or 0
+
+
+def is_bloated(physical, live, opts):
+    return physical - live >= opts.bloat_min_dead_rows and physical > opts.bloat_ratio * max(live, 1)
+
+
 @rule("D1", slow=True)
 def bad_strings(state, dp, opts):
     for t in state.business_tables():
         spec = state.spec(t.name)
-        if not spec or not spec.string_checks:
+        cond = bad_string_condition(spec, t)
+        if not cond:
             continue
-        conds = []
-        for col, chk in spec.string_checks.items():
-            if col not in t.columns:
-                continue
-            c = q_ident(col)
-            cond = f"length({c}) > {chk.max_len}"
-            if chk.pattern:
-                cond += f" OR NOT regexp_full_match({c}, {lit(chk.pattern)})"
-            conds.append(f"({c} IS NOT NULL AND ({cond}))")
-        if not conds:
-            continue
-        n = dp.scalar(f"SELECT count(*) FROM data.{q_ident(t.name)} WHERE {' OR '.join(conds)}")
+        n = dp.scalar(f"SELECT count(*) FROM data.{q_ident(t.name)} WHERE {cond}")
         if n:
             yield Finding("D1", "online", t.name,
                           f"{n:,} 行字符串不合规（{', '.join(spec.string_checks)}；常见于 DuckDB ≤ 1.5.1 的 duckdb#22279）",
@@ -266,12 +305,7 @@ def duplicate_keys(state, dp, opts):
         if not spec or t.keyed or any(c not in t.columns for c in spec.dedup_key):
             continue
         key = ", ".join(q_ident(c) for c in spec.dedup_key)
-        where, scope = "", "全表"
-        if spec.time_column and not opts.deep:
-            tc = q_ident(spec.time_column)
-            where = (f" WHERE {tc} >= (SELECT max({tc}) FROM data.{q_ident(t.name)}) "
-                     f"- INTERVAL {int(opts.dup_window_days)} DAY")
-            scope = f"最近 {opts.dup_window_days} 天"
+        where, scope = dup_scope(spec, t, opts)
         n = dp.scalar(f"SELECT count(*) - count(DISTINCT ({key})) FROM data.{q_ident(t.name)}{where}")
         if n:
             yield Finding("D2", "online", t.name, f"{scope}有 {n:,} 行重复（按 {', '.join(spec.dedup_key)}）",
@@ -302,13 +336,15 @@ def watermark_vs_data(state, dp, opts):
         duck = row.get("duck_time")
         if latest is None:
             continue
+        # The plugin keeps duck_time in memory and writes it back, so the fix needs the
+        # writer stopped (and it reloads the corrected value when it starts again).
         if duck is None:
-            yield Finding("D4", "online", t.name, f"表里有数据（最新 {latest}），但 watermark.duck_time 为空",
+            yield Finding("D4", "stop", t.name, f"表里有数据（最新 {latest}），但 watermark.duck_time 为空",
                           "设为最新数据时间")
             continue
         slack = 2 * (spec.period or timedelta(0))
         if duck > latest + slack:
-            yield Finding("D4", "online", t.name,
+            yield Finding("D4", "stop", t.name,
                           f"watermark.duck_time={duck} 超前于最新数据 {latest}",
                           "校正为最新数据时间（否则 ingestor 会跳过这段缺口）")
         elif latest > duck + slack:
@@ -319,17 +355,8 @@ def watermark_vs_data(state, dp, opts):
 @rule("D5", slow=True)
 def bloat(state, dp, opts):
     for t in state.business_tables():
-        first = next(iter(t.columns), None)
-        if not first:
-            continue
-        physical = dp.scalar(
-            f"SELECT sum(count) FROM pragma_storage_info({lit('data.' + t.name)}) "
-            f"WHERE column_name = {lit(first)} AND segment_type <> 'VALIDITY'") or 0
-        if physical < opts.bloat_min_dead_rows:
-            continue
-        live = dp.scalar(f"SELECT count(*) FROM data.{q_ident(t.name)}") or 0
-        dead = physical - live
-        if dead >= opts.bloat_min_dead_rows and physical > opts.bloat_ratio * max(live, 1):
+        physical, live = storage_rows(dp, t)
+        if is_bloated(physical, live, opts):
             yield Finding("D5", "stop", t.name,
                           f"物理存储 {physical:,} 行，有效 {live:,} 行（已删除的行没有回收）",
                           "重建这张表" + ("（它带主键，去主键时一并完成）" if t.keyed else ""))
