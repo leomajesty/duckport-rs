@@ -13,8 +13,8 @@
 #   duckport logs    <实例>|server|all   # 实时日志
 #   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist [<实例>]           # 补历史数据
-#   duckport upgrade                     # 更新环境（git pull + deploy.sh）
-#   duckport upgrade --plan|--data       # 数据对齐：只出计划 / 执行（--finalize、--rollback）
+#   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
+#   duckport upgrade --data              # 只做数据对齐（--finalize、--rollback）
 #   duckport doctor  [--deep] [--json]   # 对照当前版本检查库的状态（只读）
 
 set -euo pipefail
@@ -25,18 +25,22 @@ OS=$(uname -s)    # Linux | Darwin
 
 # macOS 用用户路径（无需 sudo），Linux 用系统路径
 if [[ "$OS" == "Darwin" ]]; then
-  DEPLOY_OPT="$HOME/.duckport"
+  DEPLOY_OPT="${DUCKPORT_HOME:-$HOME/.duckport}"
   PLIST_DIR="$HOME/Library/LaunchAgents"
   LOG_DIR="$HOME/.duckport/logs"
   _DEFAULT_REPO="$HOME/code/duckport-rs"
 else
-  DEPLOY_OPT="/opt/duckport"
+  DEPLOY_OPT="${DUCKPORT_HOME:-/opt/duckport}"
   PLIST_DIR=""   # Linux 用 systemd，不需要
   LOG_DIR="/opt/duckport/logs"
   _DEFAULT_REPO="$HOME/code/duckport-rs"
 fi
 
 DEPLOY_BIN="$DEPLOY_OPT/bin"
+# systemd unit 名前缀（deploy.sh 写入；同机第二套部署或演练环境用别的前缀，默认 duckport）
+SVC_PREFIX="$(cat "$DEPLOY_OPT/unit_prefix" 2>/dev/null || echo duckport)"
+SVC_SERVER="${SVC_PREFIX}-server"
+SVC_INGESTOR="${SVC_PREFIX}-ingestor"
 INGESTORS_DIR="$DEPLOY_OPT/ingestors"
 # 从 deploy.sh 写入的持久化路径读取，回退到平台默认值
 REPO_DIR="$(cat "$DEPLOY_OPT/repo_dir" 2>/dev/null || echo "$_DEFAULT_REPO")"
@@ -52,18 +56,19 @@ _require_root() {
   [[ $EUID -eq 0 ]] || { echo -e "${RED}需要 root 权限，请用 sudo${NC}"; exit 1; }
 }
 
-# uv pip install 封装：清除 shell 代理（代理是给 ingestor 运行时用的，不用于包安装），
-# 并支持 UV_INDEX_URL 环境变量指定 PyPI 镜像（如清华 https://pypi.tuna.tsinghua.edu.cn/simple/）
+# uv pip install 封装。默认清除 shell 代理（代理是给 ingestor 运行时用的）；设置了 DUCKPORT_PROXY
+# （duckport upgrade --proxy）时改用它安装。支持 UV_INDEX_URL 指定 PyPI 镜像（如清华 https://pypi.tuna.tsinghua.edu.cn/simple/）
 _uv_install() {
-  HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" \
+  local p="${DUCKPORT_PROXY:-}"
+  HTTP_PROXY="$p" HTTPS_PROXY="$p" http_proxy="$p" https_proxy="$p" \
     uv pip install "$@"
 }
 
 # 将服务逻辑名转为 launchd label
 _svc_label() {
   case "$1" in
-    duckport-server)     echo "com.duckport.server" ;;
-    duckport-ingestor@*) echo "com.duckport.ingestor.${1#duckport-ingestor@}" ;;
+    "$SVC_SERVER")       echo "com.duckport.server" ;;
+    "$SVC_INGESTOR"@*)   echo "com.duckport.ingestor.${1#"$SVC_INGESTOR"@}" ;;
     *)                   echo "com.duckport.$1" ;;
   esac
 }
@@ -117,7 +122,7 @@ _svc_stop() {
 
 _svc_status_label() {
   local state
-  state=$(_svc_is_active "duckport-ingestor@$1")
+  state=$(_svc_is_active "$SVC_INGESTOR@$1")
   case "$state" in
     active)   echo -e "${GREEN}● active${NC}" ;;
     inactive) echo -e "${DIM}○ inactive${NC}" ;;
@@ -195,26 +200,13 @@ _flight_python() {
 # 已安装的插件实例清单（JSON 写入 $1）：实例名、插件命令、安装版本、是否运行中。
 # 版本按 console script 名找到所属的发行包再读取，第三方插件同样适用。
 _instances_json() {
-  local out="$1" inst first=1 py exec_name ver active
+  local out="$1" inst first=1 exec_name ver active
   echo "[" > "$out"
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
     exec_name=$(_instance_exec "$inst")
-    py=$(_instance_python "$inst")
-    ver=""
-    if [[ -x "$py" ]]; then
-      ver=$("$py" - "$exec_name" 2>/dev/null << 'PY'
-import sys
-from importlib import metadata
-name = sys.argv[1]
-for dist in metadata.distributions():
-    if any(ep.group == "console_scripts" and ep.name == name for ep in dist.entry_points):
-        print(dist.version)
-        break
-PY
-)
-    fi
-    [[ "$(_svc_is_active "duckport-ingestor@$inst")" == "active" ]] && active=true || active=false
+    ver=$(_instance_version "$inst")
+    [[ "$(_svc_is_active "$SVC_INGESTOR@$inst")" == "active" ]] && active=true || active=false
     [[ $first -eq 1 ]] && first=0 || echo "," >> "$out"
     printf '{"instance": "%s", "exec": "%s", "version": "%s", "active": %s}' \
       "$inst" "$exec_name" "$ver" "$active" >> "$out"
@@ -259,7 +251,7 @@ cmd_status() {
 
   echo -e "\n${BOLD}duckport-server${NC}"
   local sv_state sv_label
-  sv_state=$(_svc_is_active "duckport-server")
+  sv_state=$(_svc_is_active "$SVC_SERVER")
   if [[ "$sv_state" == "active" ]]; then
     sv_label="${GREEN}● active${NC}"
   else
@@ -273,7 +265,7 @@ cmd_status() {
       version_label="  ${DIM}v${ver}${NC}"
     fi
   fi
-  printf "  %-22s " "duckport-server"
+  printf "  %-22s " "$SVC_SERVER"
   echo -e "$sv_label  ${DIM}:${server_port}${NC}${version_label}"
 
   echo -e "\n${BOLD}Ingestors${NC}"
@@ -460,9 +452,9 @@ _stop_running_ingestors() {
   STOPPED_INGESTORS=()
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
-    if [[ "$(_svc_is_active "duckport-ingestor@$inst")" == "active" ]]; then
+    if [[ "$(_svc_is_active "$SVC_INGESTOR@$inst")" == "active" ]]; then
       STOPPED_INGESTORS+=("$inst")
-      _svc_stop "duckport-ingestor@$inst"
+      _svc_stop "$SVC_INGESTOR@$inst"
       echo -e "  ${DIM}stopped${NC} $inst"
     fi
   done <<< "$(_list_instances)"
@@ -471,7 +463,7 @@ _stop_running_ingestors() {
 _start_stopped_ingestors() {
   local inst
   for inst in ${STOPPED_INGESTORS[@]+"${STOPPED_INGESTORS[@]}"}; do
-    _svc_start "duckport-ingestor@$inst"
+    _svc_start "$SVC_INGESTOR@$inst"
     echo -e "  ${GREEN}✓${NC} started $inst"
   done
   STOPPED_INGESTORS=()
@@ -484,7 +476,7 @@ cmd_start() {
   local arg="${1:-server}"
 
   if [[ "$arg" == "all" ]] || [[ "$arg" == "server" ]]; then
-    _svc_start "duckport-server"
+    _svc_start "$SVC_SERVER"
     echo -e "  ${GREEN}✓${NC} duckport-server started"
     [[ "$arg" == "server" ]] && return
     sleep 2
@@ -494,7 +486,7 @@ cmd_start() {
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
-    _svc_start "duckport-ingestor@$inst"
+    _svc_start "$SVC_INGESTOR@$inst"
     echo -e "  ${GREEN}✓${NC} duckport-ingestor@$inst started"
   done <<< "$instances"
 }
@@ -504,7 +496,7 @@ cmd_stop() {
   local arg="${1:-all}"
 
   if [[ "$arg" == "server" ]]; then
-    _svc_stop "duckport-server"
+    _svc_stop "$SVC_SERVER"
     echo -e "  ${DIM}○${NC} duckport-server stopped"
     return
   fi
@@ -513,12 +505,12 @@ cmd_stop() {
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
-    _svc_stop "duckport-ingestor@$inst"
+    _svc_stop "$SVC_INGESTOR@$inst"
     echo -e "  ${DIM}○${NC} duckport-ingestor@$inst stopped"
   done <<< "$instances"
 
   if [[ "$arg" == "all" ]]; then
-    _svc_stop "duckport-server"
+    _svc_stop "$SVC_SERVER"
     echo -e "  ${DIM}○${NC} duckport-server stopped"
   fi
 }
@@ -542,15 +534,15 @@ cmd_logs() {
   if [[ "$OS" == "Linux" ]]; then
     case "$target" in
       server)
-        exec journalctl -u duckport-server -f --no-hostname -o short-iso ;;
+        exec journalctl -u "$SVC_SERVER" -f --no-hostname -o short-iso ;;
       all)
-        local units=("-u" "duckport-server")
+        local units=("-u" "$SVC_SERVER")
         while IFS= read -r inst; do
-          [[ -n "$inst" ]] && units+=("-u" "duckport-ingestor@$inst")
+          [[ -n "$inst" ]] && units+=("-u" "$SVC_INGESTOR@$inst")
         done <<< "$(_list_instances)"
         exec journalctl "${units[@]}" -f --no-hostname -o short-iso ;;
       *)
-        exec journalctl -u "duckport-ingestor@$target" -f --no-hostname -o short-iso ;;
+        exec journalctl -u "$SVC_INGESTOR@$target" -f --no-hostname -o short-iso ;;
     esac
   else
     # macOS：launchd 将 stdout/stderr 重定向到 LOG_DIR 下的文件
@@ -751,7 +743,7 @@ cmd_install() {
 
   if [[ "$OS" == "Linux" ]]; then
     systemctl daemon-reload
-    systemctl enable "duckport-ingestor@$INST_NAME" 2>/dev/null || true
+    systemctl enable "$SVC_INGESTOR@$INST_NAME" 2>/dev/null || true
   else
     # macOS：launchd 无模板 unit，为每个实例生成独立 plist
     local label="com.duckport.ingestor.$INST_NAME"
@@ -827,9 +819,9 @@ cmd_rm() {
   read -rp "确认删除实例 '$name'？[y/N] " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
 
-  _svc_stop "duckport-ingestor@$name"
+  _svc_stop "$SVC_INGESTOR@$name"
   if [[ "$OS" == "Linux" ]]; then
-    systemctl disable "duckport-ingestor@$name" 2>/dev/null || true
+    systemctl disable "$SVC_INGESTOR@$name" 2>/dev/null || true
   else
     rm -f "$PLIST_DIR/com.duckport.ingestor.${name}.plist"
   fi
@@ -860,7 +852,7 @@ cmd_loadhist() {
 
     echo -e "\n${BOLD}▶ loadhist — $inst${NC}"
     echo -e "  ${YELLOW}⚠ 停止 ingestor 以独占 staging 表${NC}"
-    _svc_stop "duckport-ingestor@$inst"
+    _svc_stop "$SVC_INGESTOR@$inst"
 
     INGESTOR_ENV_FILE="$cfg" \
       "$INGESTORS_DIR/$inst/.venv/bin/loadhist" && \
@@ -873,91 +865,107 @@ cmd_loadhist() {
 
 # ─── update（更新插件）────────────────────────────────────────────────────────
 
+# 实例安装的插件版本：按 console script 名找到所属的发行包再读取，第三方插件同样适用；读不到时为空
+_instance_version() {
+  local py exec_name
+  py=$(_instance_python "$1")
+  exec_name=$(_instance_exec "$1")
+  [[ -x "$py" ]] || return 0
+  "$py" - "$exec_name" 2>/dev/null << 'PY' || true
+import sys
+from importlib import metadata
+name = sys.argv[1]
+for dist in metadata.distributions():
+    if any(ep.group == "console_scripts" and ep.name == name for ep in dist.entry_points):
+        print(dist.version)
+        break
+PY
+}
+
+# 实例插件的来源：本地源码目录，或 registry 里的 git 仓库（git+URL）；找不到时为空
+_instance_source() {
+  local exec_cmd reg plugin_name="" repo="" local_src
+  exec_cmd=$(_instance_exec "$1")
+  reg=$(_registry_file)
+  if [[ -f "$reg" ]]; then
+    read -r plugin_name repo < <(REG="$reg" EXEC="$exec_cmd" python3 -c "
+import json, os
+try:
+    for k, v in json.load(open(os.environ['REG'])).items():
+        if v.get('exec', '') == os.environ['EXEC']:
+            print(k, v.get('repo', '')); break
+except Exception:
+    pass
+" 2>/dev/null) || true
+  fi
+  local_src="$(_plugin_src "${plugin_name:-$exec_cmd}")"
+  if [[ -n "$local_src" ]]; then
+    echo "$local_src"
+  elif [[ -n "$repo" ]]; then
+    echo "git+$repo"
+  fi
+}
+
+# 从来源重新安装实例的插件（不重启）
+_update_instance() {
+  local name="$1"
+  local inst_dir="$INGESTORS_DIR/$name"
+  [[ -d "$inst_dir" ]] || { echo -e "${RED}实例 '$name' 不存在${NC}"; exit 1; }
+  local inst_py="$inst_dir/.venv/bin/python3"
+  [[ -x "$inst_py" ]] || { echo -e "${RED}实例 '$name' 的 venv 不完整，请重新执行 duckport install${NC}"; exit 1; }
+
+  export PATH="$HOME/.local/bin:$PATH"
+  echo -e "\n${BOLD}更新实例：$name${NC}  (exec=$(_instance_exec "$name"))"
+  local src
+  src=$(_instance_source "$name")
+  case "$src" in
+    "")
+      echo -e "${RED}无法确定插件来源（registry 中未找到 exec=$(_instance_exec "$name")）${NC}"
+      exit 1 ;;
+    git+*)
+      echo -e "  ${CYAN}GitHub 模式：${src#git+}${NC}"
+      _uv_install --reinstall "$src" --python "$inst_py" ;;
+    "$REPO_DIR"/*)
+      echo -e "  ${CYAN}仓库内源码：$src${NC}"
+      _uv_install -e "$src" --python "$inst_py" ;;
+    *)
+      echo -e "  ${CYAN}本地源码模式：$src${NC}"
+      git -C "$src" pull --ff-only
+      _uv_install -e "$src" --python "$inst_py" ;;
+  esac
+  echo -e "  ${GREEN}✓${NC} 插件已更新"
+}
+
 cmd_update() {
   _require_root
   local name="${1:-}"
   [[ -n "$name" ]] || { echo "用法: duckport update <实例名>"; exit 1; }
   name="${name//_/-}"
-
-  local inst_dir="$INGESTORS_DIR/$name"
-  local cfg="$inst_dir/config.env"
-  [[ -d "$inst_dir" ]] || { echo -e "${RED}实例 '$name' 不存在${NC}"; exit 1; }
-
-  local inst_py="$inst_dir/.venv/bin/python3"
-  [[ -x "$inst_py" ]] || { echo -e "${RED}实例 '$name' 的 venv 不完整，请重新执行 duckport install${NC}"; exit 1; }
-
-  # 通过 INGESTOR_EXEC 反查 registry 中的插件名和 repo URL
-  local exec_cmd
-  exec_cmd=$(grep '^INGESTOR_EXEC=' "$cfg" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
-
-  local plugin_name repo
-  local reg
-  reg=$(_registry_file)
-  if [[ -f "$reg" ]]; then
-    plugin_name=$(python3 -c "
-import json
-try:
-    d = json.load(open('$reg'))
-    for k, v in d.items():
-        if v.get('exec','') == '$exec_cmd':
-            print(k); break
-except: pass
-" 2>/dev/null)
-    repo=$(python3 -c "
-import json
-try:
-    d = json.load(open('$reg'))
-    for v in d.values():
-        if v.get('exec','') == '$exec_cmd':
-            print(v.get('repo','')); break
-except: pass
-" 2>/dev/null)
-  fi
-
-  export PATH="$HOME/.local/bin:$PATH"
-  echo -e "\n${BOLD}更新实例：$name${NC}  (exec=$exec_cmd)"
-
-  local local_src
-  local_src="$(_plugin_src "${plugin_name:-$exec_cmd}")"
-
-  if [[ -n "$local_src" ]]; then
-    case "$local_src" in
-      "$REPO_DIR"/*)
-        echo -e "  ${CYAN}仓库内源码：$local_src${NC}"
-        ;;
-      *)
-        echo -e "  ${CYAN}本地源码模式：$local_src${NC}"
-        git -C "$local_src" pull --ff-only
-        ;;
-    esac
-    _uv_install -e "$local_src" --python "$inst_py"
-  elif [[ -n "$repo" ]]; then
-    echo -e "  ${CYAN}GitHub 模式：$repo${NC}"
-    _uv_install --reinstall "git+${repo}" --python "$inst_py"
-  else
-    echo -e "${RED}无法确定插件来源（registry 中未找到 exec=$exec_cmd）${NC}"
-    exit 1
-  fi
-
-  echo -e "  ${GREEN}✓${NC} 插件已更新"
+  _update_instance "$name"
   echo -e "  ${YELLOW}提示：请手动执行 duckport restart $name 以使新版本生效${NC}"
 }
 
 # ─── upgrade ──────────────────────────────────────────────────────────────────
 
-# 升级。
-#   duckport upgrade                          git pull + deploy.sh（替换服务端 binary，不重启）
-#   duckport upgrade --plan [--deep]          对照当前版本的期望状态列出修正计划，不修改
-#   duckport upgrade --data [--yes] [--deep] [--no-backup] [--delete-bad-rows]
-#                                             只有在线修正时直接执行；需要停写时在一个窗口里
-#                                             （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
-#   duckport upgrade --finalize               删除重建留下的 <表>__pk_old
-#   duckport upgrade --rollback               把 <表>__pk_old 恢复为原表（停写）
+# 升级：服务端 → 插件 → 数据，升到仓库当前版本（或 --to 指定的 tag），可重复执行。
+#   sudo duckport upgrade [--yes] [--proxy URL] [--to vX.Y.Z] [--no-backup] [--delete-bad-rows]
+#       1 服务端：git pull（或 checkout tag）→ deploy.sh 取 v<版本> 的 binary（没有 release 时本机编译）
+#                 → binary 或运行中的版本变了就重启服务端，期间停 ingestor
+#       2 插件：每个实例从 registry 的来源重装；版本变了就重启（第 1 步停掉的在这里启动）
+#       3 数据：同 --data
+#   duckport upgrade --plan [--to vX.Y.Z]       三个阶段各会做什么，不修改（会 git fetch）
+#   sudo duckport upgrade --data [--yes] [--deep] [--no-backup] [--delete-bad-rows]
+#                                               只做第 3 步：只有在线修正时直接执行；需要停写时在一个窗口里
+#                                               （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
+#   sudo duckport upgrade --finalize            删除重建留下的 <表>__pk_old
+#   sudo duckport upgrade --rollback            把 <表>__pk_old 恢复为原表（停写）
+# --proxy 作用于 git、下载 release 和安装插件（uv）；本机的 gRPC 连接不走代理。
 # 磁盘或内存不够备份时给出警告，输入 go on without backup 才继续（--no-backup 跳过备份）。
 # 损坏或重复的行先列出样例，人工确认后才删除；--yes 不包括这一项（--delete-bad-rows 才包括）。
-# 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。可重复执行。
+# 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。
 cmd_upgrade() {
-  local mode="env" yes=0 no_backup=0 delete_bad=0 extra=()
+  local mode="full" yes=0 no_backup=0 delete_bad=0 after_pull=0 to="" proxy="" extra=()
+  local orig_args=("$@")
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --plan)     mode="plan" ;;
@@ -968,15 +976,171 @@ cmd_upgrade() {
       --no-backup) no_backup=1 ;;
       --delete-bad-rows) delete_bad=1 ;;
       --deep)     extra+=(--deep) ;;
+      --to)       to="${2:?--to 需要一个 tag，如 v1.2.0}"; shift ;;
+      --proxy)    proxy="${2:?--proxy 需要代理地址，如 http://localhost:1082}"; shift ;;
+      --after-pull) after_pull=1 ;;   # 内部使用：仓库已更新，由新的 CLI 继续
       *) echo -e "${RED}未知参数：$1${NC}"; exit 1 ;;
     esac
     shift
   done
-  if [[ "$mode" == "env" ]]; then
-    _upgrade_env
-    return
+  [[ -n "$proxy" ]] && _use_proxy "$proxy"
+
+  case "$mode" in
+    full)
+      _require_root
+      if [[ $after_pull -eq 0 ]]; then
+        _upgrade_repo
+        # 后面的步骤用刚更新的 CLI 和脚本执行
+        exec bash "$REPO_DIR/duckport" upgrade --after-pull ${orig_args[@]+"${orig_args[@]}"}
+      fi
+      _upgrade_server_and_plugins
+      echo -e "\n${BOLD}▶ 3/3 数据对齐${NC}"
+      mode="data"
+      ;;
+    plan)
+      _upgrade_plan_stages
+      echo -e "\n${BOLD}▶ 3/3 数据对齐${NC}（按当前状态估计；插件升级后，写入方版本过低造成的阻断会消失）"
+      ;;
+  esac
+  _upgrade_db
+}
+
+# 本次执行的网络代理（git、curl、uv）；本机地址不走代理（pyarrow 的 gRPC 也读这些变量）
+_use_proxy() {
+  export DUCKPORT_PROXY="$1"
+  export http_proxy="$1" https_proxy="$1" HTTP_PROXY="$1" HTTPS_PROXY="$1"
+  export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+  export NO_PROXY="$no_proxy"
+}
+
+_git_pull() {
+  local dir="$1" branch
+  branch=$(git -C "$dir" branch --show-current)
+  if git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    git -C "$dir" pull --ff-only
+  elif [[ -n "$branch" ]] && git -C "$dir" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}当前分支未设置 upstream，改用 origin/$branch${NC}"
+    git -C "$dir" pull --ff-only origin "$branch"
+  else
+    echo -e "  ${YELLOW}当前分支未设置 upstream，跳过 git pull，使用本地 checkout${NC}"
+  fi
+}
+
+_upgrade_repo() {
+  [[ -d "$REPO_DIR/.git" ]] || { echo -e "${RED}未找到仓库：$REPO_DIR${NC}"; exit 1; }
+  echo -e "\n${BOLD}▶ 更新仓库${NC} $REPO_DIR"
+  if [[ -n "$to" ]]; then
+    git -C "$REPO_DIR" fetch --tags origin
+    git -C "$REPO_DIR" -c advice.detachedHead=false checkout "$to"
+  else
+    _git_pull "$REPO_DIR"
+  fi
+}
+
+# 仓库（或某个 git 版本）里的 duckport-rs 版本号
+_repo_version() {
+  local rev="${1:-}"
+  if [[ -n "$rev" ]]; then
+    git -C "$REPO_DIR" show "$rev:Cargo.toml" 2>/dev/null
+  else
+    cat "$REPO_DIR/Cargo.toml"
+  fi | grep -m1 '^version = ' | cut -d'"' -f2
+}
+
+_md5() {
+  if [[ "$OS" == "Darwin" ]]; then md5 -q "$1" 2>/dev/null; else md5sum "$1" 2>/dev/null | cut -d' ' -f1; fi
+}
+
+# 等服务端监听并报告期望的版本（最多 120 秒）
+_wait_server() {
+  local port="$1" want="$2" i
+  for i in $(seq 1 120); do
+    if nc -z localhost "$port" 2>/dev/null && [[ "$(_server_version "$port")" == "$want" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+_upgrade_server_and_plugins() {
+  local want port before after running inst v0 v1 restart=()
+  want="${to#v}"
+  [[ -n "$want" ]] || want=$(_repo_version)
+  port=$(_server_port)
+
+  echo -e "\n${BOLD}▶ 1/3 服务端${NC}（目标 v${want}）"
+  before=$(_md5 "$DEPLOY_BIN/duckport-server")
+  DEPLOY_OPT="$DEPLOY_OPT" DUCKPORT_UNIT_PREFIX="$SVC_PREFIX" RELEASE_TAG="v${want}" bash "$REPO_DIR/deploy.sh"
+  after=$(_md5 "$DEPLOY_BIN/duckport-server")
+  running=$(_server_version "$port")
+  # 中途失败也要把停掉的 ingestor 拉起来
+  trap _start_stopped_ingestors EXIT
+  if [[ "$before" != "$after" || "$running" != "$want" ]]; then
+    echo -e "\n  重启服务端：${running:+v}${running:-未运行} → v${want}（先停 ingestor，插件升级后再启动）"
+    _stop_running_ingestors
+    _svc_stop "$SVC_SERVER"
+    _svc_start "$SVC_SERVER"
+    if ! _wait_server "$port" "$want"; then
+      echo -e "${RED}duckport-server 没有以 v${want} 启动（当前：$(_server_version "$port")），见 duckport logs server${NC}"
+      exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} duckport-server v${want} 已启动"
+  else
+    echo -e "  ${GREEN}✓${NC} 已是 v${want}，不需要重启"
   fi
 
+  echo -e "\n${BOLD}▶ 2/3 插件${NC}"
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    v0=$(_instance_version "$inst")
+    _update_instance "$inst"
+    v1=$(_instance_version "$inst")
+    echo -e "  $inst：v${v0:-?} → v${v1:-?}"
+    if [[ "$v0" != "$v1" && "$(_svc_is_active "$SVC_INGESTOR@$inst")" == "active" ]]; then
+      restart+=("$inst")
+    fi
+  done <<< "$(_list_instances)"
+  for inst in ${restart[@]+"${restart[@]}"}; do
+    _svc_stop "$SVC_INGESTOR@$inst"
+    _svc_start "$SVC_INGESTOR@$inst"
+    echo -e "  ${GREEN}✓${NC} restarted $inst"
+  done
+  _start_stopped_ingestors
+  trap - EXIT
+}
+
+_upgrade_plan_stages() {
+  local target want running port behind inst any=0
+  echo -e "${BOLD}▶ 1/3 服务端${NC}"
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    git -C "$REPO_DIR" fetch -q --tags origin 2>/dev/null || echo -e "  ${YELLOW}git fetch 失败，按本地仓库估计${NC}"
+    target="${to:-$(git -C "$REPO_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo HEAD)}"
+    want=$(_repo_version "$target")
+    behind=$(git -C "$REPO_DIR" rev-list --count "HEAD..$target" 2>/dev/null || echo "?")
+    echo -e "  仓库 $REPO_DIR：$(git -C "$REPO_DIR" rev-parse --short HEAD) → $target（${behind} 个新提交）"
+  else
+    want=$(_repo_version)
+    echo -e "  ${YELLOW}$REPO_DIR 不是 git 仓库，按当前文件估计${NC}"
+  fi
+  port=$(_server_port)
+  running=$(_server_version "$port")
+  if [[ "$running" == "$want" ]]; then
+    echo -e "  duckport-server v${running}：已是目标版本（binary 有变化时仍会重启）"
+  else
+    echo -e "  duckport-server v${running:-?（未运行）} → v${want:-?}：替换 binary 并重启，期间停 ingestor"
+  fi
+  echo -e "\n${BOLD}▶ 2/3 插件${NC}"
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    any=1
+    echo -e "  $inst（$(_instance_exec "$inst") v$(_instance_version "$inst")）：从 $(_instance_source "$inst") 重装，版本变化时重启"
+  done <<< "$(_list_instances)"
+  [[ $any -eq 1 ]] || echo -e "  （无已注册实例）"
+}
+
+# 数据阶段：--plan（数据部分）/ --data / --finalize / --rollback；用调用方的 mode、yes 等变量
+_upgrade_db() {
   local port py db inv run_id rc=0
   port=$(_server_port)
   py=$(_flight_python)
@@ -1112,28 +1276,6 @@ cmd_upgrade() {
   fi
 }
 
-_upgrade_env() {
-  _require_root
-  [[ -d "$REPO_DIR/.git" ]] || { echo -e "${RED}未找到仓库：$REPO_DIR${NC}"; exit 1; }
-  echo -e "${BOLD}升级环境...${NC}"
-
-  local branch upstream
-  branch=$(git -C "$REPO_DIR" branch --show-current)
-  if upstream=$(git -C "$REPO_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
-    git -C "$REPO_DIR" pull --ff-only
-  elif [[ -n "$branch" ]] && git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-    echo -e "  ${YELLOW}当前分支未设置 upstream，改用 origin/$branch${NC}"
-    git -C "$REPO_DIR" pull --ff-only origin "$branch"
-  else
-    echo -e "  ${YELLOW}当前分支未设置 upstream，跳过 git pull，使用本地 checkout 部署${NC}"
-  fi
-
-  bash "$REPO_DIR/deploy.sh"
-  echo -e "\n  ${YELLOW}环境已更新，如需生效：${NC}"
-  echo -e "  duckport restart"
-  echo -e "  ${YELLOW}重启后对齐数据：${NC}sudo duckport upgrade --plan，再 sudo duckport upgrade --data"
-}
-
 # ─── help ─────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1164,9 +1306,9 @@ ${BOLD}数据操作：${NC}
   duckport ${CYAN}doctor${NC} [--deep] [--json]         对照当前版本检查库的状态（只读）
 
 ${BOLD}维护：${NC}
-  duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
-  duckport ${CYAN}upgrade${NC} --plan                 数据对齐计划（只读）
-  duckport ${CYAN}upgrade${NC} --data [--yes]         执行数据对齐：在线修正，或停写窗口（先备份）+ 复检
+  duckport ${CYAN}upgrade${NC} [--proxy URL] [--to TAG] 升级：服务端 → 插件 → 数据对齐，可重复执行
+  duckport ${CYAN}upgrade${NC} --plan                 三个阶段的计划（只读）
+  duckport ${CYAN}upgrade${NC} --data [--yes]         只做数据对齐：在线修正，或停写窗口（先备份）+ 复检
                                        （--no-backup 不备份；磁盘或内存不够备份时会询问；
                                         损坏/重复的行需人工确认，--delete-bad-rows 直接确认）
   duckport ${CYAN}upgrade${NC} --finalize|--rollback  删除 / 恢复重建前的旧表
