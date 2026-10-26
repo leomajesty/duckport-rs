@@ -10,7 +10,7 @@
 
 ## 升级顺序
 
-必须先升级插件、再迁移表结构：旧插件的 `ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错，而新插件在带主键的旧表上同样能正确写入。
+必须先升级插件、再对齐数据（第 3 步会检查，旧插件还在写的表会阻断）：旧插件的 `ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错，而新插件在带主键的旧表上同样能正确写入。
 
 | | 表带主键（迁移前） | 表无主键（迁移后） |
 |---|---|---|
@@ -43,44 +43,47 @@ duckport status                   # 确认 watermark 继续推进
 
 回退：装回旧版本（第 3 步之前）。
 
-### 3. 迁移表结构（停写约 1 分钟 / 10 亿行）
+### 3. 对齐数据（停写约 1 分钟 / 10 亿行，加上备份时间）
 
-先做预检，不修改任何东西：
-
-```bash
-sudo duckport migrate nopk --plan
-```
-
-输出会列出带主键的业务表，标出哪些可以迁移（`ready`）、哪些因为写它的插件还没升级而跳过，并检查磁盘：迁移期间新旧两份数据同时存在，空闲空间需不小于库文件大小。
-
-建议先备份库文件（停服后复制 `duckport.db` 和 `duckport.db.wal`），然后执行：
+先看计划，不修改任何东西：
 
 ```bash
-sudo duckport migrate nopk
+sudo duckport upgrade --plan
 ```
 
-它会依次：停止正在运行的 ingestor → 对每张可迁移的表建一张同结构、无约束的新表，按月 `INSERT ... ORDER BY 时间列` 拷贝 → 核对行数 → 在一个事务里把原表改名为 `<表>__pk_old`、新表改为原名 → 删除废弃的 `data.retention_tasks` → CHECKPOINT → 启动 ingestor。
+它和 `duckport doctor` 做同样的检查（规则见 [升级对齐方案](http://192.168.9.20:8088/duckport-upgrade-reconcile-plan.html)），列出每项修正属于“在线”还是“停写”，以及停写窗口要做什么：带主键的业务表重建为无主键表、`exginfo` 去膨胀、删除废弃的 `data.retention_tasks` 和 `config_dict` 旧 key、隔离损坏的行等。写这张表的插件还是旧版本时会阻断，先完成第 2 步。
 
-- `exginfo` 一并重建：只拷贝有效行，带主键时累积的已删除行随之消失；`market` 不是普通标识符（超过 32 个字符等）的损坏行会被剔除。
-- 只想迁移部分表：`sudo duckport migrate nopk --tables usdt_perp_1m usdt_spot_1m`（`--plan --tables ...` 先看计划）。
-- 耗时参考（2026-10-26 在 pro.studio 库文件副本上实测，19.6 亿行、186 GB）：迁移共 130 秒（`usdt_perp_1m` 8.8 亿行 56 秒，`usdt_spot_1m` 10.7 亿行 72 秒，其余不到 2 秒）；迁移期间库文件临时涨到 273 GB。回退 2 秒，finalize 2 秒。迁移后 consumer 常用查询的耗时不变。
-- 迁移后数据按时间重新排序，数据部分比原来按 symbol/月导入的布局大 20%–28%（压缩率略低），但去掉了主键索引，整体占用从 71 万块降到 40.5 万块（约 99 GiB）。
+然后执行：
+
+```bash
+sudo duckport upgrade --data
+```
+
+需要停写时，所有修正在一个窗口里完成：停止正在运行的 ingestor（服务端不停）→ 备份 → 修正 → 启动 ingestor → 复检（必须与期望状态一致）。
+
+- **备份**：服务端用 `COPY FROM DATABASE` 把整个库复制到 `<库目录>/backup/duckport-<run_id>.db`，逐表核对行数后才开始修改。恢复：停服后用它替换 `duckport.db`（并删除 `duckport.db.wal`）。不带主键的表复制约 2 GB/s；带主键的表要在副本里重建索引，约 150 万行/秒，每行约需 100 字节内存。
+- **磁盘或内存不够备份**：计划里会给出警告（例如 pro.studio 升级前 19.6 亿行带主键，重建索引约需 196 GB 内存，远超 `memory_limit`）。`--data` 会要求输入 `go on without backup` 才继续；也可以直接加 `--no-backup`。不备份也能回退：重建时原表保留为 `<表>__pk_old`，删除的行都先导出到 `<库目录>/quarantine/<run_id>/*.parquet`。磁盘连重建都不够时直接阻断。
+- 重建：对每张表建一张同结构、无约束的新表，按月 `INSERT ... ORDER BY 时间列` 拷贝 → 核对行数 → 在一个事务里把原表改名为 `<表>__pk_old`、新表改为原名。
+- `exginfo` 一并重建：只拷贝有效行，带主键时累积的已删除行随之消失；`market` / `symbol` 不合规的损坏行先隔离再删除。
+- 每一步记入 `data.upgrade_log`（`run_id` 与备份、隔离目录同名）。中途失败可以直接再次执行，已对齐的部分会跳过。
+- 耗时参考（2026-10-26 在 pro.studio 库文件副本上实测，19.6 亿行、186 GB）：重建共 130 秒（`usdt_perp_1m` 8.8 亿行 56 秒，`usdt_spot_1m` 10.7 亿行 72 秒，其余不到 2 秒）；期间库文件临时涨到 273 GB。回退 2 秒，finalize 2 秒。重建后 consumer 常用查询的耗时不变。
+- 重建后数据按时间重新排序，数据部分比原来按 symbol/月导入的布局大 20%–28%（压缩率略低），但去掉了主键索引，整体占用从 71 万块降到 40.5 万块（约 99 GiB）。
 
 **回退**（第 4 步之前随时可以）：
 
 ```bash
-sudo duckport migrate nopk --rollback
+sudo duckport upgrade --rollback
 ```
 
-把 `<表>__pk_old` 恢复为原表，迁移后新写入的数据会按主键补回旧表（包括迁移时为空的表，以及回填到旧时间段的数据）；`exginfo` 用当前快照替换。新插件在带主键的表上也能正常写入，回退后不需要降级插件。
+把 `<表>__pk_old` 恢复为原表，重建后新写入的数据会按主键补回旧表（包括重建时为空的表，以及回填到旧时间段的数据）；`exginfo` 用当前快照替换。新插件在带主键的表上也能正常写入，回退后不需要降级插件。
 
 ### 4. 清理旧表（观察 24 小时后）
 
 ```bash
-sudo duckport migrate nopk --finalize
+sudo duckport upgrade --finalize
 ```
 
-删除所有 `<表>__pk_old` 并 CHECKPOINT（只删这些旧表，不需要停 ingestor）。释放的空间留给后续写入复用，库文件本身不会变小；主键索引占用的内存随之释放。要真正缩小文件见下面的“压缩库文件”（实测 186 GB → 100 GB）。
+删除所有 `<表>__pk_old` 并 CHECKPOINT（只删这些旧表，不需要停 ingestor）。释放的空间留给后续写入复用，库文件本身不会变小；主键索引占用的内存随之释放。要真正缩小文件见下面的“压缩库文件”（实测 186 GB → 100 GB）。确认无误后手动删除第 3 步的备份文件。
 
 ### 5. 开启 retention（按需）
 
@@ -100,9 +103,9 @@ duckport retention log
 
 第一次真删会处理全部积压历史。pro.studio 副本实测（保留 120 天）：dry-run 3.7 秒；真删 17.5 亿行、约 2000 天用时 17 分钟（其中约 13 分钟是批次间让出写连接的停顿），删除期间每 2 秒一次的实时写入 p50 17 ms、p99 383 ms、最长 841 ms；删完剩余 2.04 亿行只占约 10 GiB，其余块留作复用。各状态的含义见 [`deploy.md` 4.3](./deploy.md#43-数据保留retention)。
 
-## 在副本上演练迁移
+## 在副本上演练
 
-正式迁移前，用库文件副本演练一次，拿到准确耗时。在第 1、2 步之后做：这时 `/opt/duckport/bin/duckport-server` 已是 1.1.0，插件也已在 `data.config_dict` 登记 `write_mode`，副本里自然带着这些登记。
+正式执行第 3 步前，用库文件副本演练一次，拿到准确耗时。在第 1、2 步之后做：这时 `/opt/duckport/bin/duckport-server` 已是 1.1.0，插件也已在 `data.config_dict` 登记 `write_mode`，副本里自然带着这些登记。
 
 复制副本需要短暂停服，保证文件一致：停服时长约为“库文件大小 ÷ 磁盘复制速度”再加 1 分钟左右（服务端打出 shutdown complete 后，进程还要一段时间才退出并释放文件锁，`duckport stop` 会等它退出）。pro.studio 上 186 GB、1.7 GB/s，共停写约 3 分钟；ingestor 重启后自动补拉缺口。ext4 不支持 `cp --reflink`，只能完整复制。
 
@@ -119,8 +122,11 @@ DUCKPORT_DB_PATH=$PWD/duckport.db DUCKPORT_LISTEN_ADDR=127.0.0.1:50061 \
   DUCKPORT_DUCKDB_MEMORY_LIMIT=16GB /opt/duckport/bin/duckport-server > server.log 2>&1 &
 REHEARSAL_PID=$!                            # 记下它自己的 PID，不要用 pkill：命令行和线上进程完全一样
 PY=/opt/duckport/ingestors/<任一实例>/.venv/bin/python
-$PY <repo_dir>/scripts/migrate_nopk.py --addr 127.0.0.1:50061 --db-path $PWD/duckport.db plan
-time $PY <repo_dir>/scripts/migrate_nopk.py --addr 127.0.0.1:50061 --db-path $PWD/duckport.db migrate
+duckport_upgrade() {                        # 副本上没有在跑的 ingestor，直接调用对齐脚本
+  $PY <repo_dir>/scripts/upgrade.py --addr 127.0.0.1:50061 --db-path $PWD/duckport.db "$@"
+}
+duckport_upgrade plan
+time duckport_upgrade apply --levels online,stop            # 演练要测备份耗时就加 --backup
 
 # 收尾：停掉临时服务端，等进程真正退出（释放文件锁）后再删除副本
 kill -TERM $REHEARSAL_PID
@@ -150,7 +156,7 @@ sudo duckport start all          # 确认正常后再删除 .before-compact
 
 `aster-ingestor`、`binance-open-interest` 等第三方插件在作者按 [`ingestor-dev-guide.md` 附录](./ingestor-dev-guide.md#13-附录旧插件升级到无主键写法) 升级之前：
 
-- `duckport migrate nopk` 会跳过它们的表（未登记 `write_mode`），这些表保持原样；
+- `duckport upgrade` 不会给它们的表去主键（未登记 `write_mode`，只给提示），这些表保持原样；
 - retention 会跳过带主键的表（状态 `skipped_has_index`）。
 
 ## 全新部署

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """scripts/upgrade.py end-to-end test: a legacy database is brought to the desired state.
 
-Checks: blocked while plugins are old; online fixes, then the stop window; doctor clean
-afterwards; a second run does nothing; no row lost except the quarantined ones (which are
-in their parquet files); rollback restores the keyed tables; finalize removes them.
+Checks: blocked while plugins are old; online fixes, then the stop window with a backup
+taken first; doctor clean afterwards; a second run does nothing; no row lost except the
+quarantined ones (which are in their parquet files); rebuilt tables keep defaults and are
+stored in time order; rollback restores the keyed tables with every row written since;
+finalize removes the old tables and nothing else; not enough memory for the backup is
+reported (exit 5); a failed backup changes nothing.
 
 Prerequisites:
   DUCKPORT_DB_PATH=/tmp/upgrade.db cargo run --bin duckport-server    (fresh database)
@@ -17,15 +20,19 @@ import tempfile
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
 
-from reconcile_fixtures import NEW, OLD, SERVER, doctor, hr, legacy_state, reset, run_script, tx, unkeyed_with_duplicates
+from reconcile_fixtures import (
+    KLINE, NEW, OLD, SERVER, doctor, hr, legacy_state, reset, run_script, tx, unkeyed_with_duplicates,
+)
 
 QDIR = tempfile.mkdtemp(prefix="duckport-quarantine-")
+BDIR = tempfile.mkdtemp(prefix="duckport-backup-")
 STOPPED = NEW
 RUNNING = [dict(i, active=True) for i in NEW]
 
 
 def upgrade(instances, *args):
-    rc, out = run_script("upgrade.py", instances, "--bloat-min-dead-rows", "10000", "--quarantine-dir", QDIR, *args)
+    rc, out = run_script("upgrade.py", instances, "--bloat-min-dead-rows", "10000", "--quarantine-dir", QDIR,
+                         "--backup-dir", BDIR, *args)
     print(out)
     return rc, out
 
@@ -35,13 +42,19 @@ def scalar(client, sql):
     return t.column(0)[0].as_py()
 
 
-def keyed(client, table):
-    return scalar(client, "SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'data' "
-                          f"AND table_name = '{table}' AND constraint_type = 'PRIMARY KEY'") > 0
+def keyed(client, table, db="current_database()"):
+    return scalar(client, f"SELECT count(*) FROM duckdb_constraints() WHERE database_name = {db} "
+                          f"AND schema_name = 'data' AND table_name = '{table}' "
+                          "AND constraint_type = 'PRIMARY KEY'") > 0
 
 
 def count(client, table):
     return scalar(client, f"SELECT count(*) FROM {table}")
+
+
+def exists(client, table):
+    return scalar(client, f"SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'data' "
+                          f"AND table_name = '{table}'") == 1
 
 
 def quarantined(run_id, rule, table):
@@ -53,8 +66,17 @@ def main():
     client = flight.FlightClient(SERVER)
     legacy_state(client)
     unkeyed_with_duplicates(client)
-    # the market's duck_time lives only in config_dict (plugin first days): L2 must move it first
-    tx(client, "UPDATE data.watermark SET duck_time = NULL WHERE table_name = 'usdt_perp_1m'")
+    tx(client,
+       # the market's duck_time lives only in config_dict (plugin first days): L2 must move it first
+       "UPDATE data.watermark SET duck_time = NULL WHERE table_name = 'usdt_perp_1m'",
+       # a row from an earlier month written last: the rebuild must store rows in time order
+       "INSERT INTO data.usdt_perp_1m (open_time, symbol) VALUES (TIMESTAMP '2026-09-30 23:59', 'S0')",
+       # keyed and still empty when it is rebuilt; rows arrive afterwards
+       f"CREATE TABLE data.usdt_perp_5m ({KLINE}, PRIMARY KEY (open_time, symbol))",
+       # ordinary tables whose names merely end like the rebuild suffixes
+       "CREATE TABLE data.ab_pk_old (x INTEGER)", "INSERT INTO data.ab_pk_old VALUES (1)",
+       "CREATE TABLE data.orders_nopk (x INTEGER)", "INSERT INTO data.orders_nopk VALUES (2)")
+    n1m = count(client, "data.usdt_perp_1m")
 
     hr("old plugins: blocked, nothing changed")
     rc, out = upgrade(OLD, "plan")
@@ -62,17 +84,23 @@ def main():
     rc, _ = upgrade(OLD, "apply", "--run-id", "r0", "--levels", "online")
     assert rc == 2 and keyed(client, "usdt_perp_1m") and count(client, "data.retention_tasks") == 1
 
-    hr("plan with upgraded plugins: needs a stop window")
+    hr("plan with upgraded plugins: needs a stop window, backup planned")
     rc, out = upgrade(RUNNING, "plan")
-    assert rc == 4 and "停写窗口" in out, rc
+    assert rc == 4 and "停写窗口" in out and "备份到" in out, rc
+
+    hr("not enough memory to rebuild the indexes in a backup: exit 5")
+    limit = scalar(client, "SELECT current_setting('memory_limit')")
+    tx(client, "SET memory_limit = '1GB'")
+    rc, out = upgrade(RUNNING, "plan")
+    tx(client, f"SET memory_limit = '{limit}'")
+    assert rc == 5 and "内存不足以备份" in out, rc
 
     hr("online fixes while ingestors run")
     rc, _ = upgrade(RUNNING, "apply", "--run-id", "r1", "--levels", "online")
     assert rc == 0, rc
     assert scalar(client, "SELECT count(*) FROM duckdb_columns() WHERE table_name = 'watermark' "
                           "AND column_name = 'max_lag_seconds'") == 1
-    assert scalar(client, "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'retention_tasks'") == 0
-    assert quarantined("r1", "L1", "retention_tasks") == 1
+    assert not exists(client, "retention_tasks") and quarantined("r1", "L1", "retention_tasks") == 1
     assert scalar(client, "SELECT count(*) FROM data.config_dict WHERE ends_with(key, '_time')") == 0
     assert str(scalar(client, "SELECT duck_time FROM data.watermark WHERE table_name = 'usdt_perp_1m'")) \
         == "2026-10-26 02:00:00", "L2 moves the config_dict value into the empty watermark row"
@@ -83,22 +111,40 @@ def main():
     assert keyed(client, "usdt_perp_1m"), "rebuilds wait for the stop window"
     assert count(client, "main._staging_usdt_perp_1m") == 1, "staging is left alone while ingestors run"
 
-    hr("stop window (ingestors stopped)")
-    rc, out = upgrade(STOPPED, "plan")
-    assert rc == 4, rc
-    rc, _ = upgrade(STOPPED, "apply", "--run-id", "r1", "--levels", "online,stop")
+    hr("backup fails (file exists): nothing changed")
+    open(os.path.join(BDIR, "duckport-rx.db"), "w").close()
+    rc, out = upgrade(STOPPED, "apply", "--run-id", "rx", "--levels", "online,stop", "--backup")
+    assert rc == 1 and "备份失败" in out and keyed(client, "usdt_perp_1m"), rc
+    assert count(client, "main._staging_usdt_perp_1m") == 1
+
+    hr("stop window (ingestors stopped): backup, then fixes")
+    rc, _ = upgrade(STOPPED, "apply", "--run-id", "r1", "--levels", "online,stop", "--backup")
     assert rc == 0, rc
-    for t in ("usdt_perp_1m", "exginfo", "usdt_perp_funding"):
+    path = os.path.join(BDIR, "duckport-r1.db")
+    tx(client, f"ATTACH '{path}' AS bk (READ_ONLY)")
+    try:
+        assert count(client, "bk.data.usdt_perp_1m") == n1m and keyed(client, "usdt_perp_1m", "'bk'"), \
+            "the backup holds the state before the window"
+        assert count(client, "bk.main._staging_usdt_perp_1m") == 1
+    finally:
+        tx(client, "DETACH bk")
+    for t in ("usdt_perp_1m", "usdt_perp_5m", "exginfo", "usdt_perp_funding"):
         assert not keyed(client, t) and keyed(client, f"{t}__pk_old"), t
-    assert count(client, "data.usdt_perp_1m") == 600 and count(client, "data.exginfo") == 500
-    assert count(client, "data.usdt_perp_funding") == 1
+    assert count(client, "data.usdt_perp_1m") == n1m and count(client, "data.exginfo") == 500
+    assert count(client, "data.usdt_perp_funding") == 1 and count(client, "data.usdt_perp_5m") == 0
+    assert str(scalar(client, "SELECT open_time FROM data.usdt_perp_1m LIMIT 1")) == "2026-09-30 23:59:00", \
+        "rebuilt rows are stored in time order"
+    default = scalar(client, "SELECT column_default FROM duckdb_columns() WHERE table_name = 'exginfo' "
+                             "AND column_name = 'created_time'")
+    assert default and "CURRENT_TIMESTAMP" in default.upper(), default
     assert count(client, "main._staging_usdt_perp_1m") == 0 and quarantined("r1", "D3", "_staging_usdt_perp_1m") == 1
     assert str(scalar(client, "SELECT duck_time FROM data.watermark WHERE table_name = 'usdt_perp_funding'")) \
         == "2026-10-26 00:00:00", "D4 pulls the watermark back to the data"
     log = scalar(client, "SELECT count(*) FILTER (status = 'ok') || '/' || count(*) FROM data.upgrade_log "
                          "WHERE run_id = 'r1'")
     print("upgrade_log r1:", log)
-    assert log == "13/13", log  # S1 L2 L3 L1 D1 D2 B2 online; D3 B1x3 D5 D4 in the window
+    # online: S1 S2 L2 L3 L1 D1 D2 B2; window: BACKUP D3 B1x4 D5 D4
+    assert log == "16/16", log
     assert scalar(client, "SELECT detail FROM data.upgrade_log WHERE run_id = 'r1' AND rule = 'D4'") \
         == "duck_time 2026-11-30 00:00:00 → 2026-10-26 00:00:00"
 
@@ -111,22 +157,31 @@ def main():
     rc, _ = upgrade(STOPPED, "plan")
     assert rc == 0, rc
 
-    hr("rollback restores the keyed tables, rows written since kept")
-    tx(client, "INSERT INTO data.usdt_perp_1m SELECT TIMESTAMP '2026-10-26 02:00', 'S0', "
-               "1, 1, 1, 1, 1, 1, 1, 1, 1, 1")
+    hr("rollback restores the keyed tables with every row written since")
+    tx(client, "INSERT INTO data.usdt_perp_1m (open_time, symbol) VALUES (TIMESTAMP '2026-10-26 02:00', 'S0')",
+       # backfilled inside the old time range
+       "INSERT INTO data.usdt_perp_1m (open_time, symbol) VALUES (TIMESTAMP '2026-10-26 00:00:30', 'BACKFILL')",
+       "INSERT INTO data.usdt_perp_5m (open_time, symbol) VALUES (TIMESTAMP '2026-10-26', 'A'), "
+       "(TIMESTAMP '2026-10-26 00:05', 'A')",
+       "DELETE FROM data.exginfo WHERE symbol = 'S0'")
     rc, _ = upgrade(STOPPED, "rollback", "--run-id", "r2")
     assert rc == 0, rc
-    assert keyed(client, "usdt_perp_1m") and count(client, "data.usdt_perp_1m") == 601
+    assert keyed(client, "usdt_perp_1m") and count(client, "data.usdt_perp_1m") == n1m + 2
+    assert keyed(client, "usdt_perp_5m") and count(client, "data.usdt_perp_5m") == 2, \
+        "rows written into a table that was empty at the rebuild were lost"
+    assert keyed(client, "exginfo") and count(client, "data.exginfo") == 499, "snapshot replaced by the current one"
     assert scalar(client, "SELECT count(*) FROM duckdb_tables() WHERE ends_with(table_name, '__pk_old')") == 0
+    assert count(client, "data.ab_pk_old") == 1 and count(client, "data.orders_nopk") == 1, "decoy touched"
 
-    hr("upgrade again, then finalize")
+    hr("upgrade again (no backup), then finalize")
     rc, _ = upgrade(STOPPED, "apply", "--run-id", "r3", "--levels", "online,stop")
     assert rc == 0, rc
     rc, _ = upgrade(STOPPED, "finalize", "--run-id", "r3")
     assert rc == 0, rc
     rc, f = doctor(NEW)
     assert rc == 0 and not [x for x in f if x["rule"] == "C1"], f
-    assert count(client, "data.usdt_perp_1m") == 601 and not keyed(client, "usdt_perp_1m")
+    assert count(client, "data.usdt_perp_1m") == n1m + 2 and not keyed(client, "usdt_perp_1m")
+    assert exists(client, "ab_pk_old") and exists(client, "orders_nopk"), "finalize dropped a decoy table"
 
     reset(client)
     print("\nALL UPGRADE TESTS PASSED")

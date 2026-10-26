@@ -418,15 +418,6 @@ PYEOF
   fi
   "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>/dev/null \
     || echo -e "  ${DIM}无法读取 data.retention_policy（服务端版本低于 1.1.0？）${NC}"
-
-  echo -e "\n${BOLD}数据对齐${NC}"
-  local inv doctor_rc=0
-  inv=$(mktemp)
-  _instances_json "$inv"
-  "$status_py" "$REPO_DIR/scripts/doctor.py" --addr "127.0.0.1:$server_port" --instances-file "$inv" --summary 2>/dev/null \
-    || doctor_rc=$?
-  [[ $doctor_rc -eq 3 ]] && echo -e "  ${DIM}检查失败，运行 duckport doctor 查看原因${NC}"
-  rm -f "$inv"
   echo ""
 }
 
@@ -484,87 +475,6 @@ _start_stopped_ingestors() {
     echo -e "  ${GREEN}✓${NC} started $inst"
   done
   STOPPED_INGESTORS=()
-}
-
-# ─── migrate ──────────────────────────────────────────────────────────────────
-
-# 把带主键的业务表重建为无主键表（retention 才能回收空间）。
-#   duckport migrate nopk [--yes] [--tables t1 t2]   预检 → 停 ingestor → 迁移 → 启动 ingestor
-#   duckport migrate nopk --plan                      只预检，不修改
-#   duckport migrate nopk --finalize                  删除迁移留下的 <表>__pk_old
-#   duckport migrate nopk --rollback                  把 <表>__pk_old 恢复为原表
-cmd_migrate() {
-  local what="${1:-}"
-  shift || true
-  [[ "$what" == "nopk" ]] || { echo -e "${RED}用法：duckport migrate nopk [--plan|--finalize|--rollback] [--yes] [--tables ...]${NC}"; exit 1; }
-
-  local mode="migrate" yes=0 tables=()
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --plan)     mode="plan" ;;
-      --finalize) mode="finalize" ;;
-      --rollback) mode="rollback" ;;
-      --yes|-y)   yes=1 ;;
-      --tables)   shift; while [[ $# -gt 0 && "$1" != --* ]]; do tables+=("$1"); shift; done; continue ;;
-      *) echo -e "${RED}未知参数：$1${NC}"; exit 1 ;;
-    esac
-    shift
-  done
-
-  if [[ ${#tables[@]} -gt 0 && "$mode" != "migrate" && "$mode" != "plan" ]]; then
-    echo -e "${RED}--tables 只能用于迁移和 --plan${NC}"; exit 1
-  fi
-
-  local port py db script
-  port=$(_server_port)
-  py=$(_flight_python)
-  db=$(_server_env DUCKPORT_DB_PATH)
-  script="$REPO_DIR/scripts/migrate_nopk.py"
-  nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
-  local base=("$py" "$script" --addr "127.0.0.1:$port" --db-path "$db")
-  # 子命令必须在 --tables 之前：--tables 会吞掉其后的所有参数
-  local table_args=()
-  [[ ${#tables[@]} -gt 0 ]] && table_args=(--tables "${tables[@]}")
-
-  if [[ "$mode" == "plan" ]]; then
-    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"}
-    return
-  fi
-  _require_root
-
-  if [[ "$mode" == "finalize" ]]; then
-    # 只删除 <表>__pk_old，ingestor 不会写这些表，不需要停写
-    "${base[@]}" finalize
-    return
-  fi
-
-  if [[ "$mode" == "migrate" ]]; then
-    "${base[@]}" plan ${table_args[@]+"${table_args[@]}"} \
-      || { echo -e "\n${RED}预检未通过，未做任何修改${NC}"; exit 1; }
-    echo -e "\n${YELLOW}迁移期间会停止所有 ingestor。建议先备份库文件：${db}${NC}"
-    if [[ $yes -ne 1 ]]; then
-      read -r -p "继续？[y/N] " ans
-      [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
-    fi
-  fi
-
-  # 改名期间不能有写入：先停掉正在运行的 ingestor，结束后按原状态拉起
-  trap _start_stopped_ingestors EXIT
-  _stop_running_ingestors
-
-  local rc=0
-  if [[ "$mode" == "migrate" ]]; then
-    "${base[@]}" migrate ${table_args[@]+"${table_args[@]}"} || rc=$?
-  else
-    "${base[@]}" "$mode" || rc=$?
-  fi
-
-  _start_stopped_ingestors
-  trap - EXIT
-  if [[ $rc -ne 0 ]]; then
-    echo -e "${RED}${mode} 失败（exit=$rc）。已迁移的表保留为 <表>__pk_old，可执行 duckport migrate nopk --rollback${NC}"
-  fi
-  return $rc
 }
 
 # ─── start / stop / restart ───────────────────────────────────────────────────
@@ -1038,12 +948,15 @@ except: pass
 # 升级。
 #   duckport upgrade                          git pull + deploy.sh（替换服务端 binary，不重启）
 #   duckport upgrade --plan [--deep]          对照当前版本的期望状态列出修正计划，不修改
-#   duckport upgrade --data [--yes] [--deep]  在线修正 → 停写窗口（只停 ingestor）→ 复检
+#   duckport upgrade --data [--yes] [--deep] [--no-backup]
+#                                             只有在线修正时直接执行；需要停写时在一个窗口里
+#                                             （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
 #   duckport upgrade --finalize               删除重建留下的 <表>__pk_old
 #   duckport upgrade --rollback               把 <表>__pk_old 恢复为原表（停写）
+# 磁盘或内存不够备份时给出警告，输入 go on without backup 才继续（--no-backup 跳过备份）。
 # 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。可重复执行。
 cmd_upgrade() {
-  local mode="env" yes=0 extra=()
+  local mode="env" yes=0 no_backup=0 extra=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --plan)     mode="plan" ;;
@@ -1051,6 +964,7 @@ cmd_upgrade() {
       --finalize) mode="finalize" ;;
       --rollback) mode="rollback" ;;
       --yes|-y)   yes=1 ;;
+      --no-backup) no_backup=1 ;;
       --deep)     extra+=(--deep) ;;
       *) echo -e "${RED}未知参数：$1${NC}"; exit 1 ;;
     esac
@@ -1076,7 +990,7 @@ cmd_upgrade() {
       _instances_json "$inv"
       "${base[@]}" plan || rc=$?
       rm -f "$inv"
-      [[ $rc -eq 4 ]] && rc=1   # 对外：0 已对齐，1 有待修正，2 阻断，3 失败
+      [[ $rc -eq 4 || $rc -eq 5 ]] && rc=1   # 对外：0 已对齐，1 有待修正，2 阻断，3 失败
       return $rc
       ;;
     finalize)
@@ -1108,26 +1022,41 @@ cmd_upgrade() {
   "${base[@]}" plan || plan_rc=$?
   case $plan_rc in
     0) echo -e "\n${GREEN}✓ 已与期望状态一致，无需修改${NC}"; rm -f "$inv"; return 0 ;;
-    1|4) ;;
+    1|4|5) ;;
     *) rm -f "$inv"; return $plan_rc ;;
   esac
-  if [[ $plan_rc -eq 4 ]]; then
-    echo -e "\n${YELLOW}停写窗口会停止所有 ingestor（服务端不停）。建议先备份库文件：${db}${NC}"
+  local window=0 backup_args=(--backup)
+  [[ $plan_rc -ge 4 ]] && window=1
+  if [[ $window -eq 1 && $no_backup -eq 1 ]]; then
+    backup_args=()
+    echo -e "\n${YELLOW}--no-backup：停写窗口里不做备份${NC}"
+  elif [[ $plan_rc -eq 5 ]]; then
+    backup_args=()
+    echo -e "\n${YELLOW}⚠ 磁盘或内存不足，无法在停写窗口里备份（原因见上）。${NC}"
+    echo -e "${YELLOW}  不备份也能回退：重建的表保留为 <表>__pk_old，删除的行导出在 quarantine 目录。${NC}"
+    read -r -p "确认不备份继续，请输入 go on without backup：" ans
+    [[ "$ans" == "go on without backup" ]] || { echo "已取消"; rm -f "$inv"; exit 0; }
+    yes=1
   fi
   if [[ $yes -ne 1 ]]; then
+    if [[ $window -eq 1 ]]; then
+      echo -e "\n${YELLOW}停写窗口会停止所有 ingestor（服务端不停）。${NC}"
+    fi
     read -r -p "执行？[y/N] " ans
     [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消"; rm -f "$inv"; exit 0; }
   fi
 
   local failed=0
-  echo -e "\n${BOLD}在线修正${NC}"
-  "${base[@]}" apply --levels online || failed=1
-  if [[ $plan_rc -eq 4 ]]; then
+  if [[ $window -eq 0 ]]; then
+    echo -e "\n${BOLD}在线修正${NC}"
+    "${base[@]}" apply --levels online || failed=1
+  else
+    # 备份要在任何修改之前完成，所以在线修正也放进窗口
     echo -e "\n${BOLD}停写窗口${NC}"
     trap _start_stopped_ingestors EXIT
     _stop_running_ingestors
     _instances_json "$inv"
-    "${base[@]}" apply --levels online,stop || failed=1
+    "${base[@]}" apply --levels online,stop ${backup_args[@]+"${backup_args[@]}"} || failed=1
     _start_stopped_ingestors
     trap - EXIT
   fi
@@ -1143,8 +1072,11 @@ cmd_upgrade() {
     return 1
   fi
   echo -e "\n${GREEN}✓ 对齐完成${NC}（run_id=${run_id}）"
-  if [[ $plan_rc -eq 4 ]]; then
+  if [[ $window -eq 1 ]]; then
     echo -e "  确认 ingestor 写入正常后：sudo duckport upgrade --finalize（删除 <表>__pk_old）；有问题：--rollback"
+    if [[ ${#backup_args[@]} -gt 0 ]]; then
+      echo -e "  备份：$(dirname "$db")/backup/duckport-${run_id}.db（恢复：停服后替换 ${db}，删除 ${db}.wal）；不再需要时手动删除"
+    fi
   fi
 }
 
@@ -1197,13 +1129,13 @@ ${BOLD}数据操作：${NC}
   duckport ${CYAN}retention${NC} disable <表>          停用某张表的策略
   duckport ${CYAN}retention${NC} dry-run|run [表]      立即执行（dry-run 只统计不删除）
   duckport ${CYAN}retention${NC} log [表]              执行日志
-  duckport ${CYAN}migrate${NC} nopk [--plan]           业务表去主键（--finalize 清理旧表，--rollback 回退）
   duckport ${CYAN}doctor${NC} [--deep] [--json]         对照当前版本检查库的状态（只读）
 
 ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC}                        git pull + 重新配置环境
   duckport ${CYAN}upgrade${NC} --plan                 数据对齐计划（只读）
-  duckport ${CYAN}upgrade${NC} --data [--yes]         执行数据对齐：在线修正 + 停写窗口 + 复检
+  duckport ${CYAN}upgrade${NC} --data [--yes]         执行数据对齐：在线修正，或停写窗口（先备份）+ 复检
+                                       （--no-backup 不备份；磁盘或内存不够备份时会询问）
   duckport ${CYAN}upgrade${NC} --finalize|--rollback  删除 / 恢复重建前的旧表
 
 ${BOLD}示例：${NC}
@@ -1236,7 +1168,6 @@ case "$CMD" in
   loadhist) cmd_loadhist "${1:-}" ;;
   retention) cmd_retention "$@" ;;
   doctor)   cmd_doctor "$@" ;;
-  migrate)  cmd_migrate "$@" ;;
   upgrade)  cmd_upgrade "$@" ;;
   help|-h|--help) cmd_help ;;
   *) echo -e "${RED}未知命令：$CMD${NC}"; cmd_help; exit 1 ;;

@@ -5,7 +5,6 @@ Each rule yields Findings. A finding's level says how it would be fixed:
   stop   - fixed inside one write-stop window (ingestors stopped)
   online - fixed while everything runs
   hint   - reported only
-Rules marked slow scan table data and are skipped by `doctor --summary`.
 The fixes for these findings live in reconcile.fixes and reuse the conditions below.
 """
 
@@ -45,21 +44,19 @@ class Options:
     free_ratio: float = 0.4
 
 
-RULES: List[tuple] = []  # (id, slow, func)
+RULES: List[tuple] = []  # (id, func)
 
 
-def rule(rule_id: str, slow: bool = False):
+def rule(rule_id: str):
     def wrap(fn: Callable[[State, object, Options], Iterable[Finding]]):
-        RULES.append((rule_id, slow, fn))
+        RULES.append((rule_id, fn))
         return fn
     return wrap
 
 
-def run_rules(state: State, dp, opts: Options, include_slow: bool = True) -> List[Finding]:
+def run_rules(state: State, dp, opts: Options) -> List[Finding]:
     findings: List[Finding] = []
-    for rule_id, slow, fn in RULES:
-        if slow and not include_slow:
-            continue
+    for rule_id, fn in RULES:
         try:
             findings.extend(fn(state, dp, opts))
         except Exception as e:  # one broken check must not hide the others
@@ -284,7 +281,7 @@ def is_bloated(physical, live, opts):
     return physical - live >= opts.bloat_min_dead_rows and physical > opts.bloat_ratio * max(live, 1)
 
 
-@rule("D1", slow=True)
+@rule("D1")
 def bad_strings(state, dp, opts):
     for t in state.business_tables():
         spec = state.spec(t.name)
@@ -298,7 +295,7 @@ def bad_strings(state, dp, opts):
                           "导出到隔离文件后删除")
 
 
-@rule("D2", slow=True)
+@rule("D2")
 def duplicate_keys(state, dp, opts):
     for t in state.business_tables():
         spec = state.spec(t.name)
@@ -352,7 +349,7 @@ def watermark_vs_data(state, dp, opts):
                           f"最新数据 {latest} 晚于 watermark.duck_time={duck}（loadhist 未同步水位？）")
 
 
-@rule("D5", slow=True)
+@rule("D5")
 def bloat(state, dp, opts):
     for t in state.business_tables():
         physical, live = storage_rows(dp, t)

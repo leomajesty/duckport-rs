@@ -5,7 +5,6 @@ Read-only. Usually run through `duckport doctor`, which also passes the installe
 instances so plugin versions and table states can be checked against each other.
 
     doctor.py --addr 127.0.0.1:50051 [--instances-file f.json] [--deep] [--json]
-    doctor.py ... --summary          # one line for `duckport status`; skips slow checks
 
 Exit code: 0 nothing to do (hints only), 1 something to fix, 2 blocked, 3 doctor failed.
 """
@@ -42,23 +41,6 @@ def exit_code(findings):
     return 0
 
 
-def summary_line(findings):
-    counts = {lvl: sum(1 for f in findings if f.level == lvl) for lvl in LEVELS}
-    todo = counts["stop"] + counts["online"]
-    if not todo and not counts["block"]:
-        text = "\033[0;32m✓ 与期望状态一致\033[0m"
-    else:
-        parts = []
-        if counts["block"]:
-            parts.append(f"\033[0;31m{counts['block']} 项阻断\033[0m")
-        if todo:
-            parts.append(f"\033[1;33m{todo} 项待对齐\033[0m（停写 {counts['stop']}、在线 {counts['online']}）")
-        text = "，".join(parts)
-    if counts["hint"]:
-        text += f"  \033[2m{counts['hint']} 条提示\033[0m"
-    return f"  {text}  \033[2m(快速检查；详情 duckport doctor)\033[0m"
-
-
 def print_report(state, findings):
     print(f"duckport-server v{state.server_version}")
     if state.instances:
@@ -82,7 +64,6 @@ def main():
     ap.add_argument("--addr", default="127.0.0.1:50051")
     ap.add_argument("--instances-file", default="")
     ap.add_argument("--deep", action="store_true", help="scan whole tables for duplicate keys")
-    ap.add_argument("--summary", action="store_true", help="one line, skip slow checks")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--bloat-min-dead-rows", type=int, default=Options.bloat_min_dead_rows)
     args = ap.parse_args()
@@ -90,15 +71,13 @@ def main():
         dp = Duckport(args.addr)
         state = collect(dp, load_instances(args.instances_file))
         opts = Options(deep=args.deep, bloat_min_dead_rows=args.bloat_min_dead_rows)
-        findings = run_rules(state, dp, opts, include_slow=not args.summary)
+        findings = run_rules(state, dp, opts)
     except (pa.ArrowException, OSError) as e:
         print(f"doctor failed: {str(e).splitlines()[0]}", file=sys.stderr)
         return 3
     if args.json:
         print(json.dumps({"server_version": state.server_version, "exit_code": exit_code(findings),
                           "findings": [f.to_dict() for f in findings]}, ensure_ascii=False, indent=1))
-    elif args.summary:
-        print(summary_line(findings))
     else:
         print_report(state, findings)
     return exit_code(findings)

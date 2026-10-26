@@ -11,13 +11,13 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
-import migrate_nopk
 from duckport_flight import lit, text
+from reconcile import rebuild
 from reconcile.rules import Finding, Options, bad_string_condition, dup_scope, is_bloated, storage_rows
 from reconcile.specs import (
-    RETIRED_CONFIG_KEYS, SYSTEM_COLUMN_DEFAULTS, SYSTEM_DDL, SYSTEM_TABLES, UPGRADE_LOG_DDL,
+    RETIRED_CONFIG_KEYS, SYSTEM_COLUMN_DEFAULTS, SYSTEM_DDL, SYSTEM_TABLES,
 )
 from reconcile.state import State, q_ident
 
@@ -60,7 +60,6 @@ def actionable(findings: List[Finding], levels) -> List[Finding]:
 
 
 def apply(ctx: Context, state: State, findings: List[Finding], levels) -> List[Result]:
-    ctx.dp.execute(UPGRADE_LOG_DDL)
     results = []
     for f in actionable(findings, levels):
         started = datetime.now()
@@ -223,12 +222,6 @@ def fix_staging(ctx, state, f):
 
 def _rebuild(ctx, state, table) -> int:
     """Copy `table` into a constraint-free twin and swap; the original stays as <table>__pk_old."""
-    names = {r["table_name"] for r in ctx.dp.query(
-        "SELECT table_name FROM duckdb_tables() WHERE schema_name = 'data'")}
-    if table + migrate_nopk.OLD_SUFFIX in names:
-        raise RuntimeError(f"{table}{migrate_nopk.OLD_SUFFIX} 已存在，先 finalize 或 rollback")
-    if table + migrate_nopk.NEW_SUFFIX in names:  # an interrupted copy; the original is intact
-        ctx.dp.execute(f"DROP TABLE data.{q_ident(table + migrate_nopk.NEW_SUFFIX)}")
     spec = state.spec(table)
     if spec:
         time_col = spec.time_column
@@ -236,26 +229,26 @@ def _rebuild(ctx, state, table) -> int:
         time_col = (state.watermark.get(table) or {}).get("time_column")
         if time_col not in state.tables[table].columns:
             time_col = None
-    return migrate_nopk.copy_table(ctx.dp, table, time_col)
+    return rebuild.copy_table(ctx.dp, table, time_col)
 
 
 @fix("B1")
 def fix_primary_key(ctx, state, f):
     n = _rebuild(ctx, state, f.target)
-    return n, f"已重建为无主键表（{n:,} 行），原表保留为 {f.target}{migrate_nopk.OLD_SUFFIX}"
+    return n, f"已重建为无主键表（{n:,} 行），原表保留为 {f.target}{rebuild.OLD_SUFFIX}"
 
 
 @fix("D5")
 def fix_bloat(ctx, state, f):
     t = _table(state, f.target)
-    if migrate_nopk.has_key(ctx.dp, t.name):
+    if rebuild.has_key(ctx.dp, t.name):
         return 0, "跳过：带主键，由 B1 重建"
     physical, live = storage_rows(ctx.dp, t)
     if not is_bloated(physical, live, ctx.opts):
         return 0, "已不再膨胀（同一窗口里已重建）"
     n = _rebuild(ctx, state, t.name)
     # Same rows, no constraints changed: nothing to roll back to, so free the space now.
-    ctx.dp.execute(f"DROP TABLE data.{q_ident(t.name + migrate_nopk.OLD_SUFFIX)}")
+    ctx.dp.execute(f"DROP TABLE data.{q_ident(t.name + rebuild.OLD_SUFFIX)}")
     return n, f"已重建（物理 {physical:,} 行 → {n:,} 行）"
 
 
@@ -286,18 +279,3 @@ def fix_columns(ctx, state, f):
         added.append(col)
     return 0, "已补列：" + ", ".join(added)
 
-
-def stop_window_estimate(state: State, findings: List[Finding]) -> Tuple[int, float]:
-    """(rows to copy, seconds) for the rebuilds in a stop window; ~18M rows/s measured on pro.studio."""
-    rows = sum(state.tables[f.target].estimated_size for f in findings
-               if f.rule in ("B1", "D5") and f.level == "stop" and f.target in state.tables)
-    return rows, 10 + rows / 18e6
-
-
-def rebuild_space_needed(state: State, findings: List[Finding], db_bytes: int) -> Optional[int]:
-    """Rough extra disk bytes the rebuilds need: their share of the database file."""
-    rows, _ = stop_window_estimate(state, findings)
-    total = sum(t.estimated_size for t in state.tables.values())
-    if not rows or not total or not db_bytes:
-        return None
-    return int(db_bytes * min(1.0, rows / total) * 1.2)

@@ -189,9 +189,8 @@ duckport logs binance-5m            # Tail logs in real time
 duckport loadhist binance-5m        # Backfill historical data
 duckport retention set usdt_perp_1m 120   # Keep only the last 120 days (needs DUCKPORT_RETENTION_ENABLED=true)
 duckport retention status           # Retention policies and the latest run
-sudo duckport migrate nopk --plan   # 1.1.0 upgrade: list business tables that still carry a primary key (see upgrade-1.1.md)
 sudo duckport doctor                # read-only: compare database, system tables and plugin versions with this release's desired state (--deep, --json)
-sudo duckport upgrade --plan        # data alignment plan; --data applies it (online fixes + stop window + recheck), --finalize / --rollback
+sudo duckport upgrade --plan        # data alignment plan (read-only); --data applies it (backup first when a stop window is needed), --finalize / --rollback; see upgrade-1.1.md
 ```
 
 ### Local Development

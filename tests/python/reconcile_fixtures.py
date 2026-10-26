@@ -23,8 +23,9 @@ FUNDING = "funding_time TIMESTAMP, symbol VARCHAR, funding_rate DOUBLE, mark_pri
 NEW = [{"instance": "bn1m", "exec": "binance-ingestor", "version": "0.2.0", "active": False},
        {"instance": "binance-funding", "exec": "binance-funding", "version": "0.2.0", "active": False}]
 OLD = [dict(NEW[0], version="0.1.0"), dict(NEW[1], version="0.1.0")]
-TABLES = ("usdt_perp_1m", "usdt_spot_1m", "usdt_perp_funding", "exginfo", "retention_tasks",
-          "usdt_perp_1m__pk_old", "usdt_perp_1m__nopk", "exginfo__pk_old", "usdt_perp_funding__pk_old", "upgrade_log")
+TABLES = ("usdt_perp_1m", "usdt_spot_1m", "usdt_perp_5m", "usdt_perp_funding", "exginfo", "retention_tasks",
+          "usdt_perp_1m__pk_old", "usdt_perp_1m__nopk", "usdt_perp_5m__pk_old", "exginfo__pk_old",
+          "usdt_perp_funding__pk_old", "ab_pk_old", "orders_nopk", "upgrade_log")
 
 
 def hr(title):

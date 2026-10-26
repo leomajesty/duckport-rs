@@ -8,7 +8,7 @@ Prerequisites:
 import pyarrow.flight as flight
 
 from reconcile_fixtures import (
-    NEW, OLD, SERVER, doctor, has, hr, legacy_state, reset, run_script, target_state, tx, unkeyed_with_duplicates,
+    NEW, OLD, SERVER, doctor, has, hr, legacy_state, reset, target_state, tx, unkeyed_with_duplicates,
 )
 
 
@@ -38,10 +38,8 @@ def main():
         assert has(f, rule, level, target), (rule, level, target)
     assert not has(f, "V3", "block"), "keyed tables are compatible with old writers"
 
-    hr("summary line skips slow checks")
-    rc, out = run_script("doctor.py", NEW, "--summary")
-    print(out)
-    assert rc == 2 and "阻断" in out, (rc, out)  # usdt_perp_1m__pk_old blocks a second rebuild
+    rc, f = doctor(NEW)
+    assert rc == 2 and has(f, "B1", "block", "usdt_perp_1m"), "usdt_perp_1m__pk_old blocks a second rebuild"
 
     hr("table without a key written by an old plugin: V3 blocks")
     unkeyed_with_duplicates(client)

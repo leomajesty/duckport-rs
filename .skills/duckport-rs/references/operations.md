@@ -37,8 +37,14 @@ duckport logs all
 duckport config <instance>
 duckport install binance_ingestor
 duckport loadhist <instance>
-duckport upgrade
+duckport upgrade                   # git pull + deploy.sh
+duckport doctor                    # read-only: database vs. this release's desired state
+sudo duckport upgrade --plan       # what upgrade --data would change (read-only)
+sudo duckport upgrade --data       # apply; one stop window (ingestors only), backup first
+sudo duckport upgrade --finalize   # drop <table>__pk_old after the rebuild looks fine (--rollback undoes it)
 ```
+
+`upgrade --data` warns when disk or memory is too small for the backup and continues only after the operator types `go on without backup` (or passes `--no-backup`).
 
 `duckport loadhist <instance>` is preferred over manual loadhist because loadhist and the matching ingestor must not run concurrently.
 
@@ -133,4 +139,4 @@ duckport retention run [table]         # deletes now (ignores DUCKPORT_RETENTION
 duckport retention status | log [table]
 ```
 
-The scheduler runs only with `DUCKPORT_RETENTION_ENABLED=true` and deletes only with `DUCKPORT_RETENTION_DRY_RUN=false`. Tables with a PRIMARY KEY / UNIQUE / index are skipped (`skipped_has_index`); rebuild them with `sudo duckport migrate nopk` (see `upgrade-1.1.md`).
+The scheduler runs only with `DUCKPORT_RETENTION_ENABLED=true` and deletes only with `DUCKPORT_RETENTION_DRY_RUN=false`. Tables with a PRIMARY KEY / UNIQUE / index are skipped (`skipped_has_index`); rebuild them with `sudo duckport upgrade --data` (see `upgrade-1.1.md`).

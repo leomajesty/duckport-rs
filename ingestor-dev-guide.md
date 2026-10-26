@@ -230,7 +230,7 @@ self.execute_transaction([
 
 ### 5.3 登记写入方式
 
-`duckport migrate nopk`（把旧库的业务表重建为无主键表）只迁移已登记的表，因为旧写法 `INSERT ... ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错。插件在 `init_schema` 中为自己负责的每张业务表登记一次：
+`duckport upgrade --data`（把旧库对齐到当前版本，其中包括把业务表重建为无主键表）只对确认写入方已改用 anti-join 的表去主键，因为旧写法 `INSERT ... ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错。内置插件按安装版本判断；第三方插件靠这条登记。插件在 `init_schema` 中为自己负责的每张业务表登记一次：
 
 ```python
 f"INSERT OR REPLACE INTO {s}.config_dict (key, value) VALUES ('write_mode:{target}', 'anti_join')"
@@ -281,7 +281,7 @@ def init_schema(self, markets, interval, data_sources, start_date=None):
             # 业务表不建 PRIMARY KEY / UNIQUE / 索引，去重见第 6 节
             f"CREATE TABLE IF NOT EXISTS {s}.{target} (open_time TIMESTAMP, symbol VARCHAR, ...)",
             f"CREATE TABLE IF NOT EXISTS _staging_{target} (...)",
-            # 登记写入方式，duckport migrate nopk 据此判断这张表可以去主键
+            # 登记写入方式，duckport upgrade 据此判断这张表可以去主键
             f"INSERT OR REPLACE INTO {s}.config_dict (key, value) VALUES ('write_mode:{target}', 'anti_join')",
             # data.watermark 由 duckport-rs 创建；插件只 upsert 自己负责的业务表行
             f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
@@ -637,9 +637,9 @@ PROXY_URL=
 
 ```bash
 sudo duckport update <实例>           # 升级插件并重启，新插件启动时完成登记
-sudo duckport migrate nopk --plan     # 预检：列出可迁移和被跳过的表
-sudo duckport migrate nopk            # 停 ingestor → 重建表 → 启动 ingestor
-sudo duckport migrate nopk --finalize # 观察无误后删除旧表（之前可用 --rollback 回退）
+sudo duckport upgrade --plan          # 只读：列出要做的修正，写入方还是旧插件的表会阻断
+sudo duckport upgrade --data          # 停 ingestor → 备份 → 重建表等修正 → 启动 ingestor → 复检
+sudo duckport upgrade --finalize      # 观察无误后删除旧表（之前可用 --rollback 回退）
 ```
 
 | | 表带主键（迁移前） | 表无主键（迁移后） |
