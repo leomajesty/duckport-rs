@@ -15,7 +15,7 @@ use crate::access::DoGetLimits;
 use crate::backend::Backend;
 use crate::read_limit::{self, recover_status};
 
-use super::DuckportStream;
+use super::{truncate_for_log, DuckportStream};
 
 const QUERY_CHANNEL_BUFFER: usize = 4;
 
@@ -52,7 +52,7 @@ pub async fn handle_query(
 
     let sql = sql.to_string();
     let sql_for_log = sql.clone();
-    debug!(sql = %truncate(&sql_for_log, 200), "duckport.query");
+    debug!(sql = %truncate_for_log(&sql_for_log, 200), "duckport.query");
 
     let (tx, rx) = mpsc::channel(QUERY_CHANNEL_BUFFER);
 
@@ -82,14 +82,6 @@ pub async fn handle_query(
         .map_err(|e| recover_status(&e.to_string()));
 
     Ok(Response::new(Box::pin(flight_stream)))
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
 }
 
 #[cfg(test)]

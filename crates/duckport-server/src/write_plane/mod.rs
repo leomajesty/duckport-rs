@@ -71,6 +71,19 @@ impl DuckportService {
 /// `Pin<Box<dyn Stream<Item=Result<T,Status>> + Send + 'static>>`), so this is a
 /// zero-cost re-wrap. Keeping it as a helper avoids copy-pasting the `.map` /
 /// `Box::pin` dance in every delegated RPC.
+/// At most `max` bytes of `s` for a log line, cut on a char boundary (SQL may contain
+/// CJK text; slicing inside a multi-byte char would panic the request handler).
+pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 fn forward<T, S>(resp: Response<S>) -> Response<DuckportStream<T>>
 where
     S: Stream<Item = std::result::Result<T, Status>> + Send + 'static,
@@ -260,5 +273,20 @@ impl FlightService for DuckportService {
         let combined: DuckportStream<ActionType> = Box::pin(extra_stream.chain(airport_stream));
 
         Ok(Response::from_parts(meta, combined, ext))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_for_log;
+
+    #[test]
+    fn truncate_for_log_keeps_char_boundaries() {
+        assert_eq!(truncate_for_log("SELECT 1", 200), "SELECT 1");
+        assert_eq!(truncate_for_log("abcdef", 3), "abc…");
+        // '除' occupies bytes 2..5: cutting at 3 or 4 must back off to 2
+        assert_eq!(truncate_for_log("ab除cd", 3), "ab…");
+        assert_eq!(truncate_for_log("ab除cd", 4), "ab…");
+        assert_eq!(truncate_for_log("ab除cd", 5), "ab除…");
     }
 }

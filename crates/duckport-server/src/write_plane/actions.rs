@@ -15,7 +15,7 @@ use super::proto::{
     ExecuteRequest, ExecuteResponse, ExecuteTransactionRequest, ExecuteTransactionResponse,
     PingResponse, RetentionRunRequest,
 };
-use super::DuckportStream;
+use super::{truncate_for_log, DuckportStream};
 
 /// Prefix every custom action type shares. Anything else is delegated to airport.
 pub const PREFIX: &str = "duckport.";
@@ -118,7 +118,7 @@ async fn execute(backend: &Backend, body: &[u8]) -> Result<Bytes, Status> {
     info!(
         rows,
         epoch,
-        sql = %truncate(&sql_for_log, 200),
+        sql = %truncate_for_log(&sql_for_log, 200),
         "duckport.execute ok"
     );
 
@@ -223,10 +223,3 @@ fn run_transaction(conn: &mut duckdb::Connection, statements: Vec<String>) -> Re
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
-}
