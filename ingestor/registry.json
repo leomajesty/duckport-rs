@@ -1,6 +1,6 @@
 {
   "binance-ingestor": {
-    "repo": "https://github.com/leomajesty/duckport-binance-ingestor",
+    "repo": "https://github.com/sjmc-quant/duckport-binance-ingestor",
     "description": "Binance Spot + USDT-Perp K-line ingestor",
     "exec": "binance-ingestor",
     "default_instance": "binance-5m",
@@ -34,7 +34,7 @@
     ]
   },
   "binance-funding": {
-    "repo": "https://github.com/leomajesty/duckport-binance-funding",
+    "repo": "https://github.com/sjmc-quant/duckport-binance-funding",
     "description": "Binance USD-M funding-rate ingestor",
     "exec": "binance-funding",
     "default_instance": "binance-funding",

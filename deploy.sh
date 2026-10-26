@@ -22,7 +22,7 @@ ARCH=$(uname -m)  # x86_64 | arm64
 
 # ─── 默认配置 ─────────────────────────────────────────────────────────────────
 
-GITHUB_REPO="${GITHUB_REPO:-leomajesty/duckport-rs}"
+GITHUB_REPO="${GITHUB_REPO:-sjmc-quant/duckport-rs}"
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 
 # macOS 用用户路径（无需 sudo），Linux 用系统路径

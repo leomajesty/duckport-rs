@@ -92,7 +92,7 @@ pip install uv
 在目标 Linux 服务器上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 ```
 
 脚本自动完成：

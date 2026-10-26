@@ -117,7 +117,7 @@ Data ingestion plugins are maintained in separate repositories and installed via
 
 | Plugin | Repository | Description |
 |--------|-----------|-------------|
-| `binance-ingestor` | [duckport-binance-ingestor](https://github.com/leomajesty/duckport-binance-ingestor) | Binance Spot + USDT-Perp K-line ingestion |
+| `binance-ingestor` | [duckport-binance-ingestor](https://github.com/sjmc-quant/duckport-binance-ingestor) | Binance Spot + USDT-Perp K-line ingestion |
 
 ---
 
@@ -171,7 +171,7 @@ Only `SELECT` / `WITH` / `EXPLAIN` prefix statements are allowed; `query.rs` enf
 ### One-Click Deploy (Linux Server)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 ```
 
 `install.sh` clones the repo and runs `deploy.sh`, which: downloads/compiles the binary, writes `server.env`, registers the systemd unit, and installs the `duckport` CLI.
@@ -512,7 +512,7 @@ Only `SELECT` / `WITH` / `EXPLAIN` are allowed; DDL/DML must go through `duckpor
 
 ### Reference Implementations
 
-- [`duckport-binance-ingestor`](https://github.com/leomajesty/duckport-binance-ingestor): Complete Python ingestor reference (`duckport_client.py` / `data_jobs.py` / `loadhist.py`)
+- [`duckport-binance-ingestor`](https://github.com/sjmc-quant/duckport-binance-ingestor): Complete Python ingestor reference (`duckport_client.py` / `data_jobs.py` / `loadhist.py`)
 - `client/duckport_consumer/client.py`: Read-only consumer
 - `tests/python/test_phase4_ingestor.py`: End-to-end write test template
 

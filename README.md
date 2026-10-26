@@ -116,7 +116,7 @@ duckport-rs/
 
 | 插件 | 仓库 | 说明 |
 |------|------|------|
-| `binance-ingestor` | [duckport-binance-ingestor](https://github.com/leomajesty/duckport-binance-ingestor) | Binance Spot + USDT-Perp K 线采集 |
+| `binance-ingestor` | [duckport-binance-ingestor](https://github.com/sjmc-quant/duckport-binance-ingestor) | Binance Spot + USDT-Perp K 线采集 |
 
 ---
 
@@ -170,7 +170,7 @@ DuckDB airport 客户端或 `airport-rs` 客户端库自动使用。
 ### 一键部署（Linux 服务器）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 ```
 
 `install.sh` 会克隆仓库并执行 `deploy.sh`，完成：下载/编译 binary、写入 `server.env`、注册 systemd unit、安装 `duckport` CLI。
@@ -511,7 +511,7 @@ print(tbl.to_pandas())
 
 ### 参考实现
 
-- [`duckport-binance-ingestor`](https://github.com/leomajesty/duckport-binance-ingestor)：完整的 Python ingestor 实现参考（`duckport_client.py` / `data_jobs.py` / `loadhist.py`）
+- [`duckport-binance-ingestor`](https://github.com/sjmc-quant/duckport-binance-ingestor)：完整的 Python ingestor 实现参考（`duckport_client.py` / `data_jobs.py` / `loadhist.py`）
 - `client/duckport_consumer/client.py`：只读消费端
 - `tests/python/test_phase4_ingestor.py`：端到端写入测试样板
 

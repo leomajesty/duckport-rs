@@ -20,13 +20,15 @@
 ### 1. 升级服务端（不停写）
 
 ```bash
-cd <repo_dir> && git pull --ff-only
+cd <repo_dir>
+git remote set-url origin https://github.com/sjmc-quant/duckport-rs.git   # 从 leomajesty clone 的部署目录需要改一次
+git pull --ff-only
 sudo env GITHUB_REPO=sjmc-quant/duckport-rs RELEASE_TAG=v1.1.0 bash ./deploy.sh   # 保留现有 server.env
 sudo duckport restart server
 duckport status            # 版本显示 v1.1.0，并多出 Retention 一节
 ```
 
-服务端启动时会自动创建 `data.retention_policy` 和 `data.retention_log`。`DUCKPORT_RETENTION_ENABLED` / `DUCKPORT_RETENTION_DRY_RUN` 现在只接受 `true`/`false`（或 `1`/`0`、`yes`/`no`、`on`/`off`），空值或拼错会让服务端拒绝启动，升级前先检查 server.env。通过 Airport 连接的 DuckDB 客户端，`duckdb` 版本同步升到 1.5.6。
+仓库已统一到 `sjmc-quant`：`deploy.sh` 默认从 `sjmc-quant/duckport-rs` 下载 release。服务端启动时会自动创建 `data.retention_policy` 和 `data.retention_log`。`DUCKPORT_RETENTION_ENABLED` / `DUCKPORT_RETENTION_DRY_RUN` 现在只接受 `true`/`false`（或 `1`/`0`、`yes`/`no`、`on`/`off`），空值或拼错会让服务端拒绝启动，升级前先检查 server.env。通过 Airport 连接的 DuckDB 客户端，`duckdb` 版本同步升到 1.5.6。
 
 回退：重新部署 v1.0.4。
 

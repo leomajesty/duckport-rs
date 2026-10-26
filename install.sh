@@ -2,12 +2,12 @@
 # duckport-rs 一键安装脚本
 #
 # 公开仓库：
-#   curl -fsSL https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 #
 # 私有仓库（需先设置 GITHUB_TOKEN）：
 #   export GITHUB_TOKEN=ghp_xxxx
 #   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-#     https://raw.githubusercontent.com/leomajesty/duckport-rs/main/install.sh | bash
+#     https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 #
 # 传参示例（升级模式）：
 #   curl -fsSL ... | bash -s -- --upgrade
