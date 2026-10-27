@@ -17,8 +17,8 @@ pub async fn handle_do_get(
     let ticket_data =
         TicketData::decode(&ticket.ticket).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-    tracing::warn!(
-        "=== DoGet called! catalog={} schema={} table={} table_function={} server_catalog={}",
+    tracing::debug!(
+        "DoGet catalog={} schema={} table={} table_function={} server_catalog={}",
         ticket_data.catalog, ticket_data.schema, ticket_data.table, ticket_data.table_function,
         server.catalog_name()
     );

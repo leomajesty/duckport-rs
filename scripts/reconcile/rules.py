@@ -204,7 +204,8 @@ def leftovers(state, dp, opts):
         if name.endswith(LEFTOVER_SUFFIXES):
             kind = "去主键迁移保留的旧表" if name.endswith("__pk_old") else "迁移中断留下的半成品"
             yield Finding("C1", "hint", name, kind,
-                          "确认无误后 duckport upgrade --finalize；有问题 --rollback")
+                          "sudo duckport upgrade --compact（校验后删除旧表并压缩库文件）；只删旧表不压缩 --finalize；"
+                          "有问题 --rollback")
 
 
 # ── business table structure ──────────────────────────────────────────────────
@@ -217,7 +218,7 @@ def keyed_business_tables(state, dp, opts):
         ready, reason = _writer_ready(state, t.name)
         if ready and t.name + "__pk_old" in state.tables:
             yield Finding("B1", "block", t.name, f"上次去主键留下的 {t.name}__pk_old 还在",
-                          "先 duckport upgrade --finalize 或 --rollback")
+                          "先处理它：sudo duckport upgrade --compact（校验后删除并压缩）、--finalize（只删除）或 --rollback（恢复）")
         elif ready:
             yield Finding("B1", "stop", t.name,
                           f"带主键/唯一约束/索引（约 {t.estimated_size:,} 行）；{reason}",

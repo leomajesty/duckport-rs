@@ -177,7 +177,7 @@ def cmd_finalize(dp, args):
         return 0
     for t in dropped:
         print(f"  dropped data.{t}")
-    print("完成。释放的空间会被后续写入复用；库文件本身不会变小。")
+    print("完成。释放的空间会被后续写入复用；库文件本身不会变小——要还给磁盘：sudo duckport upgrade --compact")
     _log_command(dp, args, "C1", "删除 " + ", ".join(dropped))
     return 0
 

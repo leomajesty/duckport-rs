@@ -161,7 +161,7 @@ impl FlightService for Server {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ctx = self.authenticate_request(request.metadata()).await?;
         let ticket = request.into_inner();
-        tracing::warn!("do_get RPC called: ticket={}", String::from_utf8_lossy(&ticket.ticket));
+        tracing::debug!("do_get RPC called: ticket={}", String::from_utf8_lossy(&ticket.ticket));
         super::do_get::handle_do_get(self, &ctx, ticket).await
     }
 
