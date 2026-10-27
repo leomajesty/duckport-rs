@@ -1059,6 +1059,11 @@ cmd_upgrade() {
       ;;
   esac
   _upgrade_db
+  # 由旧版 CLI 的 upgrade 经 deploy.sh 交过来：它收尾时还会打印过时的「duckport restart」。
+  # 失败时 set -e 在上一行就退出了，旧版 CLI 也随之中止，不会走到它那句提示。
+  if [[ -n "${DUCKPORT_HANDOFF:-}" ]]; then
+    echo -e "\n${DIM}旧版 CLI 接下来会提示执行 duckport restart：不需要，升级已经在上面完成。${NC}"
+  fi
 }
 
 # 本次执行的网络代理（git、curl、uv）；本机地址不走代理（pyarrow 的 gRPC 也读这些变量）

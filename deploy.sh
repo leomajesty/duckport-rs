@@ -25,6 +25,7 @@ ARCH=$(uname -m)  # x86_64 | arm64
 # ─── 默认配置 ─────────────────────────────────────────────────────────────────
 
 GITHUB_REPO="${GITHUB_REPO:-sjmc-quant/duckport-rs}"
+TAG_GIVEN="${RELEASE_TAG:+1}"   # 调用方指定了 tag（新版 CLI 总会指定），见文末「交给新版 CLI」
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 
 # macOS 用用户路径（无需 sudo），Linux 用系统路径
@@ -59,7 +60,7 @@ LOADHIST_INSTANCE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --loadhist)  MODE="loadhist"; LOADHIST_INSTANCE="${2:-}"; [[ -n "${2:-}" ]] && shift ;;
-    --tag)       RELEASE_TAG="$2"; shift ;;
+    --tag)       RELEASE_TAG="$2"; TAG_GIVEN=1; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
   shift
@@ -79,6 +80,14 @@ md5_of() {
     md5 -q "$1" 2>/dev/null
   else
     md5sum "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}
+
+sha256_of() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
   fi
 }
 
@@ -130,9 +139,10 @@ fi
 
 info "GitHub 仓库：$GITHUB_REPO  tag：$RELEASE_TAG"
 
-# ─── 辅助：获取 Release binary URL ───────────────────────────────────────────
+# ─── 辅助：获取 Release binary 的 URL 和 sha256 ─────────────────────────────
 
-_get_binary_url() {
+# 输出 "<url> <sha256>"；sha256 是 GitHub 为每个 release 文件算好的 digest，拿不到时为空。
+_release_asset() {
   local api_url asset_name
   if [[ "$OS" == "Darwin" ]]; then
     # uname -m 在 Apple Silicon 返回 arm64，release 产物命名用 aarch64
@@ -147,12 +157,15 @@ _get_binary_url() {
   else
     api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${RELEASE_TAG}"
   fi
+  # 响应是逐行排版的 JSON；每个 asset 里 name 在前，digest 其次，browser_download_url 最后
   curl -fsSL \
     ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
     "$api_url" 2>/dev/null \
-    | grep '"browser_download_url"' \
-    | grep "${asset_name}" \
-    | cut -d'"' -f4
+    | awk -v want="\"name\": \"${asset_name}\"" '
+        index($0, want) { inside = 1; digest = "" }
+        inside && /"digest": *"sha256:/ { match($0, /sha256:[0-9a-f]+/); digest = substr($0, RSTART + 7, RLENGTH - 7) }
+        inside && /"browser_download_url"/ { split($0, f, "\""); print f[4], digest; exit }
+      '
 }
 
 # ─── 辅助：本机编译回落 ───────────────────────────────────────────────────────
@@ -179,7 +192,9 @@ step "创建目录结构"
 mkdir -p "$DEPLOY_BIN" "$DEPLOY_DATA/pqt" "$DEPLOY_DATA/hist" "$INGESTORS_DIR" "$DEPLOY_OPT/logs"
 ok "目录就绪"
 
-# ─── Step 2：获取 binary（MD5 比对决定是否替换）──────────────────────────────
+# ─── Step 2：获取 binary ─────────────────────────────────────────────────────
+# 先用 release 的 sha256 和已安装的比：一样就不下载；下载的文件也要对得上这个 sha256。
+# 拿不到 sha256（离线安装、API 不可用）时照旧：下载后 MD5 比对决定是否替换。
 
 step "获取 duckport-server binary"
 
@@ -187,13 +202,19 @@ INSTALLED_BIN="$DEPLOY_BIN/duckport-server"
 TMP_BIN="$(mktemp)"
 trap 'rm -f "$TMP_BIN"' EXIT
 
-BINARY_URL=""
-[[ -n "${DUCKPORT_SERVER_BIN:-}" ]] || BINARY_URL=$(_get_binary_url || true)
+BINARY_URL=""; BINARY_SHA256=""
+if [[ -z "${DUCKPORT_SERVER_BIN:-}" ]]; then
+  read -r BINARY_URL BINARY_SHA256 <<< "$(_release_asset || true)" || true
+fi
 
 if [[ -n "${DUCKPORT_SERVER_BIN:-}" ]]; then
   # 离线安装：用指定的 binary，不访问 GitHub
   info "使用本地 binary：$DUCKPORT_SERVER_BIN"
   cp "$DUCKPORT_SERVER_BIN" "$TMP_BIN"
+elif [[ -n "$BINARY_SHA256" && -f "$INSTALLED_BIN" && "$(sha256_of "$INSTALLED_BIN")" == "$BINARY_SHA256" ]]; then
+  skip "binary 未变化（sha256 与 release 一致），跳过下载"
+  rm -f "$TMP_BIN"; trap - EXIT
+  TMP_BIN=""
 elif [[ -n "$BINARY_URL" ]]; then
   info "下载：$BINARY_URL"
   # --progress-bar：TTY 下显示进度条；-f 保留 HTTP 错误失败；不加 -s 以免静默掉进度
@@ -201,27 +222,34 @@ elif [[ -n "$BINARY_URL" ]]; then
     ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
     "$BINARY_URL" -o "$TMP_BIN"
   echo
+  if [[ -n "$BINARY_SHA256" ]]; then
+    GOT_SHA256=$(sha256_of "$TMP_BIN")
+    [[ "$GOT_SHA256" == "$BINARY_SHA256" ]] \
+      || fail "下载的 binary 与 release 记录的 sha256 不符（${GOT_SHA256:0:12}… ≠ ${BINARY_SHA256:0:12}…），未替换"
+    ok "sha256 校验通过"
+  fi
 else
   info "GitHub Release 暂无预构建包，尝试本机编译..."
   SRC_BIN=$(_build_from_source)
   cp "$SRC_BIN" "$TMP_BIN"
 fi
 
-chmod +x "$TMP_BIN"
-
-if [[ -f "$INSTALLED_BIN" ]]; then
-  OLD_MD5=$(md5_of "$INSTALLED_BIN")
-  NEW_MD5=$(md5_of "$TMP_BIN")
-  if [[ "$OLD_MD5" == "$NEW_MD5" ]]; then
-    skip "binary 未变化（MD5 相同），跳过替换"
-    rm -f "$TMP_BIN"; trap - EXIT
+if [[ -n "$TMP_BIN" ]]; then
+  chmod +x "$TMP_BIN"
+  if [[ -f "$INSTALLED_BIN" ]]; then
+    OLD_MD5=$(md5_of "$INSTALLED_BIN")
+    NEW_MD5=$(md5_of "$TMP_BIN")
+    if [[ "$OLD_MD5" == "$NEW_MD5" ]]; then
+      skip "binary 未变化（MD5 相同），跳过替换"
+      rm -f "$TMP_BIN"; trap - EXIT
+    else
+      mv "$TMP_BIN" "$INSTALLED_BIN"; trap - EXIT
+      ok "binary 已升级（${OLD_MD5:0:8}… → ${NEW_MD5:0:8}…）"
+    fi
   else
     mv "$TMP_BIN" "$INSTALLED_BIN"; trap - EXIT
-    ok "binary 已升级（${OLD_MD5:0:8}… → ${NEW_MD5:0:8}…）"
+    ok "binary 已安装：$INSTALLED_BIN ($(ls -lh "$INSTALLED_BIN" | awk '{print $5}'))"
   fi
-else
-  mv "$TMP_BIN" "$INSTALLED_BIN"; trap - EXIT
-  ok "binary 已安装：$INSTALLED_BIN ($(ls -lh "$INSTALLED_BIN" | awk '{print $5}'))"
 fi
 
 # ─── Step 3：写配置文件（已存在则跳过）──────────────────────────────────────
@@ -425,6 +453,43 @@ else
 fi
 echo "$CLI_DIR" > "$DEPLOY_OPT/cli_dir"
 ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
+
+# ─── 旧版 CLI 的 upgrade：交给新版 CLI 接着做 ─────────────────────────────────
+# v1.0.x / v1.1.x 的 `duckport upgrade` 只做 git pull 和本脚本，参数也不传，然后提示
+# `duckport restart` 就结束了：插件和数据都没升级。它在 pull 之后执行的正是这份新脚本，
+# 所以由这里接手：调用方是 `duckport upgrade`、不是新版 CLI 的 `upgrade --after-pull`，
+# 也没有指定 tag（新版 CLI 总会指定）时，exec 新版 CLI 的 `upgrade --after-pull`，参数从
+# 父进程的命令行取回。DUCKPORT_HANDOFF 保证不会再接手一次。
+
+# 父进程是旧版 `duckport upgrade` 时输出它的参数（每行一个），否则返回 1
+_legacy_upgrade_args() {
+  local args=() arg i j n
+  if [[ -r "/proc/$PPID/cmdline" ]]; then
+    while IFS= read -r -d '' arg; do args+=("$arg"); done < "/proc/$PPID/cmdline"
+  else
+    read -ra args <<< "$(ps -o args= -p "$PPID" 2>/dev/null)"
+  fi
+  n=${#args[@]}
+  for ((i = 0; i + 1 < n; i++)); do
+    [[ "${args[i]##*/}" == "duckport" && "${args[i+1]}" == "upgrade" ]] || continue
+    for ((j = i + 2; j < n; j++)); do
+      [[ "${args[j]}" == "--after-pull" ]] && return 1
+      printf '%s\n' "${args[j]}"
+    done
+    return 0
+  done
+  return 1
+}
+
+if [[ "$MODE" == "install" && -z "$TAG_GIVEN" && -z "${DUCKPORT_HANDOFF:-}" ]] \
+   && LEGACY_ARGS=$(_legacy_upgrade_args); then
+  step "交给新版 CLI 继续升级"
+  info "旧版 duckport upgrade 只会 git pull 和执行本脚本，接下来由新版 CLI 升级服务端、插件和数据"
+  FWD=()
+  while IFS= read -r arg; do [[ -n "$arg" ]] && FWD+=("$arg"); done <<< "$LEGACY_ARGS"
+  exec env DUCKPORT_HOME="$DEPLOY_OPT" DUCKPORT_HANDOFF=1 \
+    bash "$REPO_DIR/duckport" upgrade --after-pull ${FWD[@]+"${FWD[@]}"}
+fi
 
 # ─── 完成摘要 ─────────────────────────────────────────────────────────────────
 
