@@ -7,6 +7,7 @@
 # tables. Then runs `duckport upgrade` against "origin" repositories holding the commits
 # under test, and checks: server restarted at the new version, plugins reinstalled and
 # running, data aligned (doctor clean), ingestors still writing, a second run does nothing,
+# `upgrade --compact` refuses a half-done swap and otherwise rewrites the database again,
 # and the release binary is only downloaded when its sha256 differs, and then verified.
 #
 # With LEGACY_CLI=<tag> the upgrade is started by that release's CLI instead. Its `upgrade`
@@ -199,6 +200,24 @@ grep -q "不需要重启" "$SBX/upgrade-2.log" || fail "second run restarted the
 grep -q "sha256 与 release 一致），跳过下载" "$SBX/upgrade-2.log" || fail "second run downloaded the binary again"
 grep -q "已与期望状态一致" "$SBX/upgrade-2.log" || fail "second run changed data"
 "$CLI" upgrade --finalize
+
+step "upgrade --compact: refuses a half-done swap, removes a stale .compact, rewrites the catalog"
+db="$SBX/data/duckport.db"
+touch "$db.preswap"
+if "$CLI" upgrade --compact --yes > "$SBX/compact-refused.log" 2>&1; then fail "--compact ran with a .preswap present"; fi
+grep -q "没有完成回退" "$SBX/compact-refused.log" || fail "no explanation for refusing with a .preswap"
+rm -f "$db.preswap"
+echo stale > "$db.compact"
+"$CLI" upgrade --compact --yes 2>&1 | tee "$SBX/compact.log"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || fail "upgrade --compact failed"
+grep -q "已删除 $db.compact" "$SBX/compact.log" || fail "stale .compact was not removed"
+grep -q "没有待清理的旧表" "$SBX/compact.log" || fail "nothing was left to drop, compact-verify should say so"
+grep -q "已删除换下的原文件" "$SBX/compact.log" || fail "--compact did not finish"
+[[ ! -e "$db.compact" && ! -e "$db.preswap" ]] || fail "files left behind by --compact"
+for inst in sbx5m sbxfund; do
+  [[ "$(systemctl is-active "$PREFIX-ingestor@$inst")" == "active" ]] || fail "$inst not running after --compact"
+done
+[[ "$(scalar "$PORT" "SELECT count(*) FROM data.usdt_perp_5m")" -ge "$rows_before" ]] || fail "rows lost by --compact"
 
 [[ "$(scalar "$PROD_PORT" "SELECT count(*) FROM data.watermark WHERE ingestor LIKE 'sbx%'")" == "0" ]] \
   || fail "a sandbox instance wrote to the real deployment"

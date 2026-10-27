@@ -15,6 +15,7 @@
 #   duckport loadhist <实例>             # 补历史数据（必须指定实例）
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
 #   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
+#   duckport upgrade --compact           # 只做压缩：重建已完成但空间还没还给磁盘时
 #   duckport doctor  [--deep] [--json]   # 对照当前版本检查库的状态（只读）
 
 set -euo pipefail
@@ -1010,6 +1011,8 @@ cmd_update() {
 #                                               （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
 #   sudo duckport upgrade --finalize            删除重建留下的 <表>__pk_old
 #   sudo duckport upgrade --rollback            把 <表>__pk_old 恢复为原表（停写）
+#   sudo duckport upgrade --compact [--yes]     只做重建之后的收尾：校验 → 删 <表>__pk_old → 整库重写 → 换文件
+#                                               （上次换文件失败回退了、或用旧版 CLI 做过 finalize 的机器）
 # 发生重建时，复检通过后同一条命令继续：校验重建结果 → 删除 <表>__pk_old → 整库重写压缩 →
 # 换文件并校验 → 删除换下的原文件。校验不过就用 <表>__pk_old 回退，换文件后校验不过就把原文件换回去。
 # --no-compact 停在重建之后，保留 <表>__pk_old，由 --finalize / --rollback 手动收尾。
@@ -1026,6 +1029,7 @@ cmd_upgrade() {
       --data)     mode="data" ;;
       --finalize) mode="finalize" ;;
       --rollback) mode="rollback" ;;
+      --compact)  mode="compact" ;;
       --yes|-y)   yes=1 ;;
       --no-backup) no_backup=1 ;;
       --no-compact) no_compact=1 ;;
@@ -1124,6 +1128,33 @@ _wait_server() {
   return 1
 }
 
+# 停服务端并等它真的退出。macOS 的 launchctl bootout 不等进程结束，而 duckport-server
+# 收到 SIGTERM 后要先做 checkpoint，库大时要一会儿；这期间端口还占着，马上拉起的新进程
+# 因为端口被占而退出——launchd 只重启崩溃的进程，于是服务端就一直没起来。
+# Linux 的 systemctl stop 自己会等（超时则 kill），这里的等待只是兜底。
+_stop_server_and_wait() {
+  local port="$1" timeout="${2:-300}" i
+  _svc_stop "$SVC_SERVER"
+  for ((i = 0; i < timeout; i++)); do
+    if ! nc -z localhost "$port" 2>/dev/null && ! pgrep -f "^${DEPLOY_BIN}/duckport-server" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo -e "${RED}duckport-server 停了 ${timeout}s 还没退出（:${port} 仍被占用）${NC}"
+  return 1
+}
+
+# 服务端最近的日志，用于说明它为什么没起来
+_server_log_tail() {
+  echo -e "  ${DIM}服务端最近的日志：${NC}"
+  if [[ "$OS" == "Linux" ]]; then
+    journalctl -u "$SVC_SERVER" -n 20 --no-pager -o short-iso 2>/dev/null | sed 's/^/    /'
+  else
+    tail -n 20 "$LOG_DIR/server.err" "$LOG_DIR/server.log" 2>/dev/null | sed 's/^/    /'
+  fi
+}
+
 _upgrade_server_and_plugins() {
   local want port before after running inst v0 v1 restart=()
   want="${to#v}"
@@ -1140,10 +1171,11 @@ _upgrade_server_and_plugins() {
   if [[ "$before" != "$after" || "$running" != "$want" ]]; then
     echo -e "\n  重启服务端：${running:+v}${running:-未运行} → v${want}（先停 ingestor，插件升级后再启动）"
     _stop_running_ingestors
-    _svc_stop "$SVC_SERVER"
+    _stop_server_and_wait "$port" || exit 1
     _svc_start "$SVC_SERVER"
     if ! _wait_server "$port" "$want"; then
-      echo -e "${RED}duckport-server 没有以 v${want} 启动（当前：$(_server_version "$port")），见 duckport logs server${NC}"
+      echo -e "${RED}duckport-server 没有以 v${want} 启动（当前：$(_server_version "$port")）${NC}"
+      _server_log_tail
       exit 1
     fi
     echo -e "  ${GREEN}✓${NC} duckport-server v${want} 已启动"
@@ -1213,6 +1245,18 @@ _upgrade_db() {
               --run-id "$run_id" --instances-file "$inv" ${extra[@]+"${extra[@]}"})
 
   case "$mode" in
+    compact)
+      _require_root
+      rm -f "$inv"
+      _compact_prepare "$db" || return 1
+      if [[ $yes -ne 1 ]]; then
+        echo -e "${YELLOW}压缩会停止所有 ingestor，并在换文件时短暂停服务端。${NC}"
+        read -r -p "执行？[y/N] " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消"; return 0; }
+      fi
+      _finish_rebuild "$py" "$port" "$db" "$run_id"
+      return $?
+      ;;
     plan)
       _instances_json "$inv"
       "${base[@]}" plan ${plan_args[@]+"${plan_args[@]}"} || rc=$?
@@ -1334,8 +1378,14 @@ _upgrade_db() {
     echo -e "  备份：$(dirname "$db")/backup/duckport-${run_id}.db（恢复：停服后替换 ${db}，删除 ${db}.wal）；不再需要时手动删除"
   fi
 
-  # 重建留下的 <表>__pk_old 是迁移的备份。校验通过就删掉它们并把库压实，
-  # 校验不过就用它们回退——两条路都在这一条命令里走完。
+  _finish_rebuild "$py" "$port" "$db" "$run_id"
+}
+
+# 重建之后的收尾，也是 --compact 的全部：重建留下的 <表>__pk_old 是迁移的备份，校验通过就
+# 删掉它们并把库压实，校验不过就用它们回退——两条路都在这一条命令里走完。没有旧表时
+# （已经 finalize 过）校验直接通过，只做压缩。用调用方的 no_compact。
+_finish_rebuild() {
+  local py="$1" port="$2" db="$3" run_id="$4"
   echo -e "\n${BOLD}校验重建${NC}"
   if ! "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
        --run-id "$run_id" compact-verify; then
@@ -1355,6 +1405,28 @@ _upgrade_db() {
     return 0
   fi
   _compact_db "$py" "$port" "$db" "$run_id"
+}
+
+# --compact 前的清场。<库>.preswap 说明上次换文件到一半没换回来，得人看；<库>.compact 是
+# 上次换文件失败后留下的新文件，原库之后又写入了，它已经过时，确认后删掉重来。
+_compact_prepare() {
+  local db="$1" ans
+  local newdb="${db}.compact" bak="${db}.preswap"   # 另起一行：同一条 local 里 ${db} 取的是外层的值
+  if [[ -e "$bak" ]]; then
+    echo -e "${RED}存在 ${bak}：上次换文件没有完成回退。先人工确认 ${db} 是哪一份，再继续。${NC}"
+    return 1
+  fi
+  if [[ -e "$newdb" ]]; then
+    echo -e "${YELLOW}存在上次压缩失败留下的 ${newdb}（$(du -h "$newdb" | cut -f1)，$(date -r "$newdb" '+%F %T')）。${NC}"
+    echo -e "${YELLOW}原库之后已继续写入，这份已经过时。${NC}"
+    if [[ $yes -ne 1 ]]; then
+      read -r -p "删除它并重新压缩？[y/N] " ans
+      [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消"; return 1; }
+    fi
+    rm -f "$newdb" "$newdb.wal"
+    echo -e "  已删除 ${newdb}"
+  fi
+  return 0
 }
 
 # 压缩：删除重建留下的 <表>__pk_old，并把整库重写成一个新文件。
@@ -1382,28 +1454,44 @@ _compact_db() {
 
   # 换文件。原文件一旦移走，后面每一步失败都要走 _compact_restore 换回来，
   # 所以这里不依赖 set -e：它只会让脚本带着一个不在原位的库文件退出。
-  _svc_stop "$SVC_SERVER"
-  if ! mv "$db" "$bak"; then
+  # 旧服务端必须真的退出了才能换：它还占着端口的话，新服务端起不来。
+  local why=""
+  if ! _stop_server_and_wait "$port"; then
+    why="旧服务端没有退出"
+  elif ! mv "$db" "$bak"; then
+    why="移走原文件失败（mv）"
+  fi
+  if [[ -n "$why" ]]; then
+    echo -e "${RED}换文件没有开始：${why}；库未改动，未压缩${NC}"
     _svc_start "$SVC_SERVER"
-    _wait_server "$port" "$ver" || true
+    _wait_server "$port" "$ver" || _server_log_tail
     rm -f "$newdb" "$base"
     _start_stopped_ingestors
     trap - EXIT
-    echo -e "${RED}移走原文件失败，库未改动，未压缩${NC}"
     return 1
   fi
   if [[ -f "$wal" ]]; then mv "$wal" "$bak.wal"; fi
   rm -f "$newdb.wal"        # DETACH 后不该有；留着会被当成新库的 wal 回放
 
-  if mv "$newdb" "$db" && _svc_start "$SVC_SERVER" && _wait_server "$port" "$ver" &&
-     "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
+  if ! mv "$newdb" "$db"; then
+    why="新文件放不到原位（mv）"
+  elif ! _svc_start "$SVC_SERVER"; then
+    why="启动服务端的命令失败"
+  elif ! _wait_server "$port" "$ver"; then
+    why="服务端 120s 内没有以 v${ver} 在 :${port} 就绪"
+  elif ! "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
          --run-id "$run_id" compact-check --baseline "$base"; then
+    why="换文件后校验未通过（见上）"
+  fi
+  if [[ -z "$why" ]]; then
     rm -f "$bak" "$bak.wal" "$base"
     _start_stopped_ingestors
     trap - EXIT
     echo -e "  ${GREEN}✓${NC} 已删除换下的原文件"
     return 0
   fi
+  echo -e "\n${RED}换文件失败：${why}${NC}"
+  _server_log_tail
   _compact_restore "$port" "$db" "$newdb" "$bak" "$wal" "$ver"
   rm -f "$base"
   _start_stopped_ingestors
@@ -1415,7 +1503,7 @@ _compact_db() {
 _compact_restore() {
   local port="$1" db="$2" newdb="$3" bak="$4" wal="$5" ver="$6"
   echo -e "\n${YELLOW}换回原文件${NC}"
-  _svc_stop "$SVC_SERVER"
+  _stop_server_and_wait "$port" || true
   if [[ -f "$db" ]]; then mv "$db" "$newdb"; fi
   rm -f "$wal"              # 这是新库的 wal，留在原文件旁边会被当成它的 wal 回放
   mv "$bak" "$db"
@@ -1425,6 +1513,7 @@ _compact_restore() {
     echo -e "${RED}已回到压缩前的状态${NC}（没通过校验的新文件留在 ${newdb}）"
   else
     echo -e "${RED}回退后服务端未就绪，需要人工处理${NC}（原文件已换回 ${db}）"
+    _server_log_tail
   fi
 }
 
@@ -1466,6 +1555,7 @@ ${BOLD}维护：${NC}
                                        有重建时继续：校验 → 删旧表 → 整库压缩 → 换文件 → 删备份，
                                        任一步不过自动回退（--no-compact 停在重建后，手动收尾）
   duckport ${CYAN}upgrade${NC} --finalize|--rollback  删除 / 恢复重建前的旧表
+  duckport ${CYAN}upgrade${NC} --compact [--yes]      只做压缩：重建已完成、空间还没还给磁盘时（停 ingestor，换文件时短暂停服务端）
 
 ${BOLD}示例：${NC}
   duckport list                       # 查看可安装的插件
