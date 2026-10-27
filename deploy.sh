@@ -97,6 +97,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/Cargo.toml" ]] || fail "请在 duckport-rs 仓库根目录下运行此脚本"
 REPO_DIR="$SCRIPT_DIR"
 
+# 同 duckport CLI 的 _retarget_origin：origin 还指着停更的 leomajesty/duckport-rs 就改到 sjmc-quant。
+# 旧版 CLI 的 upgrade 在 pull 之后才执行本脚本，所以这里改了要到下一次 pull 才生效。
+_retarget_origin() {
+  local dir="$1" url
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 0
+  case "$url" in
+    *github.com[:/]leomajesty/duckport-rs|*github.com[:/]leomajesty/duckport-rs.git)
+      git -C "$dir" remote set-url origin "${url/leomajesty/sjmc-quant}"
+      info "origin 已从 leomajesty 改为 sjmc-quant：${url/leomajesty/sjmc-quant}" ;;
+  esac
+}
+_retarget_origin "$REPO_DIR"
+
 # ─── loadhist 模式 ────────────────────────────────────────────────────────────
 
 if [[ "$MODE" == "loadhist" ]]; then

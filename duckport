@@ -1091,9 +1091,23 @@ _git_pull() {
   fi
 }
 
+# 仓库早已搬到 sjmc-quant；leomajesty/duckport-rs 停在搬家前的提交，从它 pull 永远拿不到
+# 新版（没有 doctor，upgrade 也不做数据对齐）。origin 还指着它就改过来，再 pull。只改这一个
+# 仓库：插件仓库是转移过去的，旧地址会被 GitHub 重定向。deploy.sh 里有同样的一段。
+_retarget_origin() {
+  local dir="$1" url
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 0
+  case "$url" in
+    *github.com[:/]leomajesty/duckport-rs|*github.com[:/]leomajesty/duckport-rs.git)
+      git -C "$dir" remote set-url origin "${url/leomajesty/sjmc-quant}"
+      echo -e "  ${YELLOW}origin 已从 leomajesty 改为 sjmc-quant：${url/leomajesty/sjmc-quant}${NC}" ;;
+  esac
+}
+
 _upgrade_repo() {
   [[ -d "$REPO_DIR/.git" ]] || { echo -e "${RED}未找到仓库：$REPO_DIR${NC}"; exit 1; }
   echo -e "\n${BOLD}▶ 更新仓库${NC} $REPO_DIR"
+  _retarget_origin "$REPO_DIR"
   if [[ -n "$to" ]]; then
     git -C "$REPO_DIR" fetch --tags origin
     git -C "$REPO_DIR" -c advice.detachedHead=false checkout "$to"
