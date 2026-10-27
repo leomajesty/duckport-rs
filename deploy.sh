@@ -491,8 +491,9 @@ fi
 echo "$CLI_DIR" > "$DEPLOY_OPT/cli_dir"
 ok "仓库路径已写入：$DEPLOY_OPT/repo_dir → $REPO_DIR"
 
-# 非 root 用户也要能读到仓库里的脚本：duckport status / doctor / retention 都靠它们。仓库在
-# root 的家目录下时做不到（以 root 运行旧版 install.sh 的默认位置就是 /root/code）。
+# Linux 上非 root 用户也要能读到仓库里的脚本：duckport status / doctor / retention 都靠它们。仓库在
+# root 的家目录下时做不到（以 root 运行旧版 install.sh 的默认位置就是 /root/code）。macOS 的部署
+# 本来就是每个用户自己的（~/.duckport，不用 sudo），不检查。
 _world_readable() {  # 文件对 other 可读，且路径上每级目录对 other 可进入
   local p="$1" d m
   m=$(stat -c %a "$p" 2>/dev/null || stat -f %Lp "$p" 2>/dev/null) || return 1
@@ -504,7 +505,7 @@ _world_readable() {  # 文件对 other 可读，且路径上每级目录对 othe
     d=$(dirname "$d")
   done
 }
-if ! _world_readable "$REPO_DIR/scripts/doctor.py"; then
+if [[ "$OS" == "Linux" ]] && ! _world_readable "$REPO_DIR/scripts/doctor.py"; then
   info "⚠ 仓库 ${REPO_DIR} 对非 root 用户不可读：duckport status / doctor / retention 只能用 sudo 执行"
   info "  建议放到所有用户可读的位置，例如 ${DEPLOY_OPT}/src/duckport-rs，再把新路径写入 ${DEPLOY_OPT}/repo_dir"
 fi
