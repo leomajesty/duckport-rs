@@ -5,7 +5,8 @@ Checks: blocked while plugins are old; online fixes, then the stop window with a
 taken first; doctor clean afterwards; a second run does nothing; no row lost except the
 quarantined ones (which are in their parquet files); rebuilt tables keep defaults and are
 stored in time order; rollback restores the keyed tables with every row written since;
-finalize removes the old tables and nothing else; not enough memory for the backup is
+finalize removes the old tables and nothing else; compact verifies the rebuild per month
+before dropping the copies and rewriting the catalog; not enough memory for the backup is
 reported (exit 5); a failed backup changes nothing; corrupted and duplicate rows are only
 deleted after an operator confirmed (--confirm-delete).
 
@@ -198,6 +199,62 @@ def main():
     assert rc == 0 and not [x for x in f if x["rule"] == "C1"], f
     assert count(client, "data.usdt_perp_1m") == n1m + 2 and not keyed(client, "usdt_perp_1m")
     assert exists(client, "ab_pk_old") and exists(client, "orders_nopk"), "finalize dropped a decoy table"
+
+    hr("compact: a rebuild that is a true superset passes verification")
+    legacy_state(client)  # also drops the decoys, so put them back
+    tx(client, "CREATE TABLE data.ab_pk_old (x INTEGER)", "INSERT INTO data.ab_pk_old VALUES (1)",
+       "CREATE TABLE data.orders_nopk (x INTEGER)", "INSERT INTO data.orders_nopk VALUES (2)")
+    # a second month, so the per-month comparison has more than one segment to compare
+    tx(client, "INSERT INTO data.usdt_perp_1m (open_time, symbol) "
+               "SELECT TIMESTAMP '2026-11-26 00:00' + INTERVAL (m) MINUTE, 'S' || s "
+               "FROM range(60) a(m), range(5) b(s)")
+    rc, _ = upgrade(STOPPED, "apply", "--run-id", "c1", "--levels", "online,stop")
+    assert rc == 0, rc
+    assert exists(client, "usdt_perp_1m__pk_old"), "no rebuild happened, nothing to compact"
+    n_live = count(client, "data.usdt_perp_1m")
+    rc, out = upgrade(STOPPED, "compact-verify")
+    assert rc == 0, out
+
+    hr("compact: a month that lost rows is caught even when the totals still match")
+    tx(client,  # 10 rows out of October, 10 back in November: count and first/last unchanged
+       "DELETE FROM data.usdt_perp_1m WHERE open_time BETWEEN TIMESTAMP '2026-10-26 00:10' "
+       "AND TIMESTAMP '2026-10-26 00:11'",
+       "INSERT INTO data.usdt_perp_1m (open_time, symbol) "
+       "SELECT TIMESTAMP '2026-11-26 00:10', 'H' || s FROM range(10) r(s)")
+    assert count(client, "data.usdt_perp_1m") == n_live, "totals must match or the test proves nothing"
+    rc, out = upgrade(STOPPED, "compact-verify")
+    assert rc == 1, "a hole inside October went unnoticed"
+    assert "个月份行数少于旧表" in out, out
+
+    hr("compact: drop the copies and write a new database that reproduces the catalog")
+    tx(client, "DELETE FROM data.usdt_perp_1m WHERE starts_with(symbol, 'H')",
+       "INSERT INTO data.usdt_perp_1m (open_time, symbol) "
+       "SELECT TIMESTAMP '2026-10-26 00:00' + INTERVAL (m) MINUTE, 'S' || s "
+       "FROM range(10, 12) a(m), range(5) b(s)")
+    rc, out = upgrade(STOPPED, "compact-verify")
+    assert rc == 0, out
+    newdb = os.path.join(tempfile.mkdtemp(prefix="duckport-compact-"), "new.db")
+    base = newdb + ".baseline.json"
+    rc, out = upgrade(STOPPED, "compact-build", "--run-id", "c2", "--new-db", newdb, "--baseline-out", base)
+    assert rc == 0, out
+    assert os.path.getsize(newdb) > 0, "no database was written"
+    assert scalar(client, "SELECT count(*) FROM duckdb_tables() WHERE ends_with(table_name, '__pk_old')") == 0
+    assert count(client, "data.usdt_perp_1m") == n_live, "compacting changed the live data"
+    assert exists(client, "ab_pk_old") and exists(client, "orders_nopk"), "compact dropped a decoy table"
+    # the baseline covers the live tables only, so the server's database still has to match it
+    rc, out = upgrade(STOPPED, "compact-check", "--baseline", base)
+    assert rc == 0, out
+
+    hr("compact: refuses a leftover file and an orphaned copy before dropping anything")
+    rc, _ = upgrade(STOPPED, "compact-build", "--run-id", "c3", "--new-db", newdb, "--baseline-out", base)
+    assert rc == 1, "wrote into the database a failed swap had left behind"
+    tx(client, "CREATE TABLE data.ghost__pk_old (x INTEGER)")
+    rc, _ = upgrade(STOPPED, "compact-verify")
+    assert rc == 1, "an orphaned __pk_old copy passed as a rebuild product"
+    rc, _ = upgrade(STOPPED, "compact-build", "--run-id", "c4",
+                    "--new-db", newdb + ".2", "--baseline-out", base)
+    assert rc == 1 and exists(client, "ghost__pk_old"), "dropped a copy with no rebuilt table"
+    tx(client, "DROP TABLE data.ghost__pk_old")
 
     reset(client)
     print("\nALL UPGRADE TESTS PASSED")

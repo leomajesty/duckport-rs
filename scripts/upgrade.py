@@ -10,6 +10,9 @@ stop window. The same checks as `duckport doctor`; every online/stop finding has
     upgrade.py ... apply ... --confirm-delete               # also delete corrupted/duplicate rows (D1/D2)
     upgrade.py ... finalize                                 # drop <table>__pk_old
     upgrade.py ... rollback                                 # put <table>__pk_old back
+    upgrade.py ... compact-verify                           # read-only: are the copies safe to drop?
+    upgrade.py ... compact-build --new-db D --baseline-out F # drop them, rewrite the catalog into D
+    upgrade.py ... compact-check --baseline F               # after the CLI swapped the files
 
 plan exit code: 0 nothing to do, 1 online fixes only, 4 needs a stop window,
                 5 needs a stop window but there is not enough disk or memory for the backup,
@@ -22,7 +25,9 @@ how many and a sample, the operator decides.
 """
 
 import argparse
+import json
 import os
+import shutil
 import sys
 from datetime import datetime
 
@@ -30,11 +35,14 @@ import pyarrow as pa
 
 from doctor import load_instances, print_report
 from duckport_flight import Duckport
-from reconcile import backup, rebuild
+from reconcile import backup, compact, rebuild
 from reconcile.fixes import NEEDS_CONFIRMATION, Context, Result, actionable, apply, log_result, preview
 from reconcile.rules import Finding, Options, run_rules
 from reconcile.specs import PLUGIN_MIN_VERSION, UPGRADE_LOG_DDL, version_at_least
 from reconcile.state import collect
+
+
+GiB = 1024 ** 3
 
 
 def check(dp, args):
@@ -170,7 +178,8 @@ def cmd_finalize(dp, args):
     return 0
 
 
-def cmd_rollback(dp, args):
+def _time_columns(dp):
+    """(time column per table, names of the snapshot tables), from the specs or the watermark."""
     state = collect(dp, [])
     time_columns, snapshots = {}, set()
     for name in state.tables:
@@ -180,6 +189,11 @@ def cmd_rollback(dp, args):
         col = spec.time_column if spec else (state.watermark.get(name) or {}).get("time_column")
         if col:
             time_columns[name] = col
+    return time_columns, snapshots
+
+
+def cmd_rollback(dp, args):
+    time_columns, snapshots = _time_columns(dp)
     restored = rebuild.rollback(dp, time_columns, snapshots)
     if not restored:
         print("没有可回退的旧表。")
@@ -187,6 +201,95 @@ def cmd_rollback(dp, args):
     for table, note in restored:
         print(f"  restored data.{table}：{note}")
     _log_command(dp, args, "B1", "恢复 " + ", ".join(t for t, _ in restored))
+    return 0
+
+
+def cmd_compact_verify(dp, args):
+    """Read-only: is every <table>__pk_old safe to drop? Nothing is modified."""
+    stray = compact.orphans(dp)
+    if stray:
+        for t in stray:
+            print(f"  ✗ data.{t}: 找不到对应的重建表")
+        return 1
+    results = compact.verify(dp, _time_columns(dp)[0])
+    if not results:
+        print("没有待清理的旧表。")
+        return 0
+    ok = True
+    for table, problems, summary in results:
+        if problems:
+            ok = False
+            print(f"  ✗ data.{table}: " + "；".join(problems))
+        else:
+            print(f"  ✓ data.{table}: {summary}")
+    return 0 if ok else 1
+
+
+def cmd_compact_build(dp, args):
+    """Drop the verified <table>__pk_old copies, then write the live catalog to --new-db.
+
+    The baseline is taken with the ingestors already stopped, so it is the exact state the
+    new file has to reproduce; the CLI keeps it for the check after the swap.
+    """
+    # Both checks have to come before anything is dropped. A leftover file is what a failed
+    # swap leaves behind for inspection, and ATTACH would write into it rather than replace it.
+    if os.path.exists(args.new_db):
+        print(f"{args.new_db} 已存在（上次压缩失败留下的）。确认不再需要后删除，再执行。", file=sys.stderr)
+        return 1
+    stray = compact.orphans(dp)
+    if stray:
+        print("以下旧表找不到对应的重建表，不能当作重建产物删除："
+              + "、".join(f"data.{t}" for t in stray), file=sys.stderr)
+        return 1
+
+    time_columns = _time_columns(dp)[0]
+    names = compact.tables(dp)
+    baseline = compact.snapshot(dp, names, time_columns)
+    with open(args.baseline_out, "w") as f:
+        json.dump({"tables": [list(n) for n in names], "time_columns": time_columns,
+                   "baseline": {k: list(v) for k, v in baseline.items()}}, f)
+    print(f"  基线快照：{len(baseline)} 张表，{sum(v[0] for v in baseline.values()):,} 行")
+
+    dropped = rebuild.finalize(dp)
+    for t in dropped:
+        print(f"  dropped data.{t}")
+    _log_command(dp, args, "C1", "删除 " + ", ".join(dropped) if dropped else "无旧表可删")
+
+    payload = compact.payload_bytes(dp)
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.new_db))).free
+    print(f"  存活数据 {payload / GiB:.1f} GiB，可用 {free / GiB:.1f} GiB")
+    if free < payload * 1.1:
+        print(f"磁盘不足以重写：需要约 {payload * 1.1 / GiB:.1f} GiB。\n"
+              f"旧表已删除，库可正常使用；腾出空间后可再压缩。", file=sys.stderr)
+        return 1
+
+    started = datetime.now()
+    try:
+        compact.rewrite(dp, args.new_db, names, time_columns, baseline)
+    except (pa.ArrowException, OSError, RuntimeError) as e:
+        print(f"重写失败：{e}", file=sys.stderr)
+        return 1
+    took = (datetime.now() - started).total_seconds()
+    size = os.path.getsize(args.new_db)
+    print(f"  ✓ 新库 {size / GiB:.1f} GiB，逐表行数与时间覆盖一致（{took:.0f}s）")
+    _log_command(dp, args, "C2", f"重写 {args.new_db}：{size} 字节，{took:.0f}s")
+    return 0
+
+
+def cmd_compact_check(dp, args):
+    """After the swap: does the server's database still match the baseline?"""
+    with open(args.baseline) as f:
+        saved = json.load(f)
+    names = [tuple(n) for n in saved["tables"]]
+    actual = compact.snapshot(dp, names, saved["time_columns"])
+    baseline = {k: tuple(v) for k, v in saved["baseline"].items()}
+    problems = compact.differences(baseline, actual, "换文件后")
+    if problems:
+        print("换文件后与基线不一致：\n    " + "\n    ".join(problems), file=sys.stderr)
+        return 1
+    size = os.path.getsize(args.db_path) if args.db_path else 0
+    print(f"  ✓ 换文件后校验通过：{len(actual)} 张表"
+          + (f"，库文件 {size / GiB:.1f} GiB" if size else ""))
     return 0
 
 
@@ -207,7 +310,11 @@ def main():
     ap.add_argument("--assume-upgraded", action="store_true",
                     help="plan: judge as after stages 1-2 of a full upgrade (server replaced, known plugins "
                          "at least at their minimum version)")
-    ap.add_argument("command", choices=["plan", "apply", "finalize", "rollback"])
+    ap.add_argument("--new-db", default="", help="compact-build: path of the rewritten database")
+    ap.add_argument("--baseline-out", default="", help="compact-build: where to save the baseline")
+    ap.add_argument("--baseline", default="", help="compact-check: the baseline to check against")
+    ap.add_argument("command", choices=["plan", "apply", "finalize", "rollback",
+                                        "compact-verify", "compact-build", "compact-check"])
     args = ap.parse_args()
     db_dir = os.path.dirname(os.path.abspath(args.db_path)) if args.db_path else ""
     args.quarantine_dir = args.quarantine_dir or (db_dir and os.path.join(db_dir, "quarantine"))
@@ -219,10 +326,16 @@ def main():
             ap.error("apply needs --quarantine-dir or --db-path")
         if args.backup and not args.backup_dir:
             ap.error("--backup needs --backup-dir or --db-path")
+    if args.command == "compact-build" and not (args.new_db and args.baseline_out):
+        ap.error("compact-build needs --new-db and --baseline-out")
+    if args.command == "compact-check" and not args.baseline:
+        ap.error("compact-check needs --baseline")
     try:
         dp = Duckport(args.addr)
         return {"plan": cmd_plan, "apply": cmd_apply, "finalize": cmd_finalize,
-                "rollback": cmd_rollback}[args.command](dp, args)
+                "rollback": cmd_rollback, "compact-verify": cmd_compact_verify,
+                "compact-build": cmd_compact_build, "compact-check": cmd_compact_check}[
+                    args.command](dp, args)
     except (pa.ArrowException, OSError) as e:
         print(f"upgrade failed: {str(e).splitlines()[0]}", file=sys.stderr)
         return 3
