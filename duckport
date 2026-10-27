@@ -1254,9 +1254,10 @@ _wait_server() {
 # 停服务端并等它真的退出。macOS 的 launchctl bootout 不等进程结束，而 duckport-server
 # 收到 SIGTERM 后要先做 checkpoint，库大时要一会儿；这期间端口还占着，马上拉起的新进程
 # 因为端口被占而退出——launchd 只重启崩溃的进程，于是服务端就一直没起来。
-# Linux 的 systemctl stop 自己会等（超时则 kill），这里的等待只是兜底。
+# Linux 的 systemctl stop 自己会等（unit 的 TimeoutStopSec，deploy.sh 写的是 900 秒，到点 kill），
+# 这里的等待只是兜底，上限和它一致；macOS 没有超时，全靠这里。
 _stop_server_and_wait() {
-  local port="$1" timeout="${2:-300}" i
+  local port="$1" timeout="${2:-900}" i
   _svc_stop "$SVC_SERVER"
   for ((i = 0; i < timeout; i++)); do
     if ! nc -z localhost "$port" 2>/dev/null && ! pgrep -f "^${DEPLOY_BIN}/duckport-server" >/dev/null 2>&1; then

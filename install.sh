@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 # duckport-rs 一键安装脚本
 #
-# 公开仓库：
 #   curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
-#
-# 私有仓库（需先设置 GITHUB_TOKEN）：
-#   export GITHUB_TOKEN=ghp_xxxx
-#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-#     https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install.sh | bash
 #
 # 传参示例（升级模式）：
 #   curl -fsSL ... | bash -s -- --upgrade
@@ -37,12 +31,8 @@ else
   INSTALL_DIR="$HOME/code/duckport-rs"
 fi
 
-# 构造带认证的 clone URL（私有仓库需要 GITHUB_TOKEN）
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  CLONE_URL="https://x-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
-else
-  CLONE_URL="https://github.com/${REPO}.git"
-fi
+# 仓库是公开的，clone 不带凭证（带了会原样留在 .git/config 里）
+CLONE_URL="https://github.com/${REPO}.git"
 
 echo "▶ duckport-rs installer"
 echo "  仓库：https://github.com/${REPO}"

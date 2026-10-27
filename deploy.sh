@@ -375,7 +375,9 @@ EnvironmentFile=${DEPLOY_OPT}/server.env
 ExecStart=${DEPLOY_BIN}/duckport-server
 # SIGTERM → drain inflight RPCs → CHECKPOINT → exit 0
 KillSignal=SIGTERM
-TimeoutStopSec=60
+# 停服要把 WAL checkpoint 进库文件再关库，几百 GB 的库要几分钟；60 秒会在半路被 SIGKILL
+# （pro.studio 273 GB 时发生过，下次启动只能回放 WAL）。systemd 到点就杀，CLI 等多久都没用。
+TimeoutStopSec=900
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
