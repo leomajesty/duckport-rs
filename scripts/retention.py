@@ -9,6 +9,14 @@ Usually run through `duckport retention ...`.
     retention.py ... dry-run [table]
     retention.py ... run [table]
     retention.py ... log [table] [-n 20]
+    retention.py ... --instances-file F check [--instance I [--fresh-only] | --table T]
+
+`set` and `check` warn when a table's history starts far before the retention cutoff
+(reconcile.startgap); --instances-file supplies each instance's START_DATE. A policy table
+nobody has written yet is checked against the given instance, or against every instance
+when asking about a table. --fresh-only keeps the tables the next start would backfill
+from scratch. check exits 0 nothing to warn about, 1 warned, 3 failed -- the CLI runs it
+before starting an instance and before loadhist, and after install or a config edit.
 """
 
 import argparse
@@ -17,7 +25,9 @@ import sys
 
 import pyarrow as pa
 
+from doctor import load_instances
 from duckport_flight import Duckport, lit
+from reconcile import startgap
 
 IDENT = re.compile(r"^[A-Za-z0-9_]{1,128}$")
 
@@ -33,6 +43,22 @@ def keyed(dp, table):
         f"AND table_name = {lit(table)} AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')")
     rows += dp.query(f"SELECT count(*) AS n FROM duckdb_indexes() WHERE schema_name = 'data' AND table_name = {lit(table)}")
     return sum(r["n"] for r in rows) > 0
+
+
+def start_gaps(dp, args, table=None, instance=None, fresh_only=False):
+    instances = load_instances(args.instances_file)
+    starts = {i.name: i.start_date for i in instances if i.start_date}
+    candidates = [instance] if instance else [i.name for i in instances]
+    policies, watermark = startgap.load(dp)
+    return [g for g in startgap.gaps(policies, watermark, starts, candidates=candidates)
+            if (table is None or g.table == table) and (instance is None or g.instance == instance)
+            and (g.fresh or not fresh_only)]
+
+
+def print_gaps(gaps):
+    for g in gaps:
+        gap, cost, fix = g.describe()
+        print(f"\033[1;33m⚠ data.{g.table}：{gap}\033[0m\n    {cost}\n    {fix}")
 
 
 def cmd_status(dp, args):
@@ -71,7 +97,14 @@ def cmd_set(dp, args):
         "(table_name, keep_days, batch_days, archive_dir, enabled, updated_at) VALUES "
         f"({lit(args.table)}, {args.keep_days}, {args.batch_days}, {archive}, true, now()::TIMESTAMP)"})
     print(f"policy set: data.{args.table} keep {args.keep_days} days")
+    print_gaps(start_gaps(dp, args, table=args.table))
     return 0
+
+
+def cmd_check(dp, args):
+    gaps = start_gaps(dp, args, table=args.table, instance=args.instance, fresh_only=args.fresh_only)
+    print_gaps(gaps)
+    return 1 if gaps else 0
 
 
 def cmd_disable(dp, args):
@@ -124,6 +157,7 @@ def cmd_log(dp, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--addr", default="127.0.0.1:50051")
+    ap.add_argument("--instances-file", default="", help="instances with their START_DATE (from the CLI)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status"); s.add_argument("--brief", action="store_true")
     s = sub.add_parser("set"); s.add_argument("table"); s.add_argument("keep_days", type=int)
@@ -132,6 +166,8 @@ def main():
     s = sub.add_parser("dry-run"); s.add_argument("table", nargs="?")
     s = sub.add_parser("run"); s.add_argument("table", nargs="?")
     s = sub.add_parser("log"); s.add_argument("table", nargs="?"); s.add_argument("-n", type=int, default=20)
+    s = sub.add_parser("check"); s.add_argument("--table"); s.add_argument("--instance")
+    s.add_argument("--fresh-only", action="store_true")
     args = ap.parse_args()
     dp = Duckport(args.addr)
     try:
@@ -143,10 +179,12 @@ def main():
             return cmd_disable(dp, args)
         if args.cmd in ("run", "dry-run"):
             return run(dp, args.table, args.cmd == "dry-run")
+        if args.cmd == "check":
+            return cmd_check(dp, args)
         return cmd_log(dp, args)
     except (pa.ArrowException, OSError) as e:
         print(f"error: {str(e).splitlines()[0]}", file=sys.stderr)
-        return 1
+        return 3 if args.cmd == "check" else 1
 
 
 if __name__ == "__main__":

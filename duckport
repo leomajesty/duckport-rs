@@ -12,7 +12,7 @@
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
 #   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
-#   duckport loadhist [<实例>]           # 补历史数据
+#   duckport loadhist <实例>             # 补历史数据（必须指定实例）
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
 #   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
 #   duckport doctor  [--deep] [--json]   # 对照当前版本检查库的状态（只读）
@@ -199,17 +199,21 @@ _flight_python() {
 
 # 已安装的插件实例清单（JSON 写入 $1）：实例名、插件命令、安装版本、是否运行中。
 # 版本按 console script 名找到所属的发行包再读取，第三方插件同样适用。
+# start_date：config.env 里的 START_DATE（插件补历史的起点），没有就留空；
+# retention 用它判断补进来的历史会不会马上被删掉（scripts/reconcile/startgap.py）。
 _instances_json() {
-  local out="$1" inst first=1 exec_name ver active
+  local out="$1" inst first=1 exec_name ver active start
   echo "[" > "$out"
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
     exec_name=$(_instance_exec "$inst")
     ver=$(_instance_version "$inst")
     [[ "$(_svc_is_active "$SVC_INGESTOR@$inst")" == "active" ]] && active=true || active=false
+    start=$(grep -m1 '^START_DATE=' "$INGESTORS_DIR/$inst/config.env" 2>/dev/null \
+            | cut -d= -f2- | tr -d "\"' ") || start=""
     [[ $first -eq 1 ]] && first=0 || echo "," >> "$out"
-    printf '{"instance": "%s", "exec": "%s", "version": "%s", "active": %s}' \
-      "$inst" "$exec_name" "$ver" "$active" >> "$out"
+    printf '{"instance": "%s", "exec": "%s", "version": "%s", "active": %s, "start_date": "%s"}' \
+      "$inst" "$exec_name" "$ver" "$active" "$start" >> "$out"
   done <<< "$(_list_instances)"
   echo "]" >> "$out"
 }
@@ -436,10 +440,31 @@ cmd_retention() {
     status|set|disable|dry-run|run|log) ;;
     *) echo -e "${RED}用法：duckport retention [status|set|disable|dry-run|run|log] ...${NC}"; exit 1 ;;
   esac
-  local port
+  local port inv rc=0
   port=$(_server_port)
   nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
-  "$(_flight_python)" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$port" "$sub" "$@"
+  inv=$(mktemp)
+  if [[ "$sub" == "set" ]]; then _instances_json "$inv"; else echo "[]" > "$inv"; fi
+  "$(_flight_python)" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$port" \
+      --instances-file "$inv" "$sub" "$@" || rc=$?
+  rm -f "$inv"
+  return $rc
+}
+
+# 插件的起始日期远早于 retention 保留窗口时提醒：补进来的那段历史随后会被 retention 删掉。
+# 参数原样交给 retention.py check（--instance X 或 --table T）。给出了提醒返回 1；
+# 服务端没在跑、或检查本身失败时不提醒，返回 0——它只是提醒，不能挡住调用它的命令。
+_start_gap_check() {
+  local port inv rc=0
+  port=$(_server_port)
+  nc -z localhost "$port" 2>/dev/null || return 0
+  inv=$(mktemp)
+  _instances_json "$inv"
+  "$(_flight_python)" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$port" \
+      --instances-file "$inv" check "$@" || rc=$?
+  rm -f "$inv"
+  if [[ $rc -eq 1 ]]; then return 1; fi
+  return 0
 }
 
 # ─── 停写窗口 ─────────────────────────────────────────────────────────────────
@@ -479,13 +504,28 @@ cmd_start() {
     _svc_start "$SVC_SERVER"
     echo -e "  ${GREEN}✓${NC} duckport-server started"
     [[ "$arg" == "server" ]] && return
-    sleep 2
+    # 启动实例前要查库（见下）：等服务端监听，最多 30 秒
+    local port i
+    port=$(_server_port)
+    for i in $(seq 1 30); do nc -z localhost "$port" 2>/dev/null && break; sleep 1; done
   fi
 
-  local instances
+  # 循环的标准输入是实例列表，终端要在进循环前判断，提示从 /dev/tty 读
+  local instances gap ans tty=0
+  [[ -t 0 ]] && tty=1
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
+    # 新实例、或实例新加的数据源：还没有数据的表一启动就从 START_DATE 补起
+    gap=0
+    _start_gap_check --instance "$inst" --fresh-only < /dev/null || gap=$?
+    if [[ $gap -eq 1 && $tty -eq 1 ]]; then
+      read -r -p "仍要启动 $inst？[y/N] " ans < /dev/tty
+      if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo -e "  ${YELLOW}跳过 $inst${NC}"
+        continue
+      fi
+    fi
     _svc_start "$SVC_INGESTOR@$inst"
     echo -e "  ${GREEN}✓${NC} duckport-ingestor@$inst started"
   done <<< "$instances"
@@ -785,6 +825,7 @@ PLISTEOF
   echo -e "  配置文件：$cfg"
   echo -e "  编辑配置：${BOLD}duckport config $INST_NAME${NC}"
   echo -e "  启动服务：${BOLD}duckport start $INST_NAME${NC}"
+  _start_gap_check --instance "$INST_NAME" || true
 }
 
 # ─── config（打开实例配置文件）───────────────────────────────────────────────
@@ -803,6 +844,7 @@ cmd_config() {
   fi
 
   ${EDITOR:-nano} "$cfg"
+  _start_gap_check --instance "$name" || true
 }
 
 # ─── rm（删除实例）───────────────────────────────────────────────────────────
@@ -833,34 +875,43 @@ cmd_rm() {
 
 cmd_loadhist() {
   _require_root
-  local name="${1:-}"
-  local instances
-
-  if [[ -n "$name" ]]; then
-    instances="$name"
-  else
-    instances=$(_list_instances)
-    [[ -n "$instances" ]] || { echo -e "${RED}无已注册实例${NC}"; exit 1; }
+  local inst="${1:-}" py cfg bin gap=0 ans
+  if [[ -z "$inst" ]]; then
+    echo -e "${RED}用法：duckport loadhist <实例名>${NC}"
+    echo "已注册实例："
+    _list_instances | sed 's/^/  /'
+    exit 1
+  fi
+  py=$(_instance_python "$inst")
+  cfg="$INGESTORS_DIR/$inst/config.env"
+  bin="$INGESTORS_DIR/$inst/.venv/bin/loadhist"
+  if [[ ! -x "$py" || ! -f "$cfg" ]]; then
+    echo -e "${RED}未找到实例或环境不完整：$inst${NC}"
+    echo "已注册实例："
+    _list_instances | sed 's/^/  /'
+    exit 1
+  fi
+  # 先检查再停实例：没有 loadhist 的插件（例如 binance-funding 自己在启动时补历史）不该被停掉
+  if [[ ! -x "$bin" ]]; then
+    echo -e "${YELLOW}$inst（$(_instance_exec "$inst")）没有 loadhist，未做任何操作，实例未停止${NC}"
+    exit 1
   fi
 
-  while IFS= read -r inst; do
-    [[ -z "$inst" ]] && continue
-    local py cfg
-    py=$(_instance_python "$inst")
-    cfg="$INGESTORS_DIR/$inst/config.env"
-    [[ -x "$py" && -f "$cfg" ]] || { echo -e "${YELLOW}跳过 $inst（环境不完整）${NC}"; continue; }
+  _start_gap_check --instance "$inst" || gap=$?
+  if [[ $gap -eq 1 && -t 0 ]]; then
+    read -r -p "仍要补历史？[y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消，$inst 未停止"; exit 0; }
+  fi
 
-    echo -e "\n${BOLD}▶ loadhist — $inst${NC}"
-    echo -e "  ${YELLOW}⚠ 停止 ingestor 以独占 staging 表${NC}"
-    _svc_stop "$SVC_INGESTOR@$inst"
+  echo -e "\n${BOLD}▶ loadhist — $inst${NC}"
+  echo -e "  ${YELLOW}⚠ 停止 ingestor 以独占 staging 表${NC}"
+  _svc_stop "$SVC_INGESTOR@$inst"
 
-    INGESTOR_ENV_FILE="$cfg" \
-      "$INGESTORS_DIR/$inst/.venv/bin/loadhist" && \
-      echo -e "  ${GREEN}✓ loadhist 完成${NC}" || \
-      echo -e "  ${RED}✗ loadhist 失败${NC}"
+  INGESTOR_ENV_FILE="$cfg" "$bin" && \
+    echo -e "  ${GREEN}✓ loadhist 完成${NC}" || \
+    echo -e "  ${RED}✗ loadhist 失败${NC}"
 
-    echo -e "  ${YELLOW}提示：请手动执行 duckport start $inst 以恢复采集${NC}"
-  done <<< "$instances"
+  echo -e "  ${YELLOW}提示：请手动执行 duckport start $inst 以恢复采集${NC}"
 }
 
 # ─── update（更新插件）────────────────────────────────────────────────────────
@@ -1393,7 +1444,7 @@ ${BOLD}服务控制：${NC}
   duckport ${CYAN}logs${NC}    <实例名|server|all>    实时日志
 
 ${BOLD}数据操作：${NC}
-  duckport ${CYAN}loadhist${NC} [实例名]              补历史数据（默认所有实例）
+  duckport ${CYAN}loadhist${NC} <实例名>              补历史数据（必须指定实例）
   duckport ${CYAN}retention${NC} status               保留策略与最近一次执行结果
   duckport ${CYAN}retention${NC} set <表> <天数>       设置保留天数（--archive-dir DIR 先归档再删）
   duckport ${CYAN}retention${NC} disable <表>          停用某张表的策略

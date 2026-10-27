@@ -17,6 +17,7 @@ from reconcile.specs import (
     LEFTOVER_SUFFIXES, PLUGIN_MIN_VERSION, RETIRED_DUCK_TIME_KEY, RETIRED_TABLES,
     SERVER_MIN_VERSION, SYSTEM_TABLES, version_at_least,
 )
+from reconcile import startgap
 from reconcile.state import State, q_ident
 
 LEVELS = ("block", "stop", "online", "hint")
@@ -385,6 +386,15 @@ def retention_targets(state, dp, opts):
             yield Finding("R1", "hint", p["table_name"], "retention 策略引用的表不存在")
         elif t.keyed:
             yield Finding("R1", "hint", p["table_name"], "retention 会跳过这张表（带主键），去主键后才生效")
+
+
+@rule("R2")
+def retention_start_gap(state, dp, opts):
+    starts = {i.name: i.start_date for i in state.instances if i.start_date}
+    candidates = [i.name for i in state.instances]
+    for g in startgap.gaps(state.retention_policies, state.watermark, starts, candidates=candidates):
+        gap, cost, fix = g.describe()
+        yield Finding("R2", "hint", g.table, f"{gap}；{cost}", fix)
 
 
 @rule("P1")

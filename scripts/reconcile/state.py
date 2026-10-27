@@ -17,6 +17,7 @@ class Instance:
     exec: str
     version: Optional[str] = None
     active: bool = False
+    start_date: Optional[str] = None   # START_DATE in its config.env, when it has one
 
 
 @dataclass

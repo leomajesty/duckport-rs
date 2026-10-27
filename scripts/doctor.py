@@ -29,7 +29,8 @@ def load_instances(path):
         return []
     with open(path) as f:
         return [Instance(name=i["instance"], exec=i.get("exec", ""), version=i.get("version") or None,
-                         active=bool(i.get("active"))) for i in json.load(f)]
+                         active=bool(i.get("active")), start_date=i.get("start_date") or None)
+                for i in json.load(f)]
 
 
 def exit_code(findings):
