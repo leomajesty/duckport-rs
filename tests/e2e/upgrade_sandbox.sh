@@ -6,7 +6,11 @@
 # release and both plugins at their 0.1.0 commits, writing real Binance data into keyed
 # tables. Then runs `duckport upgrade` against "origin" repositories holding the commits
 # under test, and checks: server restarted at the new version, plugins reinstalled and
-# running, data aligned (doctor clean), ingestors still writing, a second run does nothing.
+# running, data aligned (doctor clean), ingestors still writing, a second run does nothing,
+# and the release binary is only downloaded when its sha256 differs, and then verified.
+#
+# With LEGACY_CLI=<tag> the upgrade is started by that release's CLI instead. Its `upgrade`
+# only pulls and runs deploy.sh, so deploy.sh has to hand over to the new CLI.
 #
 # Needs root, systemd, uv, network (via $PROXY) and the three repositories checked out
 # side by side with the commits to test (uncommitted changes are not used).
@@ -14,6 +18,7 @@
 #   sudo tests/e2e/upgrade_sandbox.sh            # run, then remove the sandbox
 #   sudo KEEP=1 tests/e2e/upgrade_sandbox.sh     # keep it for inspection
 #   sudo tests/e2e/upgrade_sandbox.sh --cleanup  # remove a kept sandbox
+#   sudo LEGACY_CLI=v1.0.4 tests/e2e/upgrade_sandbox.sh  # start the upgrade with the v1.0.4 CLI
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,6 +29,7 @@ PORT="${PORT:-50081}"
 PROXY="${PROXY:-http://localhost:1082}"
 OLD_SERVER_TAG="${OLD_SERVER_TAG:-v1.0.4}"
 OLD_SERVER_BIN="${OLD_SERVER_BIN:-}"      # a local copy of that release binary skips the download
+LEGACY_CLI="${LEGACY_CLI:-}"              # start the upgrade with this release's CLI (e.g. v1.0.4)
 OLD_INGESTOR="${OLD_INGESTOR:-4c8f295}"   # binance-ingestor 0.1.0
 OLD_FUNDING="${OLD_FUNDING:-a049f7f}"     # binance-funding 0.1.0
 PROD_PORT="${PROD_PORT:-8815}"            # the real deployment, which must stay untouched
@@ -127,15 +133,32 @@ keyed=$(scalar "$PORT" "SELECT count(*) FROM duckdb_constraints() WHERE schema_n
   || fail "a sandbox instance wrote to the real deployment"
 rows_before=$(scalar "$PORT" "SELECT count(*) FROM data.usdt_perp_5m")
 
-step "duckport upgrade --plan"
-rc=0; "$CLI" upgrade --plan --proxy "$PROXY" | tee "$SBX/plan.log" || rc=$?
-[[ $rc -eq 1 ]] || fail "plan exit $rc (expected 1: work to do, nothing blocked once plugins are upgraded)"
-grep -q "v1.0.4 → v" "$SBX/plan.log" || fail "plan does not show the server upgrade"
+if [[ -n "$LEGACY_CLI" ]]; then
+  # No --plan here: a legacy CLI ignores its arguments and would run the upgrade.
+  step "$LEGACY_CLI CLI: its upgrade only pulls and runs deploy.sh"
+  # That CLI has /opt/duckport built in; point it at the sandbox.
+  git -C "$REPO" show "$LEGACY_CLI:duckport" | sed "s|DEPLOY_OPT=\"/opt/duckport\"|DEPLOY_OPT=\"$SBX/opt\"|" > "$CLI"
+  grep -q "DEPLOY_OPT=\"$SBX/opt\"" "$CLI" || fail "could not point the $LEGACY_CLI CLI at the sandbox"
+  grep -q "^cmd_upgrade()" "$CLI" && ! grep -q -- "--after-pull" "$CLI" || fail "$LEGACY_CLI is not a legacy CLI"
+else
+  step "duckport upgrade --plan"
+  rc=0; "$CLI" upgrade --plan --proxy "$PROXY" | tee "$SBX/plan.log" || rc=$?
+  [[ $rc -eq 1 ]] || fail "plan exit $rc (expected 1: work to do, nothing blocked once plugins are upgraded)"
+  grep -q "v1.0.4 → v" "$SBX/plan.log" || fail "plan does not show the server upgrade"
+fi
 
 step "duckport upgrade --yes"
 t_upgrade=$(date -u '+%F %T')
-"$CLI" upgrade --yes --proxy "$PROXY" --delete-bad-rows 2>&1 | tee "$SBX/upgrade-1.log"
+# A legacy CLI runs deploy.sh without DEPLOY_OPT, which would mean /opt/duckport.
+DEPLOY_OPT="$SBX/opt" DEPLOY_DATA="$SBX/data" \
+  "$CLI" upgrade --yes --proxy "$PROXY" --delete-bad-rows 2>&1 | tee "$SBX/upgrade-1.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "upgrade failed"
+grep -q "sha256 校验通过" "$SBX/upgrade-1.log" || fail "the downloaded binary was not checked against the release digest"
+if [[ -n "$LEGACY_CLI" ]]; then
+  grep -q "交给新版 CLI 继续升级" "$SBX/upgrade-1.log" || fail "deploy.sh did not hand over to the new CLI"
+  grep -q "升级已经在上面完成" "$SBX/upgrade-1.log" || fail "no note about the legacy CLI's restart hint"
+  cmp -s "$CLI" "$SBX/code/duckport-rs/duckport" || fail "the new CLI was not installed"
+fi
 
 step "checks"
 want=$(grep -m1 '^version = ' "$SBX/code/duckport-rs/Cargo.toml" | cut -d'"' -f2)
@@ -173,6 +196,7 @@ step "second run: nothing to do"
 "$CLI" upgrade --yes --proxy "$PROXY" 2>&1 | tee "$SBX/upgrade-2.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "second upgrade failed"
 grep -q "不需要重启" "$SBX/upgrade-2.log" || fail "second run restarted the server"
+grep -q "sha256 与 release 一致），跳过下载" "$SBX/upgrade-2.log" || fail "second run downloaded the binary again"
 grep -q "已与期望状态一致" "$SBX/upgrade-2.log" || fail "second run changed data"
 "$CLI" upgrade --finalize
 
