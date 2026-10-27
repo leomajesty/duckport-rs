@@ -97,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/sjmc-quant/duckport-rs/main/install
 
 脚本自动完成：
 
-1. 克隆仓库到 `$HOME/code/duckport-rs`（可用 `DUCKPORT_INSTALL_DIR` 覆盖）
+1. 克隆仓库：以 root 运行放到 `/opt/duckport/src/duckport-rs`，否则 `$HOME/code/duckport-rs`；已有部署沿用 `/opt/duckport/repo_dir` 记录的位置（可用 `DUCKPORT_INSTALL_DIR` 覆盖）。仓库必须放在所有用户可读的位置：`duckport status / doctor / retention` 要读仓库里的脚本，放在 `/root` 下非 root 用户就用不了
 2. 从 GitHub Release 下载预构建的 `duckport-server` binary（MD5 比对，已安装且未变化时跳过）
 3. 无 Release 时自动回落到本机 `cargo build --release`
 4. 写入 `/opt/duckport/server.env`（已存在时跳过，不会覆盖已有配置）
@@ -132,7 +132,7 @@ sudo duckport upgrade --plan
 sudo duckport upgrade
 
 # 只重新配置环境（不重启服务）
-bash "$HOME/code/duckport-rs/deploy.sh"
+bash "$(cat /opt/duckport/repo_dir)/deploy.sh"
 ```
 
 ## 6. 手动构建与部署

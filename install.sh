@@ -16,7 +16,26 @@
 set -euo pipefail
 
 REPO="sjmc-quant/duckport-rs"
-INSTALL_DIR="${DUCKPORT_INSTALL_DIR:-$HOME/code/duckport-rs}"
+
+# 安装目录。已有部署就沿用它记录的仓库位置；否则以 root 安装时放到 /opt/duckport/src，而不是
+# /root 下：/root 对其他用户不可进入，而 duckport 命令要读仓库里的脚本，非 root 用户就用不了
+# doctor / retention / status 的 retention 部分（grid102 就是这样装出来的）。
+_recorded_repo() {
+  local f
+  for f in /opt/duckport/repo_dir "$HOME/.duckport/repo_dir"; do
+    [[ -r "$f" && -d "$(cat "$f" 2>/dev/null)/.git" ]] && { cat "$f"; return 0; }
+  done
+  return 1
+}
+if [[ -n "${DUCKPORT_INSTALL_DIR:-}" ]]; then
+  INSTALL_DIR="$DUCKPORT_INSTALL_DIR"
+elif INSTALL_DIR=$(_recorded_repo); then
+  :
+elif [[ "$(id -u)" -eq 0 && "$(uname -s)" == "Linux" ]]; then
+  INSTALL_DIR="/opt/duckport/src/duckport-rs"
+else
+  INSTALL_DIR="$HOME/code/duckport-rs"
+fi
 
 # 构造带认证的 clone URL（私有仓库需要 GITHUB_TOKEN）
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -34,6 +53,7 @@ if [[ -d "${INSTALL_DIR}/.git" ]]; then
   git -C "${INSTALL_DIR}" pull --ff-only
 else
   echo "▶ 克隆仓库到 ${INSTALL_DIR}..."
+  mkdir -p "$(dirname "${INSTALL_DIR}")"
   git clone "${CLONE_URL}" "${INSTALL_DIR}"
 fi
 

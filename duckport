@@ -184,6 +184,17 @@ _server_port() {
 }
 
 # 带 pyarrow 的 Python：优先用第一个 ingestor 实例的 venv，回退到系统 python3
+# 已安装的 duckport 命令只是 $REPO_DIR/duckport 的副本；doctor、retention、status 的 retention
+# 部分和 upgrade 都要读 $REPO_DIR/scripts/*.py。仓库在 root 的家目录下时（以 root 运行旧版
+# install.sh 的默认位置 /root/code），非 root 用户读不到它。
+_scripts_readable() { [[ -r "$REPO_DIR/scripts/doctor.py" ]]; }
+_scripts_unreadable_hint() {
+  echo -e "${RED}仓库 ${REPO_DIR} 对当前用户 $(id -un) 不可读${NC}"
+  echo -e "  用 sudo 执行；或者把仓库放到所有用户可读的位置并更新 ${DEPLOY_OPT}/repo_dir，例如："
+  echo -e "    sudo mkdir -p ${DEPLOY_OPT}/src && sudo mv ${REPO_DIR} ${DEPLOY_OPT}/src/duckport-rs"
+  echo -e "    echo ${DEPLOY_OPT}/src/duckport-rs | sudo tee ${DEPLOY_OPT}/repo_dir"
+}
+
 _flight_python() {
   local py candidate inst
   py=$(command -v python3)
@@ -413,8 +424,17 @@ PYEOF
   else
     echo -e "  scheduler ${DIM}○ disabled${NC}"
   fi
-  "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>/dev/null \
-    || echo -e "  ${DIM}无法读取 data.retention_policy（服务端版本低于 1.1.0？）${NC}"
+  if ! _scripts_readable; then
+    echo -e "  ${DIM}（策略列表要读 ${REPO_DIR}/scripts，当前用户不可读：用 sudo，或把仓库移到所有用户可读的位置）${NC}"
+  else
+    local ret_err
+    ret_err=$(mktemp)
+    if ! "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>"$ret_err"; then
+      # 说清楚是哪一种读不到：python 环境对当前用户不可用、服务端太旧……都在 stderr 的最后一行
+      echo -e "  ${DIM}无法读取 data.retention_policy：$(tail -n 1 "$ret_err" 2>/dev/null | cut -c1-120)${NC}"
+    fi
+    rm -f "$ret_err"
+  fi
   echo ""
 }
 
@@ -423,6 +443,7 @@ PYEOF
 # 对照当前版本的期望状态检查数据库，只读。退出码：0 一致，1 有待对齐项，2 有阻断项，3 检查失败。
 cmd_doctor() {
   local port inv rc=0
+  _scripts_readable || { _scripts_unreadable_hint; exit 3; }
   port=$(_server_port)
   nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 3; }
   inv=$(mktemp)
@@ -442,6 +463,7 @@ cmd_retention() {
     *) echo -e "${RED}用法：duckport retention [status|set|disable|dry-run|run|log] ...${NC}"; exit 1 ;;
   esac
   local port inv rc=0
+  _scripts_readable || { _scripts_unreadable_hint; exit 1; }
   port=$(_server_port)
   nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 1; }
   inv=$(mktemp)
@@ -457,6 +479,7 @@ cmd_retention() {
 # 服务端没在跑、或检查本身失败时不提醒，返回 0——它只是提醒，不能挡住调用它的命令。
 _start_gap_check() {
   local port inv rc=0
+  _scripts_readable || return 0
   port=$(_server_port)
   nc -z localhost "$port" 2>/dev/null || return 0
   inv=$(mktemp)
@@ -1044,6 +1067,7 @@ cmd_upgrade() {
     shift
   done
   [[ -n "$proxy" ]] && _use_proxy "$proxy"
+  _scripts_readable || { _scripts_unreadable_hint; exit 1; }
 
   case "$mode" in
     full)
