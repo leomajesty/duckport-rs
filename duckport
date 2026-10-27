@@ -286,7 +286,7 @@ cmd_status() {
     done <<< "$instances"
   fi
 
-  echo -e "\n${BOLD}数据水位${NC}"
+  echo -e "\n${BOLD}Watermark${NC}"
   if ! nc -z localhost "$server_port" 2>/dev/null; then
     echo -e "  ${DIM}duckport-server 未监听 :${server_port}${NC}\n"
     return
