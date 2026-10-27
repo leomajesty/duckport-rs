@@ -504,13 +504,28 @@ cmd_start() {
     _svc_start "$SVC_SERVER"
     echo -e "  ${GREEN}✓${NC} duckport-server started"
     [[ "$arg" == "server" ]] && return
-    sleep 2
+    # 启动实例前要查库（见下）：等服务端监听，最多 30 秒
+    local port i
+    port=$(_server_port)
+    for i in $(seq 1 30); do nc -z localhost "$port" 2>/dev/null && break; sleep 1; done
   fi
 
-  local instances
+  # 循环的标准输入是实例列表，终端要在进循环前判断，提示从 /dev/tty 读
+  local instances gap ans tty=0
+  [[ -t 0 ]] && tty=1
   instances=$(_resolve_instances "$arg")
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
+    # 新实例、或实例新加的数据源：还没有数据的表一启动就从 START_DATE 补起
+    gap=0
+    _start_gap_check --instance "$inst" --fresh-only < /dev/null || gap=$?
+    if [[ $gap -eq 1 && $tty -eq 1 ]]; then
+      read -r -p "仍要启动 $inst？[y/N] " ans < /dev/tty
+      if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo -e "  ${YELLOW}跳过 $inst${NC}"
+        continue
+      fi
+    fi
     _svc_start "$SVC_INGESTOR@$inst"
     echo -e "  ${GREEN}✓${NC} duckport-ingestor@$inst started"
   done <<< "$instances"

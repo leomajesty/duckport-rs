@@ -391,7 +391,8 @@ def retention_targets(state, dp, opts):
 @rule("R2")
 def retention_start_gap(state, dp, opts):
     starts = {i.name: i.start_date for i in state.instances if i.start_date}
-    for g in startgap.gaps(state.retention_policies, state.watermark, starts):
+    candidates = [i.name for i in state.instances]
+    for g in startgap.gaps(state.retention_policies, state.watermark, starts, candidates=candidates):
         gap, cost, fix = g.describe()
         yield Finding("R2", "hint", g.table, f"{gap}；{cost}", fix)
 

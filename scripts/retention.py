@@ -9,12 +9,14 @@ Usually run through `duckport retention ...`.
     retention.py ... dry-run [table]
     retention.py ... run [table]
     retention.py ... log [table] [-n 20]
-    retention.py ... --instances-file F check [--instance I | --table T]
+    retention.py ... --instances-file F check [--instance I [--fresh-only] | --table T]
 
 `set` and `check` warn when a table's history starts far before the retention cutoff
-(reconcile.startgap); --instances-file supplies each instance's START_DATE. check exits
-0 nothing to warn about, 1 warned, 3 failed — the CLI runs it before loadhist and after
-editing an instance's config.
+(reconcile.startgap); --instances-file supplies each instance's START_DATE. A policy table
+nobody has written yet is checked against the given instance, or against every instance
+when asking about a table. --fresh-only keeps the tables the next start would backfill
+from scratch. check exits 0 nothing to warn about, 1 warned, 3 failed -- the CLI runs it
+before starting an instance and before loadhist, and after install or a config edit.
 """
 
 import argparse
@@ -43,11 +45,14 @@ def keyed(dp, table):
     return sum(r["n"] for r in rows) > 0
 
 
-def start_gaps(dp, args, table=None, instance=None):
-    starts = {i.name: i.start_date for i in load_instances(args.instances_file) if i.start_date}
+def start_gaps(dp, args, table=None, instance=None, fresh_only=False):
+    instances = load_instances(args.instances_file)
+    starts = {i.name: i.start_date for i in instances if i.start_date}
+    candidates = [instance] if instance else [i.name for i in instances]
     policies, watermark = startgap.load(dp)
-    return [g for g in startgap.gaps(policies, watermark, starts)
-            if (table is None or g.table == table) and (instance is None or g.instance == instance)]
+    return [g for g in startgap.gaps(policies, watermark, starts, candidates=candidates)
+            if (table is None or g.table == table) and (instance is None or g.instance == instance)
+            and (g.fresh or not fresh_only)]
 
 
 def print_gaps(gaps):
@@ -97,7 +102,7 @@ def cmd_set(dp, args):
 
 
 def cmd_check(dp, args):
-    gaps = start_gaps(dp, args, table=args.table, instance=args.instance)
+    gaps = start_gaps(dp, args, table=args.table, instance=args.instance, fresh_only=args.fresh_only)
     print_gaps(gaps)
     return 1 if gaps else 0
 
@@ -162,6 +167,7 @@ def main():
     s = sub.add_parser("run"); s.add_argument("table", nargs="?")
     s = sub.add_parser("log"); s.add_argument("table", nargs="?"); s.add_argument("-n", type=int, default=20)
     s = sub.add_parser("check"); s.add_argument("--table"); s.add_argument("--instance")
+    s.add_argument("--fresh-only", action="store_true")
     args = ap.parse_args()
     dp = Duckport(args.addr)
     try:

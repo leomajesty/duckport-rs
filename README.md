@@ -192,7 +192,7 @@ sudo duckport doctor                # 只读：对照当前版本的期望状态
 sudo duckport upgrade               # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划，--proxy 走代理）；见 upgrade.md
 ```
 
-插件的起始日期（实例配置里的 `START_DATE`，没有时取 `data.watermark.start_time`）比 retention 的 cutoff 早得多时，补历史拉进来的大部分数据会被随后的 retention 删掉，而且删除后库文件不会变小。`duckport retention set`、`duckport loadhist`、`duckport config` 会在这种情况下提醒（`loadhist` 在终端里还会先确认），`duckport doctor` 显示为 R2 提示。判定标准：被删掉的天数超过保留的天数，且至少 30 天；建议把 `START_DATE` 设为 cutoff 前 7 天左右。
+插件的起始日期（实例配置里的 `START_DATE`，没有时取 `data.watermark.start_time`）比 retention 的 cutoff 早得多时，补历史拉进来的大部分数据会被随后的 retention 删掉，而且删除后库文件不会变小。`duckport retention set`、`duckport loadhist`、`duckport config`、`duckport install`、`duckport start` 会在这种情况下提醒（`loadhist` 和 `start` 在终端里还会先确认），`duckport doctor` 显示为 R2 提示。还没被任何实例写过的表（新实例、或实例新加的数据源）在首次启动前就会按该实例的 `START_DATE` 检查。判定标准：被删掉的天数超过保留的天数，且至少 30 天；建议把 `START_DATE` 设为 cutoff 前 7 天左右。
 
 ### 本地开发
 

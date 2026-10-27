@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """scripts/doctor.py end-to-end test: target state, a legacy database, mixed versions, and
-a plugin start far before the retention cutoff (R2, plus `retention.py check` / `set`).
+a plugin start far before the retention cutoff (R2, plus `retention.py check` / `set`),
+including tables no instance has written yet.
 
 Prerequisites:
   DUCKPORT_DB_PATH=/tmp/doctor.db cargo run --bin duckport-server    (fresh database)
@@ -128,6 +129,36 @@ def main():
         assert not has(f, "R2", "hint", "usdt_perp_1m"), "a disabled policy deletes nothing"
     finally:
         tx(client, "DELETE FROM data.retention_policy")  # test_upgrade.py runs next on the same server
+
+    hr("a policy table nobody has written yet: checked against the instance that may start writing it")
+    target_state(client)  # usdt_perp_1m is written by bn1m; usdt_spot_1m does not exist yet
+    tx(client, "INSERT INTO data.retention_policy (table_name, keep_days, batch_days, enabled, updated_at) VALUES "
+       "('usdt_spot_1m', 120, 1, true, now()::TIMESTAMP), ('usdt_perp_1m', 120, 1, true, now()::TIMESTAMP)",
+       "UPDATE data.watermark SET start_time = TIMESTAMP '2021-01-01' WHERE table_name = 'usdt_perp_1m'")
+    early = [dict(NEW[0], start_date="2021-01-01"), NEW[1]]
+    try:
+        # before its first start: a new instance, or bn1m gaining usdt_spot as a data source
+        rc, out = run_script("retention.py", early, "check", "--instance", "bn1m", "--fresh-only")
+        assert rc == 1 and "usdt_spot_1m" in out and "还没有实例写入过" in out, (rc, out)
+        assert "usdt_perp_1m" not in out, "--fresh-only reported a table that is already being written"
+        rc, out = run_script("retention.py", early, "check", "--instance", "binance-funding")
+        assert rc == 0, "an instance without START_DATE cannot be judged (only the plugin knows its default)"
+        rc, out = run_script("retention.py", with_start(120 + 7), "check", "--instance", "bn1m")
+        assert rc == 0, out
+        rc, f = doctor(early)
+        assert has(f, "R2", "hint", "usdt_spot_1m"), f
+        rc, out = run_script("retention.py", early, "set", "usdt_spot_1m", "120")
+        assert rc == 0 and "还没有实例写入过" in out, "set on an empty table warns for each possible writer"
+
+        # once the plugin has written its watermark row, the table is attributed, not assumed
+        tx(client, "INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, "
+           "duck_time) VALUES ('usdt_spot_1m', 'bn1m', 900, 'open_time', TIMESTAMP '2021-01-01', NULL)")
+        rc, out = run_script("retention.py", early, "check", "--instance", "bn1m", "--fresh-only")
+        assert rc == 1 and "还没有 duck_time" in out and "还没有实例写入过" not in out, out
+        rc, out = run_script("retention.py", early, "check", "--instance", "binance-funding")
+        assert rc == 0, "a table bn1m owns was blamed on binance-funding"
+    finally:
+        tx(client, "DELETE FROM data.retention_policy")
 
     reset(client)
     print("\nALL DOCTOR TESTS PASSED")
