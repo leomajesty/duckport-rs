@@ -14,7 +14,7 @@
 #   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist [<实例>]           # 补历史数据
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
-#   duckport upgrade --data              # 只做数据对齐（--finalize、--rollback）
+#   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
 #   duckport doctor  [--deep] [--json]   # 对照当前版本检查库的状态（只读）
 
 set -euo pipefail
@@ -954,17 +954,20 @@ cmd_update() {
 #       2 插件：每个实例从 registry 的来源重装；版本变了就重启（第 1 步停掉的在这里启动）
 #       3 数据：同 --data
 #   duckport upgrade --plan [--to vX.Y.Z]       三个阶段各会做什么，不修改（会 git fetch）
-#   sudo duckport upgrade --data [--yes] [--deep] [--no-backup] [--delete-bad-rows]
+#   sudo duckport upgrade --data [--yes] [--deep] [--no-backup] [--no-compact] [--delete-bad-rows]
 #                                               只做第 3 步：只有在线修正时直接执行；需要停写时在一个窗口里
 #                                               （只停 ingestor）先备份到 <库目录>/backup/，再修正，最后复检
 #   sudo duckport upgrade --finalize            删除重建留下的 <表>__pk_old
 #   sudo duckport upgrade --rollback            把 <表>__pk_old 恢复为原表（停写）
+# 发生重建时，复检通过后同一条命令继续：校验重建结果 → 删除 <表>__pk_old → 整库重写压缩 →
+# 换文件并校验 → 删除换下的原文件。校验不过就用 <表>__pk_old 回退，换文件后校验不过就把原文件换回去。
+# --no-compact 停在重建之后，保留 <表>__pk_old，由 --finalize / --rollback 手动收尾。
 # --proxy 作用于 git、下载 release 和安装插件（uv）；本机的 gRPC 连接不走代理。
 # 磁盘或内存不够备份时给出警告，输入 go on without backup 才继续（--no-backup 跳过备份）。
 # 损坏或重复的行先列出样例，人工确认后才删除；--yes 不包括这一项（--delete-bad-rows 才包括）。
 # 每一步记入 data.upgrade_log；删除的行先导出到 <库目录>/quarantine/<run_id>/。
 cmd_upgrade() {
-  local mode="full" yes=0 no_backup=0 delete_bad=0 after_pull=0 to="" proxy="" extra=() plan_args=()
+  local mode="full" yes=0 no_backup=0 no_compact=0 delete_bad=0 after_pull=0 to="" proxy="" extra=() plan_args=()
   local orig_args=("$@")
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -974,6 +977,7 @@ cmd_upgrade() {
       --rollback) mode="rollback" ;;
       --yes|-y)   yes=1 ;;
       --no-backup) no_backup=1 ;;
+      --no-compact) no_compact=1 ;;
       --delete-bad-rows) delete_bad=1 ;;
       --deep)     extra+=(--deep) ;;
       --to)       to="${2:?--to 需要一个 tag，如 v1.2.0}"; shift ;;
@@ -1269,11 +1273,102 @@ _upgrade_db() {
     return 1
   fi
   echo -e "\n${GREEN}✓ 对齐完成${NC}（run_id=${run_id}）"
-  if [[ $window -eq 1 ]]; then
-    echo -e "  确认 ingestor 写入正常后：sudo duckport upgrade --finalize（删除 <表>__pk_old）；有问题：--rollback"
-    if [[ ${#backup_args[@]} -gt 0 ]]; then
-      echo -e "  备份：$(dirname "$db")/backup/duckport-${run_id}.db（恢复：停服后替换 ${db}，删除 ${db}.wal）；不再需要时手动删除"
-    fi
+  [[ $window -eq 1 ]] || return 0
+  if [[ ${#backup_args[@]} -gt 0 ]]; then
+    echo -e "  备份：$(dirname "$db")/backup/duckport-${run_id}.db（恢复：停服后替换 ${db}，删除 ${db}.wal）；不再需要时手动删除"
+  fi
+
+  # 重建留下的 <表>__pk_old 是迁移的备份。校验通过就删掉它们并把库压实，
+  # 校验不过就用它们回退——两条路都在这一条命令里走完。
+  echo -e "\n${BOLD}校验重建${NC}"
+  if ! "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
+       --run-id "$run_id" compact-verify; then
+    echo -e "\n${RED}重建校验未通过，正在用 <表>__pk_old 回退${NC}"
+    trap _start_stopped_ingestors EXIT
+    _stop_running_ingestors
+    "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
+        --run-id "$run_id" rollback || true
+    _start_stopped_ingestors
+    trap - EXIT
+    echo -e "${YELLOW}已回到重建之前的数据；原因见上，处理后可再次执行。${NC}"
+    return 1
+  fi
+  if [[ $no_compact -eq 1 ]]; then
+    echo -e "  ${YELLOW}--no-compact：保留 <表>__pk_old，未压缩${NC}"
+    echo -e "  需要时：sudo duckport upgrade --finalize（删除旧表）；有问题：--rollback"
+    return 0
+  fi
+  _compact_db "$py" "$port" "$db" "$run_id"
+}
+
+# 压缩：删除重建留下的 <表>__pk_old，并把整库重写成一个新文件。
+# DROP 只把 block 标记为空闲供后续写入复用，库文件本身不会变小；只有整库重写才真正把空间还给磁盘。
+# 重写期间原文件不动，它就是这一步的备份——换文件后校验通过才删，失败就换回去，
+# 所以库再大也不必先为自己腾出一份等大的拷贝。调用方需已 _require_root。
+_compact_db() {
+  local py="$1" port="$2" db="$3" run_id="$4"
+  local newdb="${db}.compact" bak="${db}.preswap" wal="${db}.wal"
+  local base ver
+  base=$(mktemp)
+  ver=$(_server_version "$port")
+
+  echo -e "\n${BOLD}压缩${NC}（停 ingestor；换文件时短暂停服务端）"
+  trap _start_stopped_ingestors EXIT
+  _stop_running_ingestors
+  if ! "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
+       --run-id "$run_id" compact-build --new-db "$newdb" --baseline-out "$base"; then
+    rm -f "$newdb" "$base"
+    _start_stopped_ingestors
+    trap - EXIT
+    echo -e "${YELLOW}未压缩；库可正常使用，腾出空间后可再执行。${NC}"
+    return 1
+  fi
+
+  # 换文件。原文件一旦移走，后面每一步失败都要走 _compact_restore 换回来，
+  # 所以这里不依赖 set -e：它只会让脚本带着一个不在原位的库文件退出。
+  _svc_stop "$SVC_SERVER"
+  if ! mv "$db" "$bak"; then
+    _svc_start "$SVC_SERVER"
+    _wait_server "$port" "$ver" || true
+    rm -f "$newdb" "$base"
+    _start_stopped_ingestors
+    trap - EXIT
+    echo -e "${RED}移走原文件失败，库未改动，未压缩${NC}"
+    return 1
+  fi
+  if [[ -f "$wal" ]]; then mv "$wal" "$bak.wal"; fi
+  rm -f "$newdb.wal"        # DETACH 后不该有；留着会被当成新库的 wal 回放
+
+  if mv "$newdb" "$db" && _svc_start "$SVC_SERVER" && _wait_server "$port" "$ver" &&
+     "$py" "$REPO_DIR/scripts/upgrade.py" --addr "127.0.0.1:$port" --db-path "$db" \
+         --run-id "$run_id" compact-check --baseline "$base"; then
+    rm -f "$bak" "$bak.wal" "$base"
+    _start_stopped_ingestors
+    trap - EXIT
+    echo -e "  ${GREEN}✓${NC} 已删除换下的原文件"
+    return 0
+  fi
+  _compact_restore "$port" "$db" "$newdb" "$bak" "$wal" "$ver"
+  rm -f "$base"
+  _start_stopped_ingestors
+  trap - EXIT
+  return 1
+}
+
+# 把换下的原文件换回原位；用于换文件之后任何一步失败。
+_compact_restore() {
+  local port="$1" db="$2" newdb="$3" bak="$4" wal="$5" ver="$6"
+  echo -e "\n${YELLOW}换回原文件${NC}"
+  _svc_stop "$SVC_SERVER"
+  if [[ -f "$db" ]]; then mv "$db" "$newdb"; fi
+  rm -f "$wal"              # 这是新库的 wal，留在原文件旁边会被当成它的 wal 回放
+  mv "$bak" "$db"
+  if [[ -f "$bak.wal" ]]; then mv "$bak.wal" "$wal"; fi
+  _svc_start "$SVC_SERVER"
+  if _wait_server "$port" "$ver"; then
+    echo -e "${RED}已回到压缩前的状态${NC}（没通过校验的新文件留在 $newdb）"
+  else
+    echo -e "${RED}回退后服务端未就绪，需要人工处理${NC}（原文件已换回 $db）"
   fi
 }
 
@@ -1312,6 +1407,8 @@ ${BOLD}维护：${NC}
   duckport ${CYAN}upgrade${NC} --data [--yes]         只做数据对齐：在线修正，或停写窗口（先备份）+ 复检
                                        （--no-backup 不备份；磁盘或内存不够备份时会询问；
                                         损坏/重复的行需人工确认，--delete-bad-rows 直接确认）
+                                       有重建时继续：校验 → 删旧表 → 整库压缩 → 换文件 → 删备份，
+                                       任一步不过自动回退（--no-compact 停在重建后，手动收尾）
   duckport ${CYAN}upgrade${NC} --finalize|--rollback  删除 / 恢复重建前的旧表
 
 ${BOLD}示例：${NC}
