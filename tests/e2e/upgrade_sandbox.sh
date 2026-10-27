@@ -156,10 +156,14 @@ DEPLOY_OPT="$SBX/opt" DEPLOY_DATA="$SBX/data" \
   "$CLI" upgrade --yes --proxy "$PROXY" --delete-bad-rows 2>&1 | tee "$SBX/upgrade-1.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "upgrade failed"
 grep -q "sha256 校验通过" "$SBX/upgrade-1.log" || fail "the downloaded binary was not checked against the release digest"
-if [[ -n "${EXPECT_MEMORY_CAP:-}" ]]; then   # MEMORY_LIMIT above the host's RAM: the window must run under a budget
-  grep -q "超过本机" "$SBX/plan.log" || fail "plan did not warn about memory_limit above the host's memory"
-  grep -q "，降为 " "$SBX/upgrade-1.log" || fail "the stop window did not lower memory_limit"
-  grep -q "保持 .* 直到服务端重启" "$SBX/upgrade-1.log" || fail "an oversized limit must stay lowered"
+if [[ -n "${EXPECT_MEMORY_CAP:-}" ]]; then   # MEMORY_LIMIT above the host's RAM: stage 1 fixes server.env and restarts
+  grep -q "超过本机内存" "$SBX/plan.log" || fail "plan did not warn about memory_limit above the host's memory"
+  grep -q "server.env：DUCKPORT_DUCKDB_MEMORY_LIMIT=" "$SBX/upgrade-1.log" || fail "stage 1 did not fix server.env"
+  grep -q "应用新的 memory_limit\|→ v" "$SBX/upgrade-1.log" || fail "no server restart after fixing server.env"
+  want_mem="$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 / 2 / 1073741824 ))GB"
+  grep -q "^DUCKPORT_DUCKDB_MEMORY_LIMIT=$want_mem\$" "$SBX/opt/server.env" || fail "server.env is not half the host's RAM ($want_mem)"
+  if grep -q "，降为 " "$SBX/upgrade-1.log"; then fail "the window still had to lower memory_limit after the fix"; fi
+  if "$CLI" doctor 2>&1 | grep -q "\[M1\]"; then fail "M1 still reported after the fix"; fi
 fi
 if [[ -n "$LEGACY_CLI" ]]; then
   grep -q "交给新版 CLI 继续升级" "$SBX/upgrade-1.log" || fail "deploy.sh did not hand over to the new CLI"

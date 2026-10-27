@@ -1002,6 +1002,7 @@ cmd_update() {
 # 升级：服务端 → 插件 → 数据，升到仓库当前版本（或 --to 指定的 tag），可重复执行。
 #   sudo duckport upgrade [--yes] [--proxy URL] [--to vX.Y.Z] [--no-backup] [--delete-bad-rows]
 #       1 服务端：git pull（或 checkout tag）→ deploy.sh 取 v<版本> 的 binary（没有 release 时本机编译）
+#         server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 超过本机内存时改为本机内存的一半（交互确认；--yes 直接改）
 #                 → binary 或运行中的版本变了就重启服务端，期间停 ingestor
 #       2 插件：每个实例从 registry 的来源重装；版本变了就重启（第 1 步停掉的在这里启动）
 #       3 数据：同 --data
@@ -1130,6 +1131,57 @@ _md5() {
   if [[ "$OS" == "Darwin" ]]; then md5 -q "$1" 2>/dev/null; else md5sum "$1" 2>/dev/null | cut -d' ' -f1; fi
 }
 
+# 内存量的字节数：'8GB' '2GiB' '800MB' '1.5GB' '1024MiB' '4G'；解析不了返回 1
+_mem_bytes() {
+  local s="${1// /}" num unit
+  num="${s%%[!0-9.]*}"; unit="${s#"$num"}"
+  [[ -n "$num" ]] || return 1
+  awk -v n="$num" -v u="$(printf '%s' "$unit" | tr '[:upper:]' '[:lower:]')" 'BEGIN {
+    f[""] = 1; f["b"] = 1
+    f["k"] = 1000; f["kb"] = 1000; f["kib"] = 1024
+    f["m"] = 1e6; f["mb"] = 1e6; f["mib"] = 1048576
+    f["g"] = 1e9; f["gb"] = 1e9; f["gib"] = 1073741824
+    f["t"] = 1e12; f["tb"] = 1e12; f["tib"] = 1099511627776
+    if (!(u in f)) exit 1
+    printf "%d\n", n * f[u] }'
+}
+
+_host_mem_bytes() {
+  if [[ -r /proc/meminfo ]]; then
+    echo $(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 ))
+  else
+    sysctl -n hw.memsize 2>/dev/null
+  fi
+}
+
+_gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+
+# server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 超过本机内存时输出 "<配置值> <建议值>"，否则返回 1。
+# 超过本机内存的上限让 DuckDB 以为内存够用而不落盘，重建这类大操作会被内核 OOM 杀掉
+# （grid102：3.8 GB 内存配了 8GB）。建议值 = 本机内存的一半（整 GB，最少 1GB），和 deploy.sh
+# 新装时的默认一致。停写窗口内 upgrade.py 还会临时降低上限兜底，但平时运行也该是合理的值。
+_memory_limit_over() {
+  local cfg total limit gb
+  cfg=$(_server_env DUCKPORT_DUCKDB_MEMORY_LIMIT); [[ -n "$cfg" ]] || return 1
+  total=$(_host_mem_bytes); [[ -n "$total" && "$total" -gt 0 ]] || return 1
+  limit=$(_mem_bytes "$cfg") || return 1
+  [[ "$limit" -gt "$total" ]] || return 1
+  gb=$(( total / 2 / 1073741824 )); [[ $gb -ge 1 ]] || gb=1
+  echo "$cfg ${gb}GB"
+}
+
+# 改 server.env 里的一个键（所有同名行都改；没有就追加），保留文件本身的属主和权限
+_set_server_env() {
+  local f="$DEPLOY_OPT/server.env" tmp
+  tmp=$(mktemp)
+  if grep -q "^$1=" "$f" 2>/dev/null; then
+    awk -v k="$1" -v v="$2" 'index($0, k "=") == 1 { print k "=" v; next } { print }' "$f" > "$tmp"
+  else
+    cat "$f" > "$tmp" 2>/dev/null; echo "$1=$2" >> "$tmp"
+  fi
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
 # 等服务端监听并报告期望的版本（最多 120 秒）
 _wait_server() {
   local port="$1" want="$2" i
@@ -1180,10 +1232,36 @@ _upgrade_server_and_plugins() {
   DEPLOY_OPT="$DEPLOY_OPT" DUCKPORT_UNIT_PREFIX="$SVC_PREFIX" RELEASE_TAG="v${want}" bash "$REPO_DIR/deploy.sh"
   after=$(_md5 "$DEPLOY_BIN/duckport-server")
   running=$(_server_version "$port")
+
+  # server.env 的内存上限超过本机内存：改成本机内存的一半，随后重启让它生效
+  local env_changed=0 over ans
+  if over=$(_memory_limit_over); then
+    echo -e "  ${YELLOW}⚠ memory_limit ${over%% *} 超过本机内存 $(_gib "$(_host_mem_bytes)")：DuckDB 不会及时落盘，重建这类大操作会被内核 OOM 杀掉${NC}"
+    ans=y
+    if [[ $yes -ne 1 ]]; then
+      if [[ -t 0 ]]; then
+        read -r -p "  把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 ${over##* } 并重启服务端？[Y/n] " ans
+        ans="${ans:-y}"
+      else
+        ans=n
+        echo -e "  ${DIM}非交互执行且没有 --yes：不改配置；停写窗口内会临时降低上限，之后 doctor 的 M1 会继续提示${NC}"
+      fi
+    fi
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      _set_server_env DUCKPORT_DUCKDB_MEMORY_LIMIT "${over##* }"
+      env_changed=1
+      echo -e "  ${GREEN}✓${NC} server.env：DUCKPORT_DUCKDB_MEMORY_LIMIT=${over##* }（原 ${over%% *}），重启后生效"
+    fi
+  fi
+
   # 中途失败也要把停掉的 ingestor 拉起来
   trap _start_stopped_ingestors EXIT
-  if [[ "$before" != "$after" || "$running" != "$want" ]]; then
-    echo -e "\n  重启服务端：${running:+v}${running:-未运行} → v${want}（先停 ingestor，插件升级后再启动）"
+  if [[ "$before" != "$after" || "$running" != "$want" || $env_changed -eq 1 ]]; then
+    if [[ "$before" == "$after" && "$running" == "$want" ]]; then
+      echo -e "\n  重启服务端：应用新的 memory_limit（先停 ingestor，插件升级后再启动）"
+    else
+      echo -e "\n  重启服务端：${running:+v}${running:-未运行} → v${want}（先停 ingestor，插件升级后再启动）"
+    fi
     _stop_running_ingestors
     _stop_server_and_wait "$port" || exit 1
     _svc_start "$SVC_SERVER"
@@ -1236,6 +1314,11 @@ _upgrade_plan_stages() {
     echo -e "  duckport-server v${running}：已是目标版本（binary 有变化时仍会重启）"
   else
     echo -e "  duckport-server v${running:-?（未运行）} → v${want:-?}：替换 binary 并重启，期间停 ingestor"
+  fi
+  local over
+  if over=$(_memory_limit_over); then
+    echo -e "  ${YELLOW}⚠ memory_limit ${over%% *} 超过本机内存 $(_gib "$(_host_mem_bytes)")：DuckDB 不会及时落盘，重建会被内核 OOM 杀掉${NC}"
+    echo -e "    会把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 ${over##* } 并重启服务端（交互确认；--yes 直接改）"
   fi
   echo -e "\n${BOLD}▶ 2/3 插件${NC}"
   while IFS= read -r inst; do
