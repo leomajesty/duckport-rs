@@ -141,8 +141,9 @@ def main():
         rc, out = run_script("retention.py", early, "check", "--instance", "bn1m", "--fresh-only")
         assert rc == 1 and "usdt_spot_1m" in out and "还没有实例写入过" in out, (rc, out)
         assert "usdt_perp_1m" not in out, "--fresh-only reported a table that is already being written"
-        rc, out = run_script("retention.py", early, "check", "--instance", "binance-funding")
-        assert rc == 0, "an instance without START_DATE cannot be judged (only the plugin knows its default)"
+        rc, out = run_script("retention.py", early, "check", "--instance", "binance-funding", "--fresh-only")
+        assert rc == 1 and "usdt_spot_1m" in out and "没有设置 START_DATE" in out, \
+            "an instance without START_DATE backfills from its plugin's default: warned as unknown"
         rc, out = run_script("retention.py", with_start(120 + 7), "check", "--instance", "bn1m")
         assert rc == 0, out
         rc, f = doctor(early)
@@ -157,6 +158,10 @@ def main():
         assert rc == 1 and "还没有 duck_time" in out and "还没有实例写入过" not in out, out
         rc, out = run_script("retention.py", early, "check", "--instance", "binance-funding")
         assert rc == 0, "a table bn1m owns was blamed on binance-funding"
+        # its start_time is the plugin's default as applied; with neither, the start is unknown
+        tx(client, "UPDATE data.watermark SET start_time = NULL WHERE table_name = 'usdt_spot_1m'")
+        rc, out = run_script("retention.py", NEW, "check", "--instance", "bn1m", "--fresh-only")
+        assert rc == 1 and "水位表也没有记录 start_time" in out and "设为" in out, out
     finally:
         tx(client, "DELETE FROM data.retention_policy")
 

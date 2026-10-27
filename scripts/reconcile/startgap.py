@@ -10,7 +10,12 @@ Nothing here knows a particular plugin: a table belongs to the instance named in
 watermark row (`ingestor`). A table nobody has written yet has no such row -- the plugin
 creates it on its first start, just before backfilling -- so for an instance that has
 never run (or one that just gained a data source) the policy tables without a row are
-checked against that instance's START_DATE instead, marked `assumed`. A gap only counts when the history thrown away would be more
+checked against that instance's START_DATE instead, marked `assumed`.
+
+An instance without START_DATE backfills from a default only its plugin knows (binance-
+funding's is 2009-01-03). Where the table already has a watermark row its start_time is that
+default as the plugin applied it; otherwise the start is unknown and reported as such,
+without the threshold below: it cannot be measured, and it may be years. A gap only counts when the history thrown away would be more
 than what is kept, and at least MIN_GAP_DAYS. A START_DATE set close to the window, as
 upgrade-1.1.md recommends, therefore does not warn as soon as the cutoff moves on.
 """
@@ -27,16 +32,16 @@ MARGIN_DAYS = 7  # upgrade-1.1.md: START_DATE = today - keep_days - 7
 class Gap:
     table: str
     instance: Optional[str]
-    start: date
-    source: str      # "START_DATE" (instance config) or "start_time" (data.watermark)
+    start: Optional[date]  # None: the instance has no START_DATE and nothing recorded one
+    source: str      # "START_DATE" (instance config), "start_time" (data.watermark) or "unknown"
     keep_days: int
     cutoff: date
     fresh: bool      # no duck_time yet: the instance's next start backfills from `start`
     assumed: bool = False  # nobody has written the table yet; `instance` is only a candidate
 
     @property
-    def days(self) -> int:
-        return (self.cutoff - self.start).days
+    def days(self) -> Optional[int]:
+        return (self.cutoff - self.start).days if self.start else None
 
     @property
     def suggested_start(self) -> date:
@@ -45,7 +50,19 @@ class Gap:
     def describe(self) -> List[str]:
         """Three lines: the gap, what it costs, what to change (the table name is the caller's)."""
         where = f"duckport config {self.instance}" if self.instance else "写入这张表的插件的配置"
-        fix = f"把起始日期（START_DATE）调到 {self.suggested_start} 或之后：{where}"
+        fix = f"把起始日期（START_DATE）设为 {self.suggested_start} 或之后：{where}"
+        window = f"retention 只保留 {self.keep_days} 天（cutoff {self.cutoff}）"
+        if self.start is None:
+            first = (f"还没有实例写入过；若由实例 {self.instance} 写入，它没有设置 START_DATE" if self.assumed
+                     else f"实例 {self.instance} 没有设置 START_DATE，水位表也没有记录 start_time")
+            when = ("首次启动时" if self.assumed else
+                    "这张表还没有 duck_time，实例下次启动时" if self.fresh else "下次补历史（loadhist、重建表）时")
+            return [
+                f"{first}，会从插件自己的默认起点补起，无法判断比 cutoff 早多少；{window}",
+                f"默认起点可能远早于 cutoff：{when}早于 cutoff 的数据会被下载、写入，"
+                f"再被 retention 删掉，删除后库文件不会变小",
+                fix,
+            ]
         if self.assumed:
             return [
                 f"还没有实例写入过；若由实例 {self.instance} 写入，会从它的 START_DATE {self.start} 补起，"
@@ -88,8 +105,8 @@ def gaps(policies: List[dict], watermark: Dict[str, dict], start_dates: Dict[str
     policies: rows of data.retention_policy; watermark: table -> row of data.watermark;
     start_dates: instance -> START_DATE from its config.env (absent when it has none);
     candidates: instances that may write a policy table nobody has written yet. Such a
-    table is reported once per candidate with a START_DATE, marked `assumed`; a candidate
-    without one is skipped, since only the plugin knows its default.
+    table is reported once per candidate, marked `assumed` -- with start None for a
+    candidate that has no START_DATE.
     """
     today = today or datetime.now(timezone.utc).date()
     out = []
@@ -102,16 +119,19 @@ def gaps(policies: List[dict], watermark: Dict[str, dict], start_dates: Dict[str
         if wm is None:
             for name in candidates:
                 start = _as_date(start_dates.get(name))
-                if start is not None:
-                    out.append(Gap(table, name, start, "START_DATE", keep, cutoff, fresh=True, assumed=True))
+                out.append(Gap(table, name, start, "START_DATE" if start else "unknown", keep, cutoff,
+                               fresh=True, assumed=True))
             continue
         instance = wm.get("ingestor") or None
         start, source = _as_date(start_dates.get(instance)) if instance else None, "START_DATE"
         if start is None:
             start, source = _as_date(wm.get("start_time")), "start_time"
-        if start is not None:
-            out.append(Gap(table, instance, start, source, keep, cutoff, fresh=not wm.get("duck_time")))
-    return sorted((g for g in out if g.days > threshold(g.keep_days)),
+        if start is None:
+            if instance is None:
+                continue  # no start and nobody to tell
+            source = "unknown"
+        out.append(Gap(table, instance, start, source, keep, cutoff, fresh=not wm.get("duck_time")))
+    return sorted((g for g in out if g.start is None or g.days > threshold(g.keep_days)),
                   key=lambda g: (g.table, g.instance or ""))
 
 
