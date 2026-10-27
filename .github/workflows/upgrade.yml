@@ -23,6 +23,15 @@ jobs:
           repository: sjmc-quant/duckport-binance-funding
           path: plugins/duckport-binance-funding
 
+      # macOS ships bash 3.2, which takes the first byte of a multi-byte character as part of
+      # a variable name: "$REPO_DIR：" reads a variable called REPO_DIR\xef, and under set -u
+      # the CLI dies with "unbound variable". Write ${REPO_DIR}： instead.
+      - name: Shell scripts are safe for bash 3.2 (no $VAR followed by a non-ASCII character)
+        run: |
+          if git ls-files -z '*.sh' duckport | xargs -0 grep -nP '\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7F])'; then
+            echo "::error::brace these variables, e.g. \${name}：" && exit 1
+          fi
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

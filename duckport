@@ -520,7 +520,7 @@ cmd_start() {
     gap=0
     _start_gap_check --instance "$inst" --fresh-only < /dev/null || gap=$?
     if [[ $gap -eq 1 && $tty -eq 1 ]]; then
-      read -r -p "仍要启动 $inst？[y/N] " ans < /dev/tty
+      read -r -p "仍要启动 ${inst}？[y/N] " ans < /dev/tty
       if [[ ! "$ans" =~ ^[Yy]$ ]]; then
         echo -e "  ${YELLOW}跳过 $inst${NC}"
         continue
@@ -893,7 +893,7 @@ cmd_loadhist() {
   fi
   # 先检查再停实例：没有 loadhist 的插件（例如 binance-funding 自己在启动时补历史）不该被停掉
   if [[ ! -x "$bin" ]]; then
-    echo -e "${YELLOW}$inst（$(_instance_exec "$inst")）没有 loadhist，未做任何操作，实例未停止${NC}"
+    echo -e "${YELLOW}${inst}（$(_instance_exec "$inst")）没有 loadhist，未做任何操作，实例未停止${NC}"
     exit 1
   fi
 
@@ -1157,7 +1157,7 @@ _upgrade_server_and_plugins() {
     v0=$(_instance_version "$inst")
     _update_instance "$inst"
     v1=$(_instance_version "$inst")
-    echo -e "  $inst：v${v0:-?} → v${v1:-?}"
+    echo -e "  ${inst}：v${v0:-?} → v${v1:-?}"
     if [[ "$v0" != "$v1" && "$(_svc_is_active "$SVC_INGESTOR@$inst")" == "active" ]]; then
       restart+=("$inst")
     fi
@@ -1179,7 +1179,7 @@ _upgrade_plan_stages() {
     target="${to:-$(git -C "$REPO_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo HEAD)}"
     want=$(_repo_version "$target")
     behind=$(git -C "$REPO_DIR" rev-list --count "HEAD..$target" 2>/dev/null || echo "?")
-    echo -e "  仓库 $REPO_DIR：$(git -C "$REPO_DIR" rev-parse --short HEAD) → $target（${behind} 个新提交）"
+    echo -e "  仓库 ${REPO_DIR}：$(git -C "$REPO_DIR" rev-parse --short HEAD) → ${target}（${behind} 个新提交）"
   else
     want=$(_repo_version)
     echo -e "  ${YELLOW}$REPO_DIR 不是 git 仓库，按当前文件估计${NC}"
@@ -1195,7 +1195,7 @@ _upgrade_plan_stages() {
   while IFS= read -r inst; do
     [[ -z "$inst" ]] && continue
     any=1
-    echo -e "  $inst（$(_instance_exec "$inst") v$(_instance_version "$inst")）：从 $(_instance_source "$inst") 重装，版本变化时重启"
+    echo -e "  ${inst}（$(_instance_exec "$inst") v$(_instance_version "$inst")）：从 $(_instance_source "$inst") 重装，版本变化时重启"
   done <<< "$(_list_instances)"
   [[ $any -eq 1 ]] || echo -e "  （无已注册实例）"
 }
@@ -1422,9 +1422,9 @@ _compact_restore() {
   if [[ -f "$bak.wal" ]]; then mv "$bak.wal" "$wal"; fi
   _svc_start "$SVC_SERVER"
   if _wait_server "$port" "$ver"; then
-    echo -e "${RED}已回到压缩前的状态${NC}（没通过校验的新文件留在 $newdb）"
+    echo -e "${RED}已回到压缩前的状态${NC}（没通过校验的新文件留在 ${newdb}）"
   else
-    echo -e "${RED}回退后服务端未就绪，需要人工处理${NC}（原文件已换回 $db）"
+    echo -e "${RED}回退后服务端未就绪，需要人工处理${NC}（原文件已换回 ${db}）"
   fi
 }
 
