@@ -35,7 +35,7 @@ import pyarrow as pa
 
 from doctor import load_instances, print_report
 from duckport_flight import Duckport
-from reconcile import backup, compact, rebuild
+from reconcile import backup, compact, memory, rebuild
 from reconcile.fixes import NEEDS_CONFIRMATION, Context, Result, actionable, apply, log_result, preview
 from reconcile.rules import Finding, Options, run_rules
 from reconcile.specs import PLUGIN_MIN_VERSION, UPGRADE_LOG_DDL, version_at_least
@@ -108,6 +108,9 @@ def cmd_plan(dp, args):
         print(f"\n计划：在线修正 {len(online)} 项，ingestor 不停")
     else:
         print(f"\n计划：停写窗口内完成全部 {len(online) + len(stop)} 项（停止 ingestor，服务端保持运行）")
+        note = memory.plan_note(dp)
+        if note:
+            print(f"  ⚠ {note}")
         if res.backup_possible:
             print(f"  1. 备份到 {backup_path(args)}（约 {backup.gb(res.backup_bytes)}，"
                   f"预计 {res.backup_seconds:.0f}s）")
@@ -154,9 +157,10 @@ def cmd_apply(dp, args):
             return 1
         print(f"    ✓ {detail}（{(datetime.now() - started).total_seconds():.0f}s）", flush=True)
         log_result(ctx, Result(Finding("BACKUP", "stop", path, "备份"), "ok", 0, detail, 0), started)
-    results = apply(ctx, state, findings, levels, confirmed=args.confirm_delete)
-    if "stop" in levels:
-        dp.execute("CHECKPOINT")
+    with memory.Bounded(dp, enabled="stop" in levels):
+        results = apply(ctx, state, findings, levels, confirmed=args.confirm_delete)
+        if "stop" in levels:
+            dp.execute("CHECKPOINT")
     return 1 if any(r.status == "error" for r in results) else 0
 
 
@@ -265,7 +269,8 @@ def cmd_compact_build(dp, args):
 
     started = datetime.now()
     try:
-        compact.rewrite(dp, args.new_db, names, time_columns, baseline)
+        with memory.Bounded(dp):
+            compact.rewrite(dp, args.new_db, names, time_columns, baseline)
     except (pa.ArrowException, OSError, RuntimeError) as e:
         print(f"重写失败：{e}", file=sys.stderr)
         return 1

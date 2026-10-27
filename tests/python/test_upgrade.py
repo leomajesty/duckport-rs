@@ -17,6 +17,7 @@ Prerequisites:
 import glob
 import json
 import os
+import sys
 import tempfile
 
 import pyarrow.flight as flight
@@ -25,6 +26,9 @@ import pyarrow.parquet as pq
 from reconcile_fixtures import (
     KLINE, NEW, OLD, SERVER, doctor, hr, legacy_state, reset, run_script, tx, unkeyed_with_duplicates,
 )
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+from reconcile import memory  # noqa: E402
 
 QDIR = tempfile.mkdtemp(prefix="duckport-quarantine-")
 BDIR = tempfile.mkdtemp(prefix="duckport-backup-")
@@ -37,6 +41,10 @@ def upgrade(instances, *args):
                          "--backup-dir", BDIR, *args)
     print(out)
     return rc, out
+
+
+def execute(client, sql):
+    list(client.do_action(flight.Action("duckport.execute", json.dumps({"sql": sql}).encode())))
 
 
 def scalar(client, sql):
@@ -244,6 +252,24 @@ def main():
     # the baseline covers the live tables only, so the server's database still has to match it
     rc, out = upgrade(STOPPED, "compact-check", "--baseline", base)
     assert rc == 0, out
+
+    hr("memory: heavy work runs under a budget when memory_limit exceeds the host")
+    G = 1024 ** 3
+    assert memory.parse_size("3.7 GiB") == int(3.7 * G) and memory.parse_size("8GB") == 8 * 10 ** 9 \
+        and memory.parse_size("953.6 MiB") == int(953.6 * 1024 ** 2) and memory.parse_size("junk") is None
+    assert memory.budget(8 * G, 4 * G, 1 * G, 1 * G) == int(0.8 * 2 * G), "capped by what is free plus what DuckDB holds"
+    assert memory.budget(8 * G, 64 * G, 60 * G, 0) == 8 * G, "a limit the host can honour is kept"
+    assert memory.budget(8 * G, 4 * G, 3 * G, 0) == 2 * G, "never more than half the machine"
+    assert memory.budget(8 * G, 4 * G, 0, 0) == memory.FLOOR and memory.budget(None, None, None, None) is None
+    before = scalar(client, "SELECT current_setting('memory_limit')")
+    execute(client, "SET memory_limit = '400GB'")
+    rc, out = upgrade(STOPPED, "compact-build", "--run-id", "c5", "--new-db", newdb + ".mem", "--baseline-out", base)
+    assert rc == 0 and "超过本机" in out and "，降为 " in out and "保持" in out, out
+    assert memory.parse_size(scalar(client, "SELECT current_setting('memory_limit')")) < 100 * G, \
+        "an oversized limit must stay lowered, not be put back"
+    execute(client, f"SET memory_limit = '{memory.parse_size(before) // 1024 ** 2}MiB'")
+    # current_setting() prints the limit rounded to 0.1 GiB
+    assert abs(memory.parse_size(scalar(client, "SELECT current_setting('memory_limit')")) - memory.parse_size(before)) < 0.1 * G
 
     hr("compact: refuses a leftover file and an orphaned copy before dropping anything")
     rc, _ = upgrade(STOPPED, "compact-build", "--run-id", "c3", "--new-db", newdb, "--baseline-out", base)

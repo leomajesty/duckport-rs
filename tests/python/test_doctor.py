@@ -7,6 +7,7 @@ Prerequisites:
   DUCKPORT_DB_PATH=/tmp/doctor.db cargo run --bin duckport-server    (fresh database)
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pyarrow.flight as flight
@@ -84,6 +85,15 @@ def main():
     rc, f = doctor(NEW)
     assert has(f, "B1", "stop", "oi_5m"), "a registered anti_join writer makes the rebuild possible"
     tx(client, "DROP TABLE data.oi_5m", "DELETE FROM data.table_specs")
+
+    hr("memory_limit above the host's memory: M1 hint, exit code unchanged")
+    rc_before, _ = doctor(NEW)
+    list(client.do_action(flight.Action("duckport.execute", json.dumps({"sql": "SET memory_limit = '400GB'"}).encode())))
+    rc, f = doctor(NEW)
+    assert rc == rc_before and has(f, "M1", "hint", "duckport-server"), (rc, rc_before, f)
+    list(client.do_action(flight.Action("duckport.execute", json.dumps({"sql": "SET memory_limit = '4GB'"}).encode())))
+    rc, f = doctor(NEW)
+    assert not has(f, "M1", "hint", "duckport-server"), f
 
     hr("ingestor running: staging rows are only a hint")
     rc, f = doctor([dict(NEW[0], active=True), NEW[1]])

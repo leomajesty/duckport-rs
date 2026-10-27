@@ -50,7 +50,20 @@ LOG_DIR="$DEPLOY_OPT/logs"
 DB_PATH="${DB_PATH:-${DEPLOY_DATA}/duckport.db}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:50051}"
 READ_POOL_SIZE="${READ_POOL_SIZE:-4}"
-MEMORY_LIMIT="${MEMORY_LIMIT:-8GB}"
+# DuckDB 的内存上限：没指定就取本机内存的一半。以前固定 8GB，在小机器上 DuckDB 以为内存够用
+# 而不落盘，重建时被内核 OOM 杀掉；上限高于本机内存的 server.env，doctor 会提示（M1）。
+_default_memory_limit() {
+  local bytes=0 gb
+  if [[ -r /proc/meminfo ]]; then
+    bytes=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 ))
+  else
+    bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  fi
+  gb=$(( bytes / 2 / 1024 / 1024 / 1024 ))
+  if [[ $gb -ge 1 ]]; then echo "${gb}GB"; else echo "1GB"; fi
+}
+MEMORY_LIMIT_GIVEN="${MEMORY_LIMIT:+1}"
+MEMORY_LIMIT="${MEMORY_LIMIT:-$(_default_memory_limit)}"
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
 
@@ -278,6 +291,9 @@ _write_if_missing() {
   fi
 }
 
+if [[ ! -f "$DEPLOY_OPT/server.env" && -z "$MEMORY_LIMIT_GIVEN" ]]; then
+  info "DUCKPORT_DUCKDB_MEMORY_LIMIT=${MEMORY_LIMIT}（本机内存的一半；MEMORY_LIMIT=… 可覆盖）"
+fi
 _write_if_missing "$DEPLOY_OPT/server.env" << EOF
 DUCKPORT_DB_PATH=${DB_PATH}
 DUCKPORT_LISTEN_ADDR=${LISTEN_ADDR}

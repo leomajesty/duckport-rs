@@ -20,6 +20,7 @@
 #   sudo KEEP=1 tests/e2e/upgrade_sandbox.sh     # keep it for inspection
 #   sudo tests/e2e/upgrade_sandbox.sh --cleanup  # remove a kept sandbox
 #   sudo LEGACY_CLI=v1.0.4 tests/e2e/upgrade_sandbox.sh  # start the upgrade with the v1.0.4 CLI
+#   sudo MEMORY_LIMIT=500GB EXPECT_MEMORY_CAP=1 tests/e2e/upgrade_sandbox.sh  # server.env limit above the host's RAM
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -89,7 +90,7 @@ git -C "$SBX/code/duckport-binance-funding" reset -q --hard "$OLD_FUNDING"
 
 step "install duckport-server $OLD_SERVER_TAG"
 (cd "$SBX/code/duckport-rs" && DEPLOY_OPT="$SBX/opt" DEPLOY_DATA="$SBX/data" DUCKPORT_UNIT_PREFIX="$PREFIX" \
-  DUCKPORT_CLI_DIR="$SBX/bin" LISTEN_ADDR="127.0.0.1:$PORT" MEMORY_LIMIT=4GB RELEASE_TAG="$OLD_SERVER_TAG" \
+  DUCKPORT_CLI_DIR="$SBX/bin" LISTEN_ADDR="127.0.0.1:$PORT" MEMORY_LIMIT="${MEMORY_LIMIT:-4GB}" RELEASE_TAG="$OLD_SERVER_TAG" \
   DUCKPORT_SERVER_BIN="$OLD_SERVER_BIN" \
   bash deploy.sh > "$SBX/deploy-initial.log" 2>&1) || { tail -20 "$SBX/deploy-initial.log"; fail "initial deploy"; }
 grep -q "^EnvironmentFile=$SBX/opt/server.env$" "/etc/systemd/system/$PREFIX-server.service" \
@@ -155,6 +156,11 @@ DEPLOY_OPT="$SBX/opt" DEPLOY_DATA="$SBX/data" \
   "$CLI" upgrade --yes --proxy "$PROXY" --delete-bad-rows 2>&1 | tee "$SBX/upgrade-1.log"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || fail "upgrade failed"
 grep -q "sha256 校验通过" "$SBX/upgrade-1.log" || fail "the downloaded binary was not checked against the release digest"
+if [[ -n "${EXPECT_MEMORY_CAP:-}" ]]; then   # MEMORY_LIMIT above the host's RAM: the window must run under a budget
+  grep -q "超过本机" "$SBX/plan.log" || fail "plan did not warn about memory_limit above the host's memory"
+  grep -q "，降为 " "$SBX/upgrade-1.log" || fail "the stop window did not lower memory_limit"
+  grep -q "保持 .* 直到服务端重启" "$SBX/upgrade-1.log" || fail "an oversized limit must stay lowered"
+fi
 if [[ -n "$LEGACY_CLI" ]]; then
   grep -q "交给新版 CLI 继续升级" "$SBX/upgrade-1.log" || fail "deploy.sh did not hand over to the new CLI"
   grep -q "升级已经在上面完成" "$SBX/upgrade-1.log" || fail "no note about the legacy CLI's restart hint"

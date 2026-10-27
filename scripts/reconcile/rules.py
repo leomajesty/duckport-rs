@@ -17,7 +17,7 @@ from reconcile.specs import (
     LEFTOVER_SUFFIXES, PLUGIN_MIN_VERSION, RETIRED_DUCK_TIME_KEY, RETIRED_TABLES,
     SERVER_MIN_VERSION, SYSTEM_TABLES, version_at_least,
 )
-from reconcile import startgap
+from reconcile import memory, startgap
 from reconcile.state import State, q_ident
 
 LEVELS = ("block", "stop", "online", "hint")
@@ -395,6 +395,17 @@ def retention_start_gap(state, dp, opts):
     for g in startgap.gaps(state.retention_policies, state.watermark, starts, candidates=candidates):
         gap, cost, fix = g.describe()
         yield Finding("R2", "hint", g.table, f"{gap}；{cost}", fix)
+
+
+@rule("M1")
+def memory_limit_vs_host(state, dp, opts):
+    limit = memory.parse_size(dp.scalar("SELECT current_setting('memory_limit')"))
+    total, _ = memory.host_memory()
+    if limit and total and limit > total:
+        yield Finding("M1", "hint", "duckport-server",
+                      f"memory_limit {memory.fmt(limit)} 超过本机内存 {memory.fmt(total)}：DuckDB 不会及时落盘，"
+                      "重建这类大操作会被内核 OOM 杀掉（upgrade 的停写窗口会临时降低）",
+                      "把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为不超过本机内存的值（建议一半），重启服务端")
 
 
 @rule("P1")
