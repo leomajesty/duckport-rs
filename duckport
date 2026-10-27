@@ -1154,20 +1154,53 @@ _host_mem_bytes() {
   fi
 }
 
+# 操作系统现在真正能给出的内存：Linux 的 MemAvailable；macOS 用 vm_stat 的 free+inactive+speculative 页
+_host_mem_available_bytes() {
+  if [[ -r /proc/meminfo ]]; then
+    echo $(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) * 1024 ))
+  else
+    vm_stat 2>/dev/null | awk '
+      /page size of/ { page = $8 }
+      /^Pages (free|inactive|speculative):/ { gsub(/\./, "", $NF); pages += $NF }
+      END { if (page) printf "%d\n", pages * page }'
+  fi
+}
+
+# 服务端进程现在的 RSS（它手里的内存，MemAvailable 里不算这部分）
+_server_rss_bytes() {
+  local pid
+  pid=$(pgrep -f "^${DEPLOY_BIN}/duckport-server" 2>/dev/null | head -1)
+  [[ -n "$pid" ]] || { echo 0; return; }
+  echo $(( $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0) * 1024 ))
+}
+
+# 本机现在能承受的上限：(可用 + 服务端已占) 的一半，不超过本机内存的一半，按 256 MiB 取整，最少 512 MiB。
+# 总内存的一半不可靠：grid102 的 3.8 GB 里另有一个 1 GB 的面板进程，一半（2GB）正是第一次被杀的位置。
+_suggest_memory_limit() {
+  local total avail rss b
+  total=$(_host_mem_bytes); avail=$(_host_mem_available_bytes); rss=$(_server_rss_bytes)
+  [[ -n "$avail" && "$avail" -gt 0 ]] || return 1
+  b=$(( (avail + rss) / 2 ))
+  [[ -n "$total" && "$total" -gt 0 && $b -gt $(( total / 2 )) ]] && b=$(( total / 2 ))
+  b=$(( b / 268435456 * 268435456 ))
+  [[ $b -ge 536870912 ]] || b=536870912
+  echo "$(( b / 1048576 ))MiB"
+}
+
 _gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
 
 # server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 超过本机内存时输出 "<配置值> <建议值>"，否则返回 1。
 # 超过本机内存的上限让 DuckDB 以为内存够用而不落盘，重建这类大操作会被内核 OOM 杀掉
-# （grid102：3.8 GB 内存配了 8GB）。建议值 = 本机内存的一半（整 GB，最少 1GB），和 deploy.sh
-# 新装时的默认一致。停写窗口内 upgrade.py 还会临时降低上限兜底，但平时运行也该是合理的值。
+# （grid102：3.8 GB 内存配了 8GB）。建议值见 _suggest_memory_limit；upgrade.py 在停写窗口内
+# 也按同一公式临时降低上限兜底，但平时运行也该是合理的值。
 _memory_limit_over() {
-  local cfg total limit gb
+  local cfg total limit suggest
   cfg=$(_server_env DUCKPORT_DUCKDB_MEMORY_LIMIT); [[ -n "$cfg" ]] || return 1
   total=$(_host_mem_bytes); [[ -n "$total" && "$total" -gt 0 ]] || return 1
   limit=$(_mem_bytes "$cfg") || return 1
   [[ "$limit" -gt "$total" ]] || return 1
-  gb=$(( total / 2 / 1073741824 )); [[ $gb -ge 1 ]] || gb=1
-  echo "$cfg ${gb}GB"
+  suggest=$(_suggest_memory_limit) || return 1
+  echo "$cfg $suggest"
 }
 
 # 改 server.env 里的一个键（所有同名行都改；没有就追加），保留文件本身的属主和权限
@@ -1318,7 +1351,7 @@ _upgrade_plan_stages() {
   local over
   if over=$(_memory_limit_over); then
     echo -e "  ${YELLOW}⚠ memory_limit ${over%% *} 超过本机内存 $(_gib "$(_host_mem_bytes)")：DuckDB 不会及时落盘，重建会被内核 OOM 杀掉${NC}"
-    echo -e "    会把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 ${over##* } 并重启服务端（交互确认；--yes 直接改）"
+    echo -e "    会把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 ${over##* }（本机现在能给出的一半）并重启服务端（交互确认；--yes 直接改）"
   fi
   echo -e "\n${BOLD}▶ 2/3 插件${NC}"
   while IFS= read -r inst; do

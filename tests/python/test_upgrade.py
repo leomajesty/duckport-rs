@@ -257,10 +257,14 @@ def main():
     G = 1024 ** 3
     assert memory.parse_size("3.7 GiB") == int(3.7 * G) and memory.parse_size("8GB") == 8 * 10 ** 9 \
         and memory.parse_size("953.6 MiB") == int(953.6 * 1024 ** 2) and memory.parse_size("junk") is None
-    assert memory.budget(8 * G, 4 * G, 1 * G, 1 * G) == int(0.8 * 2 * G), "capped by what is free plus what DuckDB holds"
+    M = 1024 ** 2
+    # grid102 at the second kill: 3.8 GB box, 1.26 GB available, DuckDB holding 473 MiB, 8GB configured
+    assert memory.suggest(3831 * M, 1258 * M, 473 * M) == 768 * M, "half of (available + held), in 256 MiB steps"
+    assert memory.budget(8 * G, 3831 * M, 1258 * M, 473 * M) == 768 * M
     assert memory.budget(8 * G, 64 * G, 60 * G, 0) == 8 * G, "a limit the host can honour is kept"
-    assert memory.budget(8 * G, 4 * G, 3 * G, 0) == 2 * G, "never more than half the machine"
-    assert memory.budget(8 * G, 4 * G, 0, 0) == memory.FLOOR and memory.budget(None, None, None, None) is None
+    assert memory.suggest(4 * G, 3 * G, 3 * G) == 2 * G, "never more than half the machine"
+    assert memory.suggest(4 * G, 100 * M, 0) == memory.FLOOR and memory.suggest(4 * G, None, 0) is None
+    assert memory.budget(None, None, None, None) is None and memory.mib(768 * M) == "768MiB"
     before = scalar(client, "SELECT current_setting('memory_limit')")
     execute(client, "SET memory_limit = '400GB'")
     rc, out = upgrade(STOPPED, "compact-build", "--run-id", "c5", "--new-db", newdb + ".mem", "--baseline-out", base)

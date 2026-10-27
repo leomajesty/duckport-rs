@@ -400,12 +400,14 @@ def retention_start_gap(state, dp, opts):
 @rule("M1")
 def memory_limit_vs_host(state, dp, opts):
     limit = memory.parse_size(dp.scalar("SELECT current_setting('memory_limit')"))
-    total, _ = memory.host_memory()
+    total, avail = memory.host_memory()
     if limit and total and limit > total:
+        s = memory.suggest(total, avail, memory.parse_size(dp.scalar("SELECT memory_usage FROM pragma_database_size()")))
         yield Finding("M1", "hint", "duckport-server",
                       f"memory_limit {memory.fmt(limit)} 超过本机内存 {memory.fmt(total)}：DuckDB 不会及时落盘，"
                       "重建这类大操作会被内核 OOM 杀掉（upgrade 的停写窗口会临时降低）",
-                      "把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为不超过本机内存的值（建议一半），重启服务端")
+                      f"把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 {memory.mib(s) if s else '本机能给出的一半'}"
+                      "（本机现在能给出的一半），重启服务端；`sudo duckport upgrade` 会询问并代改")
 
 
 @rule("P1")

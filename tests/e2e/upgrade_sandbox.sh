@@ -160,8 +160,9 @@ if [[ -n "${EXPECT_MEMORY_CAP:-}" ]]; then   # MEMORY_LIMIT above the host's RAM
   grep -q "超过本机内存" "$SBX/plan.log" || fail "plan did not warn about memory_limit above the host's memory"
   grep -q "server.env：DUCKPORT_DUCKDB_MEMORY_LIMIT=" "$SBX/upgrade-1.log" || fail "stage 1 did not fix server.env"
   grep -q "应用新的 memory_limit\|→ v" "$SBX/upgrade-1.log" || fail "no server restart after fixing server.env"
-  want_mem="$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 / 2 / 1073741824 ))GB"
-  grep -q "^DUCKPORT_DUCKDB_MEMORY_LIMIT=$want_mem\$" "$SBX/opt/server.env" || fail "server.env is not half the host's RAM ($want_mem)"
+  got_mem=$(grep -oE "^DUCKPORT_DUCKDB_MEMORY_LIMIT=[0-9]+MiB$" "$SBX/opt/server.env" | grep -oE "[0-9]+") || fail "server.env limit is not an NNNMiB value"
+  half_total_mib=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 2 / 1024 ))
+  [[ "$got_mem" -ge 512 && "$got_mem" -le "$half_total_mib" && $(( got_mem % 256 )) -eq 0 ]] || fail "server.env limit ${got_mem}MiB out of bounds (512..${half_total_mib}, step 256)"
   if grep -q "，降为 " "$SBX/upgrade-1.log"; then fail "the window still had to lower memory_limit after the fix"; fi
   if "$CLI" doctor 2>&1 | grep -q "\[M1\]"; then fail "M1 still reported after the fix"; fi
 fi

@@ -5,11 +5,16 @@ leaves DuckDB believing it may use more than the host has. It then never spills 
 and the kernel kills the server in the middle of a rebuild: grid102 has 3.8 GB, a limit
 of 8 GB, and died at 2.4 GB RSS while copying usdt_perp_5m.
 
+The machine's total is the wrong yardstick: grid102 also runs a 1 GB panel, and half of
+its 3.8 GB (2 GB) is exactly where the first kill happened. What counts is what the OS can
+actually hand out -- MemAvailable plus what DuckDB already holds -- and DuckDB's process
+is a few hundred MB bigger than its buffer pool. So the budget is half of that sum,
+never above half the machine, in 256 MiB steps, at least 512 MiB.
+
 memory_limit is a global DuckDB setting and can be changed over Flight, so the heavy
-steps run under a budget: the configured limit, capped at half the machine and at 80% of
-what is free plus what DuckDB already holds. Afterwards the configured value is put back
--- unless it is itself above the host's memory, in which case the budget stays until the
-next restart and the operator is told to fix server.env.
+steps run under that budget and the configured value is put back afterwards -- unless it
+is itself above the host's memory, in which case the budget stays until the next restart
+and the operator is told to fix server.env (`duckport upgrade` offers to do it).
 """
 
 import re
@@ -18,7 +23,8 @@ from typing import Optional, Tuple
 
 _UNIT = {"": 1, "b": 1, "kb": 1000, "kib": 1024, "mb": 1000 ** 2, "mib": 1024 ** 2,
          "gb": 1000 ** 3, "gib": 1024 ** 3, "tb": 1000 ** 4, "tib": 1024 ** 4}
-FLOOR = 256 * 1024 ** 2
+STEP = 256 * 1024 ** 2
+FLOOR = 512 * 1024 ** 2
 
 
 def parse_size(text) -> Optional[int]:
@@ -59,12 +65,28 @@ def host_memory() -> Tuple[Optional[int], Optional[int]]:
         return total, None
 
 
+def suggest(total, available, in_use) -> Optional[int]:
+    """A limit this host can honour right now: half of (available + what DuckDB holds),
+    at most half the machine, in 256 MiB steps, at least 512 MiB. None when unknown."""
+    if available is None:
+        return None
+    b = (available + (in_use or 0)) // 2
+    if total:
+        b = min(b, total // 2)
+    return max(b // STEP * STEP, FLOOR)
+
+
 def budget(limit, total, available, in_use) -> Optional[int]:
-    """Bytes DuckDB may use during the window; None when nothing is known."""
-    caps = [c for c in (limit, total // 2 if total else None) if c]
-    if available is not None:
-        caps.append(int(0.8 * (available + (in_use or 0))))
-    return max(min(caps), FLOOR) if caps else None
+    """Bytes DuckDB may use during the window: the configured limit, or the suggestion
+    when that is lower; None when nothing is known."""
+    s = suggest(total, available, in_use)
+    caps = [c for c in (limit, s) if c]
+    return min(caps) if caps else None
+
+
+def mib(n) -> str:
+    """The form written to server.env and accepted by DuckDB."""
+    return f"{n // 1024 ** 2}MiB"
 
 
 def plan_note(dp) -> Optional[str]:
@@ -73,9 +95,10 @@ def plan_note(dp) -> Optional[str]:
     total, avail = host_memory()
     if not (limit and total and limit > total):
         return None
-    b = budget(limit, total, avail, parse_size(dp.scalar("SELECT memory_usage FROM pragma_database_size()")))
-    return (f"内存：服务端 memory_limit {fmt(limit)} 超过本机 {fmt(total)}，窗口内会临时降为 {fmt(b)}；"
-            f"请把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为不超过本机内存的值（建议一半）并重启服务端")
+    s = suggest(total, avail, parse_size(dp.scalar("SELECT memory_usage FROM pragma_database_size()")))
+    return (f"内存：服务端 memory_limit {fmt(limit)} 超过本机 {fmt(total)}，窗口内会临时降为 {fmt(s)}；"
+            f"请把 server.env 的 DUCKPORT_DUCKDB_MEMORY_LIMIT 改为 {mib(s)} 左右（本机现在能给出的一半）并重启服务端"
+            f"——`duckport upgrade` 的服务端阶段会询问并代改")
 
 
 class Bounded:

@@ -50,17 +50,25 @@ LOG_DIR="$DEPLOY_OPT/logs"
 DB_PATH="${DB_PATH:-${DEPLOY_DATA}/duckport.db}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:50051}"
 READ_POOL_SIZE="${READ_POOL_SIZE:-4}"
-# DuckDB 的内存上限：没指定就取本机内存的一半。以前固定 8GB，在小机器上 DuckDB 以为内存够用
-# 而不落盘，重建时被内核 OOM 杀掉；上限高于本机内存的 server.env，doctor 会提示（M1）。
+# DuckDB 的内存上限：没指定就取本机现在能给出的内存的一半（不超过总内存的一半，按 256 MiB 取整，
+# 最少 512 MiB）。以前固定 8GB，在小机器上 DuckDB 以为内存够用而不落盘，重建时被内核 OOM 杀掉；
+# 总内存的一半也不可靠——机器上往往还有别的进程。上限高于本机内存的 server.env，doctor 会提示（M1），
+# duckport upgrade 会询问并代改。
 _default_memory_limit() {
-  local bytes=0 gb
+  local total=0 avail=0 b
   if [[ -r /proc/meminfo ]]; then
-    bytes=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 ))
+    total=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 ))
+    avail=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) * 1024 ))
   else
-    bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    avail=$(vm_stat 2>/dev/null | awk '/page size of/ { page = $8 } /^Pages (free|inactive|speculative):/ { gsub(/\./, "", $NF); pages += $NF } END { if (page) printf "%d\n", pages * page }')
+    avail=${avail:-0}
   fi
-  gb=$(( bytes / 2 / 1024 / 1024 / 1024 ))
-  if [[ $gb -ge 1 ]]; then echo "${gb}GB"; else echo "1GB"; fi
+  b=$(( avail / 2 ))
+  [[ $total -gt 0 && $b -gt $(( total / 2 )) ]] && b=$(( total / 2 ))
+  b=$(( b / 268435456 * 268435456 ))
+  [[ $b -ge 536870912 ]] || b=536870912
+  echo "$(( b / 1048576 ))MiB"
 }
 MEMORY_LIMIT_GIVEN="${MEMORY_LIMIT:+1}"
 MEMORY_LIMIT="${MEMORY_LIMIT:-$(_default_memory_limit)}"
@@ -292,7 +300,7 @@ _write_if_missing() {
 }
 
 if [[ ! -f "$DEPLOY_OPT/server.env" && -z "$MEMORY_LIMIT_GIVEN" ]]; then
-  info "DUCKPORT_DUCKDB_MEMORY_LIMIT=${MEMORY_LIMIT}（本机内存的一半；MEMORY_LIMIT=… 可覆盖）"
+  info "DUCKPORT_DUCKDB_MEMORY_LIMIT=${MEMORY_LIMIT}（本机现在能给出的内存的一半；MEMORY_LIMIT=… 可覆盖）"
 fi
 _write_if_missing "$DEPLOY_OPT/server.env" << EOF
 DUCKPORT_DB_PATH=${DB_PATH}
