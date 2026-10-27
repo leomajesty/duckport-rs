@@ -3,7 +3,7 @@
 #
 # 用法：
 #   duckport list                        # 列出可用插件
-#   duckport install <插件名>            # 安装插件实例
+#   duckport install <插件名> [--proxy URL]  # 安装插件实例
 #   duckport rm      <实例名>            # 删除实例
 #   duckport config  <实例名>            # 编辑实例配置
 #   duckport status                      # 服务总览 + 水位
@@ -11,7 +11,7 @@
 #   duckport stop    [<实例>|all]        # 停止（默认 all）
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
-#   duckport update  <实例名>            # 更新插件（自动判断本地/GitHub）
+#   duckport update  <实例名> [--proxy URL]  # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist <实例>             # 补历史数据（必须指定实例）
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
 #   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
@@ -57,12 +57,16 @@ _require_root() {
   [[ $EUID -eq 0 ]] || { echo -e "${RED}需要 root 权限，请用 sudo${NC}"; exit 1; }
 }
 
-# uv pip install 封装。默认清除 shell 代理（代理是给 ingestor 运行时用的）；设置了 DUCKPORT_PROXY
-# （duckport upgrade --proxy）时改用它安装。支持 UV_INDEX_URL 指定 PyPI 镜像（如清华 https://pypi.tuna.tsinghua.edu.cn/simple/）
+# uv pip install 封装。--proxy（DUCKPORT_PROXY）指定了就用它；没指定就沿用 shell 里的代理设置——
+# 以前这里会把它们清空，只能走代理的机器就装不了插件。支持 UV_INDEX_URL 指定 PyPI 镜像
+# （如清华 https://pypi.tuna.tsinghua.edu.cn/simple/）
 _uv_install() {
-  local p="${DUCKPORT_PROXY:-}"
-  HTTP_PROXY="$p" HTTPS_PROXY="$p" http_proxy="$p" https_proxy="$p" \
+  if [[ -n "${DUCKPORT_PROXY:-}" ]]; then
+    HTTP_PROXY="$DUCKPORT_PROXY" HTTPS_PROXY="$DUCKPORT_PROXY" http_proxy="$DUCKPORT_PROXY" https_proxy="$DUCKPORT_PROXY" \
+      uv pip install "$@"
+  else
     uv pip install "$@"
+  fi
 }
 
 # 将服务逻辑名转为 launchd label
@@ -733,8 +737,16 @@ for name, info in data.items():
 
 cmd_install() {
   _require_root
-  local plugin="${1:-}"
-  [[ -n "$plugin" ]] || { echo "用法: duckport install <插件名>"; cmd_list; exit 1; }
+  local plugin="" proxy=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proxy) proxy="${2:?--proxy 需要代理地址，如 http://localhost:1082}"; shift ;;
+      *) plugin="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$plugin" ]] || { echo "用法: duckport install <插件名> [--proxy URL]"; cmd_list; exit 1; }
+  [[ -n "$proxy" ]] && _use_proxy "$proxy"
   plugin="${plugin//_/-}"
 
   local reg
@@ -1013,8 +1025,16 @@ _update_instance() {
 
 cmd_update() {
   _require_root
-  local name="${1:-}"
-  [[ -n "$name" ]] || { echo "用法: duckport update <实例名>"; exit 1; }
+  local name="" proxy=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proxy) proxy="${2:?--proxy 需要代理地址，如 http://localhost:1082}"; shift ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || { echo "用法: duckport update <实例名> [--proxy URL]"; exit 1; }
+  [[ -n "$proxy" ]] && _use_proxy "$proxy"
   name="${name//_/-}"
   _update_instance "$name"
   echo -e "  ${YELLOW}提示：请手动执行 duckport restart $name 以使新版本生效${NC}"
@@ -1556,7 +1576,7 @@ _finish_rebuild() {
   fi
   if [[ $no_compact -eq 1 ]]; then
     echo -e "  ${YELLOW}--no-compact：保留 <表>__pk_old，未压缩${NC}"
-    echo -e "  需要时：sudo duckport upgrade --finalize（删除旧表）；有问题：--rollback"
+    echo -e "  之后：sudo duckport upgrade --compact（校验、删除旧表并压缩）；只删旧表 --finalize；有问题 --rollback"
     return 0
   fi
   _compact_db "$py" "$port" "$db" "$run_id"
@@ -1680,9 +1700,9 @@ ${BOLD}duckport${NC} — duckport-rs 服务管理
 
 ${BOLD}插件管理：${NC}
   duckport ${CYAN}list${NC}                           列出 registry 中的可用插件
-  duckport ${CYAN}install${NC} <插件名>               从 registry 安装插件（交互式）
+  duckport ${CYAN}install${NC} <插件名> [--proxy URL] 从 registry 安装插件（交互式）
   duckport ${CYAN}rm${NC}      <实例名>               删除实例
-  duckport ${CYAN}update${NC}  <实例名>               更新插件并重启实例
+  duckport ${CYAN}update${NC}  <实例名> [--proxy URL] 更新插件并重启实例
   duckport ${CYAN}config${NC}  <实例名>               编辑实例配置文件
 
 ${BOLD}服务控制：${NC}
@@ -1730,9 +1750,9 @@ shift || true
 
 case "$CMD" in
   list)     cmd_list ;;
-  install)  cmd_install "${1:-}" ;;
+  install)  cmd_install "$@" ;;
   rm)       cmd_rm      "${1:-}" ;;
-  update)   cmd_update  "${1:-}" ;;
+  update)   cmd_update  "$@" ;;
   config)   cmd_config  "${1:-}" ;;
   status)   cmd_status ;;
   start)    cmd_start   "${1:-server}" ;;

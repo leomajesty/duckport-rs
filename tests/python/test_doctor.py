@@ -43,6 +43,8 @@ def main():
     ]:
         assert has(f, rule, level, target), (rule, level, target)
     assert not has(f, "V3", "block"), "keyed tables are compatible with old writers"
+    assert all("--compact" in x["fix"] for x in f if x["rule"] in ("C1", "B1") and "__pk_old" in x["message"] + x["target"]), \
+        "a leftover __pk_old must point at upgrade --compact"
 
     rc, f = doctor(NEW)
     assert rc == 2 and has(f, "B1", "block", "usdt_perp_1m"), "usdt_perp_1m__pk_old blocks a second rebuild"

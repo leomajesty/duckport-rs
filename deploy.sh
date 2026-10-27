@@ -7,7 +7,7 @@
 # 用法：
 #   ./deploy.sh                        # 安装 / 升级（自动 MD5 检测）
 #   ./deploy.sh --instance <名称>      # 指定默认实例名（默认 binance-5m）
-#   ./deploy.sh --loadhist [<实例>]    # 补历史数据
+#   ./deploy.sh --loadhist <实例>      # 补历史数据（= duckport loadhist <实例>）
 #
 # 环境变量（可覆盖默认值）：
 #   GITHUB_REPO, RELEASE_TAG
@@ -131,47 +131,14 @@ _retarget_origin() {
 }
 _retarget_origin "$REPO_DIR"
 
-# ─── loadhist 模式 ────────────────────────────────────────────────────────────
+# ─── loadhist 模式：交给 duckport CLI ─────────────────────────────────────────
+# 以前这里有一份自己的 loadhist，和 CLI 那份各走各的：unit 名写死（同机第二套部署停不到）、
+# 没有实例名就遍历全部实例（没有 loadhist 程序的插件被停掉后就一直停着）、macOS 用已废弃的
+# launchctl unload。CLI 那份会先确认实例有 loadhist、提醒 START_DATE 与 retention 的差距，再停实例。
 
 if [[ "$MODE" == "loadhist" ]]; then
-  step "loadhist${LOADHIST_INSTANCE:+ — $LOADHIST_INSTANCE}"
-
-  _run_loadhist() {
-    local inst="$1"
-    local inst_dir="$INGESTORS_DIR/$inst"
-    local cfg="$inst_dir/config.env"
-    local py="$inst_dir/.venv/bin/python3"
-    [[ -x "$py" && -f "$cfg" ]] || { info "实例 $inst 环境不完整，跳过"; return; }
-
-    info "⚠ 停止 duckport-ingestor@$inst 以独占 staging 表"
-    if [[ "$OS" == "Linux" ]]; then
-      systemctl stop "duckport-ingestor@$inst" 2>/dev/null || true
-    else
-      launchctl unload "$PLIST_DIR/com.duckport.ingestor.${inst}.plist" 2>/dev/null || true
-    fi
-
-    INGESTOR_ENV_FILE="$cfg" "$inst_dir/.venv/bin/loadhist" && \
-      ok "loadhist 完成" || { info "loadhist 失败"; }
-
-    info "提示：请手动执行 duckport start $inst 以恢复采集"
-  }
-
-  if [[ -n "$LOADHIST_INSTANCE" ]]; then
-    _run_loadhist "$LOADHIST_INSTANCE"
-  else
-    # 对所有实例逐一执行
-    find "$INGESTORS_DIR" -maxdepth 2 -name "config.env" 2>/dev/null \
-      | sed "s|$INGESTORS_DIR/||;s|/config.env||" | sort \
-      | while IFS= read -r inst; do _run_loadhist "$inst"; done
-  fi
-  exit 0
+  exec env DUCKPORT_HOME="$DEPLOY_OPT" bash "$REPO_DIR/duckport" loadhist ${LOADHIST_INSTANCE:+"$LOADHIST_INSTANCE"}
 fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# install 模式
-# ═══════════════════════════════════════════════════════════════════════════════
-
-info "GitHub 仓库：$GITHUB_REPO  tag：$RELEASE_TAG"
 
 # ─── 辅助：获取 Release binary 的 URL 和 sha256 ─────────────────────────────
 
