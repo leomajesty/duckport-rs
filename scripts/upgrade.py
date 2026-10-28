@@ -120,7 +120,9 @@ def cmd_plan(dp, args):
                 print(f"     ⚠ {w}")
         print(f"  2. 修正；预计窗口共 {res.window_seconds(res.backup_possible):.0f}s"
               + (f"（重建复制约 {res.rebuild_rows:,} 行）" if res.rebuild_rows else ""))
-        print("  重建的表保留为 <表>__pk_old，可 --rollback；确认无误后 --finalize 删除")
+        for n in res.notes:
+            print(f"  ⚠ {n}")
+        print("  重建的表保留为 <表>__pk_old，可 --rollback；确认无误后自动校验、删除并压缩（--no-compact 则留给 --finalize）")
     if any(f.rule in ("D3", "L1") for f in online + stop):
         print(f"  删除的行先导出到 {args.quarantine_dir or '<quarantine>'}/<run_id>/（parquet）")
     deletions = show_deletions(dp, state, findings, opts)

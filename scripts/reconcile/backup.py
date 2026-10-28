@@ -34,13 +34,16 @@ _UNITS = {"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "KIB": 1 << 10, "MIB": 1 
 @dataclass
 class Resources:
     free: Optional[int] = None          # bytes free on the database's filesystem
+    reusable: int = 0                   # free blocks inside the file: DuckDB fills these before growing it
     rebuild_bytes: int = 0              # extra space the rebuilds need while old and new coexist
+    compact_bytes: int = 0              # what a rewrite of the live data would need on disk afterwards
     rebuild_rows: int = 0
     backup_bytes: int = 0
     backup_memory: int = 0
     backup_seconds: float = 0.0
     memory_available: Optional[int] = None
-    warnings: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)   # these make the backup impossible
+    notes: List[str] = field(default_factory=list)      # worth knowing, change nothing
     fatal: Optional[str] = None
 
     @property
@@ -74,11 +77,29 @@ def _host_memory_available() -> Optional[int]:
     return None
 
 
+def disk_plan(free: int, reusable: int, rebuild: int, backup: int):
+    """(fatal, backup_warning) for the stop window. The rebuilds grow the file only by what
+    the free blocks inside it cannot absorb; the backup is a separate file and needs disk."""
+    need = max(0, rebuild - reusable)
+    inside = f"，库文件内可复用 {gb(reusable)}" if reusable else ""
+    if free < need:
+        return (f"磁盘不足：重建需要约 {gb(rebuild)}（新旧两份数据同时存在）{inside}，"
+                f"磁盘空闲只有 {gb(free)}"), None
+    if free < need + backup:
+        return None, (f"磁盘不足以备份：备份约 {gb(backup)} + 重建约 {gb(need)}"
+                      f"{'（已扣除库文件内可复用的 ' + gb(reusable) + '）' if reusable else ''}，空闲只有 {gb(free)}")
+    return None, None
+
+
 def estimate(dp, state: State, findings: List[Finding], db_path: str) -> Resources:
     res = Resources()
     size = state.db_size
-    used = (size.get("used_blocks") or 0) * (dp.scalar(
-        "SELECT block_size FROM pragma_database_size() WHERE database_name = current_database()") or 0)
+    block_size = dp.scalar(
+        "SELECT block_size FROM pragma_database_size() WHERE database_name = current_database()") or 0
+    used = (size.get("used_blocks") or 0) * block_size
+    # Blocks freed by earlier DROPs (a rolled-back rebuild, retention) stay in the file and are
+    # handed out before it grows: rmt.ctb2 had 20 GB of them and 7 GB of disk, which is enough.
+    res.reusable = (size.get("free_blocks") or 0) * block_size
     # estimated_size also counts deleted rows; copies carry only the live ones
     physical_total = sum(t.estimated_size for t in state.tables.values()) or 1
     live = {}
@@ -94,6 +115,12 @@ def estimate(dp, state: State, findings: List[Finding], db_path: str) -> Resourc
         used * live_rows(t) / physical_total * (KEYED_DATA_SHARE if state.tables[t].keyed else 1.0)
         for t in rebuilt))
 
+    # A later `upgrade --compact` rewrites the live data into a new file next to the old one,
+    # so it needs that much free disk -- free blocks inside the file do not help there.
+    res.compact_bytes = int(1.1 * sum(
+        used * live_rows(t.name) / physical_total * (KEYED_DATA_SHARE if t.keyed else 1.0)
+        for t in state.business_tables()))
+
     keyed_rows = sum(live_rows(t.name) for t in state.business_tables() if t.keyed)
     res.backup_bytes = used
     res.backup_memory = BASE_MEMORY + keyed_rows * INDEX_BYTES_PER_ROW
@@ -107,12 +134,14 @@ def estimate(dp, state: State, findings: List[Finding], db_path: str) -> Resourc
     res.memory_available = min(known) if known else None
 
     if res.free is not None:
-        if res.free < res.rebuild_bytes:
-            res.fatal = (f"磁盘不足：重建需要约 {gb(res.rebuild_bytes)}（新旧两份数据同时存在），"
-                         f"空闲只有 {gb(res.free)}")
-        elif res.free < res.rebuild_bytes + res.backup_bytes:
-            res.warnings.append(f"磁盘不足以备份：备份约 {gb(res.backup_bytes)} + 重建约 {gb(res.rebuild_bytes)}，"
-                                f"空闲只有 {gb(res.free)}")
+        fatal, warning = disk_plan(res.free, res.reusable, res.rebuild_bytes, res.backup_bytes)
+        res.fatal = fatal
+        if warning:
+            res.warnings.append(warning)
+        if res.compact_bytes and res.free < res.compact_bytes:
+            res.notes.append(f"重建后的压缩要在旁边重写一份存活数据，约需 {gb(res.compact_bytes)} 空闲磁盘，"
+                             f"现在只有 {gb(res.free)}：到时会跳过压缩（库照常可用，空闲块留给写入复用），"
+                             "腾出空间后 sudo duckport upgrade --compact")
     if res.memory_available is not None and res.memory_available < res.backup_memory:
         res.warnings.append(f"内存不足以备份：带主键的表 {keyed_rows:,} 行，复制时重建索引约需 "
                             f"{gb(res.backup_memory)}，可用 {gb(res.memory_available)}"

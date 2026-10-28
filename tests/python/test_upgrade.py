@@ -28,7 +28,7 @@ from reconcile_fixtures import (
 )
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
-from reconcile import memory  # noqa: E402
+from reconcile import backup, memory  # noqa: E402
 
 QDIR = tempfile.mkdtemp(prefix="duckport-quarantine-")
 BDIR = tempfile.mkdtemp(prefix="duckport-backup-")
@@ -252,6 +252,17 @@ def main():
     # the baseline covers the live tables only, so the server's database still has to match it
     rc, out = upgrade(STOPPED, "compact-check", "--baseline", base)
     assert rc == 0, out
+
+    hr("disk: free blocks inside the file count for the rebuild, not for the backup")
+    GB = 10 ** 9
+    fatal, warn = backup.disk_plan(free=7 * GB, reusable=21 * GB, rebuild=21 * GB, backup=48 * GB)
+    assert fatal is None and warn and "备份" in warn, (fatal, warn)      # rmt.ctb2 after a rolled-back rebuild
+    fatal, warn = backup.disk_plan(free=7 * GB, reusable=0, rebuild=21 * GB, backup=48 * GB)
+    assert fatal and "磁盘不足" in fatal and "可复用" not in fatal, fatal   # the same box before: nothing reusable
+    fatal, warn = backup.disk_plan(free=100 * GB, reusable=0, rebuild=21 * GB, backup=48 * GB)
+    assert fatal is None and warn is None
+    fatal, warn = backup.disk_plan(free=30 * GB, reusable=5 * GB, rebuild=21 * GB, backup=48 * GB)
+    assert fatal is None and warn and "已扣除" in warn, warn
 
     hr("memory: heavy work runs under a budget when memory_limit exceeds the host")
     G = 1024 ** 3
