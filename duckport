@@ -261,6 +261,25 @@ PY
 
 # ─── status ───────────────────────────────────────────────────────────────────
 
+# 服务端进程的启动时刻（epoch 秒）；没在跑输出空
+_server_started_epoch() {
+  if [[ "$OS" == "Linux" ]]; then
+    local ts
+    ts=$(systemctl show -p ActiveEnterTimestamp --value "$SVC_SERVER" 2>/dev/null)
+    [[ -n "$ts" && "$ts" != "n/a" ]] && date -d "$ts" +%s 2>/dev/null
+  else
+    local pid
+    pid=$(launchctl list "$(_svc_label "$SVC_SERVER")" 2>/dev/null | awk -F'[=;]' '/"PID"/ {gsub(/ /, "", $2); print $2}')
+    [[ -n "$pid" ]] && date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$pid" 2>/dev/null | xargs)" +%s 2>/dev/null
+  fi
+}
+
+_file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+_hm() { date -d "@$1" +%H:%M 2>/dev/null || date -r "$1" +%H:%M 2>/dev/null; }
+
 cmd_status() {
   local server_addr server_port
   server_addr=$(grep '^DUCKPORT_LISTEN_ADDR=' "$DEPLOY_OPT/server.env" 2>/dev/null \
@@ -417,6 +436,11 @@ PYEOF
     ret_dry=true
   fi
   echo -e "\n${BOLD}Retention${NC}"
+  # 这一行只能从 server.env 读：服务端只在启动时读配置，之后改的文件对运行中的进程无效。
+  # 文件比服务端启动晚就说出来，别让人以为改完就生效了（grid102 上改完没重启，status 却显示 enabled）。
+  local started env_mtime stale_env=0
+  started=$(_server_started_epoch); env_mtime=$(_file_mtime "$DEPLOY_OPT/server.env")
+  [[ -n "$started" && -n "$env_mtime" && "$env_mtime" -gt "$started" ]] && stale_env=1
   if [[ "$ret_enabled" == "invalid" || "$ret_dry" == "invalid" ]]; then
     echo -e "  scheduler ${RED}✗ server.env 中 DUCKPORT_RETENTION_ENABLED / DRY_RUN 的值无效（只接受 true/false），服务端会拒绝启动${NC}"
   elif [[ "$ret_enabled" == "true" ]]; then
@@ -428,16 +452,28 @@ PYEOF
   else
     echo -e "  scheduler ${DIM}○ disabled${NC}"
   fi
+  if [[ $stale_env -eq 1 ]]; then
+    echo -e "  ${YELLOW}⚠ 以上是 server.env 里的值：文件改于 $(_hm "$env_mtime")，服务端 $(_hm "$started") 启动，运行中的进程还是启动时的配置；duckport restart server 后生效${NC}"
+  fi
   if ! _scripts_readable; then
     echo -e "  ${DIM}（策略列表要读 ${REPO_DIR}/scripts，当前用户不可读：用 sudo，或把仓库移到所有用户可读的位置）${NC}"
   else
-    local ret_err
-    ret_err=$(mktemp)
-    if ! "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief 2>"$ret_err"; then
+    local ret_err ret_out interval
+    ret_err=$(mktemp); ret_out=$(mktemp)
+    if "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief >"$ret_out" 2>"$ret_err"; then
+      cat "$ret_out"
+      # 调度器「开着」、有策略、却一轮都没跑过，而服务端运行已超过一个周期：多半是配置改了没重启
+      interval=$(_server_env DUCKPORT_RETENTION_INTERVAL_SECS); interval="${interval:-3600}"
+      if [[ "$ret_enabled" == "true" && $stale_env -eq 0 && -n "$started" ]] \
+         && grep -q "never run" "$ret_out" && ! grep -q "cutoff=" "$ret_out" \
+         && [[ $(( $(date +%s) - started )) -gt $(( interval + 120 )) ]]; then
+        echo -e "  ${YELLOW}⚠ 调度器开着、服务端已运行 $(( ( $(date +%s) - started ) / 60 )) 分钟，策略却一轮都没执行过：看 duckport logs server 里的 retention 行${NC}"
+      fi
+    else
       # 说清楚是哪一种读不到：python 环境对当前用户不可用、服务端太旧……都在 stderr 的最后一行
       echo -e "  ${DIM}无法读取 data.retention_policy：$(tail -n 1 "$ret_err" 2>/dev/null | cut -c1-120)${NC}"
     fi
-    rm -f "$ret_err"
+    rm -f "$ret_err" "$ret_out"
   fi
   echo ""
 }
