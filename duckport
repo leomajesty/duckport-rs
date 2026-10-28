@@ -455,26 +455,63 @@ PYEOF
   if [[ $stale_env -eq 1 ]]; then
     echo -e "  ${YELLOW}⚠ 以上是 server.env 里的值：文件改于 $(_hm "$env_mtime")，服务端 $(_hm "$started") 启动，运行中的进程还是启动时的配置；duckport restart server 后生效${NC}"
   fi
-  if ! _scripts_readable; then
-    echo -e "  ${DIM}（策略列表要读 ${REPO_DIR}/scripts，当前用户不可读：用 sudo，或把仓库移到所有用户可读的位置）${NC}"
-  else
-    local ret_err ret_out interval
-    ret_err=$(mktemp); ret_out=$(mktemp)
-    if "$status_py" "$REPO_DIR/scripts/retention.py" --addr "127.0.0.1:$server_port" status --brief >"$ret_out" 2>"$ret_err"; then
-      cat "$ret_out"
-      # 调度器「开着」、有策略、却一轮都没跑过，而服务端运行已超过一个周期：多半是配置改了没重启
-      interval=$(_server_env DUCKPORT_RETENTION_INTERVAL_SECS); interval="${interval:-3600}"
-      if [[ "$ret_enabled" == "true" && $stale_env -eq 0 && -n "$started" ]] \
-         && grep -q "never run" "$ret_out" && ! grep -q "cutoff=" "$ret_out" \
-         && [[ $(( $(date +%s) - started )) -gt $(( interval + 120 )) ]]; then
-        echo -e "  ${YELLOW}⚠ 调度器开着、服务端已运行 $(( ( $(date +%s) - started ) / 60 )) 分钟，策略却一轮都没执行过：看 duckport logs server 里的 retention 行${NC}"
-      fi
-    else
-      # 说清楚是哪一种读不到：python 环境对当前用户不可用、服务端太旧……都在 stderr 的最后一行
-      echo -e "  ${DIM}无法读取 data.retention_policy：$(tail -n 1 "$ret_err" 2>/dev/null | cut -c1-120)${NC}"
+  # 和上面的 Watermark 一样，查询写在命令里，不读仓库的脚本：非 root 用户、仓库放在哪里都能看。
+  # 输出格式与 `duckport retention status --brief` 一致（scripts/retention.py），改一处记得改另一处。
+  local ret_err ret_out interval
+  ret_err=$(mktemp); ret_out=$(mktemp)
+  if "$status_py" - "$server_port" >"$ret_out" 2>"$ret_err" << 'PYEOF'
+import json
+import sys
+
+import pyarrow.flight as flight
+
+port = sys.argv[1]
+client = flight.FlightClient(f"grpc://localhost:{port}")
+
+def query(sql):
+    ticket = json.dumps({"type": "duckport.query", "sql": sql}).encode("utf-8")
+    try:
+        return client.do_get(flight.Ticket(ticket)).read_all().to_pylist()
+    except flight.FlightInternalError as exc:  # an empty result arrives as "never sent a data message"
+        if "never sent a data message" in str(exc):
+            return []
+        raise
+
+try:
+    rows = query(
+        "SELECT p.table_name, p.keep_days, p.enabled, l.status, l.cutoff, l.rows_deleted, l.dry_run, l.started_at "
+        "FROM data.retention_policy p LEFT JOIN ("
+        "  SELECT * FROM data.retention_log QUALIFY row_number() OVER (PARTITION BY table_name ORDER BY started_at DESC) = 1"
+        ") l ON l.table_name = p.table_name ORDER BY p.table_name"
+    )
+finally:
+    client.close()
+
+if not rows:
+    print("  \033[2m（未配置策略：duckport retention set <表名> <保留天数>）\033[0m")
+for p in rows:
+    state = "on " if p["enabled"] else "off"
+    last = "never run"
+    if p["status"]:
+        mode = " (dry-run)" if p["dry_run"] else ""
+        last = (f"{p['status']}{mode} cutoff={p['cutoff']} rows={p['rows_deleted']:,} "
+                f"at {str(p['started_at'])[:16]} UTC")
+    print(f"  [{state}] {p['table_name']:<22} keep {p['keep_days']:>4}d  {last}")
+PYEOF
+  then
+    cat "$ret_out"
+    # 调度器「开着」、有策略、却一轮都没跑过，而服务端运行已超过一个周期：多半是配置改了没重启
+    interval=$(_server_env DUCKPORT_RETENTION_INTERVAL_SECS); interval="${interval:-3600}"
+    if [[ "$ret_enabled" == "true" && $stale_env -eq 0 && -n "$started" ]] \
+       && grep -q "never run" "$ret_out" && ! grep -q "cutoff=" "$ret_out" \
+       && [[ $(( $(date +%s) - started )) -gt $(( interval + 120 )) ]]; then
+      echo -e "  ${YELLOW}⚠ 调度器开着、服务端已运行 $(( ( $(date +%s) - started ) / 60 )) 分钟，策略却一轮都没执行过：看 duckport logs server 里的 retention 行${NC}"
     fi
-    rm -f "$ret_err" "$ret_out"
+  else
+    # 说清楚是哪一种读不到：python 环境对当前用户不可用、服务端太旧……都在 stderr 的最后一行
+    echo -e "  ${DIM}无法读取 data.retention_policy：$(tail -n 1 "$ret_err" 2>/dev/null | cut -c1-120)${NC}"
   fi
+  rm -f "$ret_err" "$ret_out"
   echo ""
 }
 
