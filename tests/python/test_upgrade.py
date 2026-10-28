@@ -24,11 +24,12 @@ import pyarrow.flight as flight
 import pyarrow.parquet as pq
 
 from reconcile_fixtures import (
-    KLINE, NEW, OLD, SERVER, doctor, hr, legacy_state, reset, run_script, tx, unkeyed_with_duplicates,
+    ADDR, KLINE, NEW, OLD, SERVER, doctor, hr, legacy_state, reset, run_script, tx, unkeyed_with_duplicates,
 )
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
-from reconcile import backup, memory  # noqa: E402
+from duckport_flight import Duckport  # noqa: E402
+from reconcile import backup, memory, rebuild  # noqa: E402
 
 QDIR = tempfile.mkdtemp(prefix="duckport-quarantine-")
 BDIR = tempfile.mkdtemp(prefix="duckport-backup-")
@@ -285,6 +286,30 @@ def main():
     execute(client, f"SET memory_limit = '{memory.parse_size(before) // 1024 ** 2}MiB'")
     # current_setting() prints the limit rounded to 0.1 GiB
     assert abs(memory.parse_size(scalar(client, "SELECT current_setting('memory_limit')")) - memory.parse_size(before)) < 0.1 * G
+
+    hr("rebuild: a copy that dies half-way is discarded at once, the original untouched")
+    tx(client, "CREATE TABLE data.t_fail (open_time TIMESTAMP, symbol VARCHAR, PRIMARY KEY (open_time, symbol))",
+       "INSERT INTO data.t_fail SELECT TIMESTAMP '2026-09-01' + INTERVAL (d) DAY, 'S' FROM range(50) r(d)")
+
+    class DiskFullOnSecondMonth(Duckport):
+        inserts = 0
+
+        def execute(self, sql):
+            if "INSERT INTO" in sql:
+                self.inserts += 1
+                if self.inserts == 2:
+                    raise RuntimeError("IO Error: Could not write file: No space left on device (simulated)")
+            return super().execute(sql)
+
+    try:
+        rebuild.copy_table(DiskFullOnSecondMonth(ADDR), "t_fail", "open_time")
+        raise AssertionError("the copy should have failed")
+    except RuntimeError as e:
+        assert "No space left" in str(e) and "半成品" in str(e) and "已删除" in str(e), e
+    assert not exists(client, "t_fail__nopk"), "the half-copied twin was left behind"
+    assert keyed(client, "t_fail") and count(client, "data.t_fail") == 50, "the original was touched"
+    assert scalar(client, "SELECT count(*) FROM duckdb_tables() WHERE table_name = 't_fail'") == 1
+    tx(client, "DROP TABLE data.t_fail")
 
     hr("compact: refuses a leftover file and an orphaned copy before dropping anything")
     rc, _ = upgrade(STOPPED, "compact-build", "--run-id", "c3", "--new-db", newdb, "--baseline-out", base)

@@ -56,31 +56,49 @@ def copy_table(dp, table, time_col: Optional[str]) -> int:
         dp.execute(f"DROP TABLE data.{q(table + NEW_SUFFIX)}")
     src, dst = f"data.{q(table)}", f"data.{q(table + NEW_SUFFIX)}"
     dp.execute(create_twin_sql(dp, table))
-    if time_col:
-        tc = q(time_col)
-        months = dp.query(
-            f"SELECT DISTINCT CAST(date_trunc('month', {tc}) AS VARCHAR) AS m FROM {src} "
-            f"WHERE {tc} IS NOT NULL ORDER BY m")
-        for r in months:
-            t0 = time.time()
-            n = dp.execute(
-                f"INSERT INTO {dst} SELECT * FROM {src} WHERE {tc} >= TIMESTAMP {lit(r['m'])} "
-                f"AND {tc} < TIMESTAMP {lit(r['m'])} + INTERVAL 1 MONTH ORDER BY {tc}")
-            print(f"    {r['m'][:7]}  {n:>12,} rows  {time.time() - t0:5.1f}s", flush=True)
-        dp.execute(f"INSERT INTO {dst} SELECT * FROM {src} WHERE {tc} IS NULL")
-    else:
-        dp.execute(f"INSERT INTO {dst} SELECT * FROM {src}")
+    try:
+        if time_col:
+            tc = q(time_col)
+            months = dp.query(
+                f"SELECT DISTINCT CAST(date_trunc('month', {tc}) AS VARCHAR) AS m FROM {src} "
+                f"WHERE {tc} IS NOT NULL ORDER BY m")
+            for r in months:
+                t0 = time.time()
+                n = dp.execute(
+                    f"INSERT INTO {dst} SELECT * FROM {src} WHERE {tc} >= TIMESTAMP {lit(r['m'])} "
+                    f"AND {tc} < TIMESTAMP {lit(r['m'])} + INTERVAL 1 MONTH ORDER BY {tc}")
+                print(f"    {r['m'][:7]}  {n:>12,} rows  {time.time() - t0:5.1f}s", flush=True)
+            dp.execute(f"INSERT INTO {dst} SELECT * FROM {src} WHERE {tc} IS NULL")
+        else:
+            dp.execute(f"INSERT INTO {dst} SELECT * FROM {src}")
 
-    src_n = dp.scalar(f"SELECT count(*) FROM {src}")
-    dst_n = dp.scalar(f"SELECT count(*) FROM {dst}")
-    if src_n != dst_n:
-        dp.execute(f"DROP TABLE {dst}")
-        raise RuntimeError(f"data.{table} 行数不一致：{src_n} vs {dst_n}，已删除副本")
+        src_n = dp.scalar(f"SELECT count(*) FROM {src}")
+        dst_n = dp.scalar(f"SELECT count(*) FROM {dst}")
+        if src_n != dst_n:
+            raise RuntimeError(f"data.{table} 行数不一致：{src_n} vs {dst_n}")
+    except Exception as e:
+        # A copy that dies half-way (disk full on rmt.ctb2, the server killed) must not leave the
+        # half-filled twin behind: dropped and checkpointed, its blocks are free again for the
+        # retry instead of waiting for the next run or a --rollback. The original is untouched.
+        raise RuntimeError(f"{str(e).splitlines()[0]}；{_discard(dp, dst)}") from e
     dp.transaction([
         f"ALTER TABLE {src} RENAME TO {q(table + OLD_SUFFIX)}",
         f"ALTER TABLE {dst} RENAME TO {q(table)}",
     ])
     return dst_n
+
+
+def _discard(dp, dst: str) -> str:
+    """Best effort: drop the half-copied twin and checkpoint so its blocks are reusable now."""
+    try:
+        dp.execute(f"DROP TABLE IF EXISTS {dst}")
+    except Exception as e:  # e.g. the server is gone
+        return f"半成品 {dst} 未能删除（{str(e).splitlines()[0][:80]}），下次重建或 --rollback 会清理"
+    try:
+        dp.execute("CHECKPOINT")
+    except Exception as e:
+        return f"半成品 {dst} 已删除，但 CHECKPOINT 失败（{str(e).splitlines()[0][:80]}）：空间在下次 checkpoint 后复用"
+    return f"半成品 {dst} 已删除，空间已回到空闲块"
 
 
 def finalize(dp) -> List[str]:
