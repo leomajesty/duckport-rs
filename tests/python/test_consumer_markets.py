@@ -53,6 +53,24 @@ def test_asset_class_on_both_perp_markets():
         "SELECT * FROM data.exginfo WHERE market = 'usdt_perp' AND contract_type = 'PERPETUAL'"
 
 
+def test_asset_class_on_the_rows_own_columns():
+    """binance-ingestor >= 0.7.0 writes contract_type / underlying_type on every perp row."""
+    for market in ("usdt_perp", "others_perp"):
+        sql = kline_sql(market, asset_class="crypto", row_columns=True)
+        assert "AND (contract_type = 'PERPETUAL')" in sql
+        assert "exginfo" not in sql and "symbol IN" not in sql
+    assert "AND (contract_type = 'TRADIFI_PERPETUAL')" in kline_sql("usdt_perp", asset_class="tradifi", row_columns=True)
+    equity = kline_sql("usdt_perp", asset_class="EQUITY", row_columns=True)
+    assert "AND (contract_type = 'TRADIFI_PERPETUAL' AND underlying_type IN ('EQUITY', 'HK_EQUITY', " in equity
+    assert "AND (underlying_type = 'PREMARKET')" in kline_sql("usdt_perp", asset_class="premarket", row_columns=True)
+    # no asset_class: the statement is the same with or without the columns
+    assert kline_sql("usdt_perp", row_columns=True) == kline_sql("usdt_perp")
+    # without the columns the symbols still come from exginfo
+    assert "symbol IN (SELECT symbol FROM data.exginfo" in kline_sql("usdt_perp", asset_class="crypto")
+    raises(lambda: kline_sql("usdt_spot", asset_class="crypto", row_columns=True), "only supported for perp markets")
+    raises(lambda: kline_sql("usdt_perp", asset_class="a'b", row_columns=True), "Invalid asset_class")
+
+
 def test_asset_class_is_refused_on_spot():
     raises(lambda: kline_sql("usdt_spot", asset_class="crypto"), "only supported for perp markets")
     raises(lambda: build_exginfo_sql("data", "usdt_spot", "crypto"), "only supported for perp markets")

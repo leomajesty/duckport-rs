@@ -297,12 +297,14 @@ crypto = c.get_market("usdt_perp", interval=60, asset_class="crypto")
 tradfi = c.get_market("usdt_perp", interval=60, asset_class="tradifi")
 # EQUITY includes EQUITY, HK_EQUITY, KR_EQUITY, and CN_EQUITY.
 equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
-# Any other value matches exginfo.underlying_type exactly, e.g. COMMODITY, FX, PREMARKET, COIN.
+# Any other value matches underlying_type exactly, e.g. COMMODITY, FX, PREMARKET, COIN.
 gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
 info = c.get_exginfo("usdt_perp", asset_class="tradifi")
 ```
 
-`asset_class` applies only to `usdt_perp`, on `get_market`, `get_symbol`, and `get_exginfo`. `crypto` selects `contract_type='PERPETUAL'`; `tradifi` selects `TRADIFI_PERPETUAL`. Do not pass it for `usdt_spot`. A raw `query()` against `usdt_perp_5m` or `usdt_perp_funding` is not filtered.
+`asset_class` applies only to the perp markets (`usdt_perp`, `others_perp`), on `get_market`, `get_symbol`, and `get_exginfo`. `crypto` selects `contract_type='PERPETUAL'`; `tradifi` selects `TRADIFI_PERPETUAL`. Do not pass it for `usdt_spot`. A raw `query()` against `usdt_perp_5m` or `usdt_perp_funding` is not filtered.
+
+Since binance-ingestor 0.7.0 every row of the perp kline tables (`usdt_perp_*`, `others_perp_*`) carries `contract_type` and `underlying_type`, and `asset_class` on `get_market` / `get_symbol` filters on those columns: delisted contracts are included, a symbol name that was reused (ANTUSDT: crypto until 2024-04, TradFi since 2026-11) is split by period, and pre-market rows are `PREMARKET`. Tables without the columns (older plugin) fall back to the symbols `exginfo` lists as trading now. `get_exginfo` always reflects current listings only. When filtering by `underlying_type` (`PREMARKET`, `COIN`, `EQUITY`, ...), the one resample bar in which a contract changes type is incomplete on both sides and is not returned.
 
 ---
 

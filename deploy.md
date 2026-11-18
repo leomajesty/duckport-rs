@@ -416,7 +416,9 @@ table = consumer.query("SELECT * FROM data.usdt_perp_5m WHERE symbol = 'BTCUSDT'
 duck_time = consumer.read_duck_time("usdt_perp")
 ```
 
-`asset_class` 只用于 `usdt_perp`。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`EQUITY` 展开为 `EQUITY`、`HK_EQUITY`、`KR_EQUITY`、`CN_EQUITY`；`COMMODITY`、`FX`、`PREMARKET`、`COIN` 等按 `exginfo.underlying_type` 精确匹配。`usdt_spot` 传入该参数会报错。
+`asset_class` 只用于合约市场（`usdt_perp`、`others_perp`）。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`EQUITY` 展开为 `EQUITY`、`HK_EQUITY`、`KR_EQUITY`、`CN_EQUITY`；`COMMODITY`、`FX`、`PREMARKET`、`COIN` 等按 `underlying_type` 精确匹配。`usdt_spot` 传入该参数会报错。
+
+合约 K 线表（`usdt_perp_*`、`others_perp_*`）自 binance-ingestor 0.7.0 起每行带 `contract_type` 和 `underlying_type` 两列，`get_market` / `get_symbol` 的 `asset_class` 直接按这两列过滤：已下架的合约也在结果里，同一个 symbol 先后挂过不同合约时（如 ANTUSDT，2024-04 前是 Crypto，2026-11 起是 TradFi）各段归各自的类别，盘前阶段的行是 `PREMARKET`。表上没有这两列时（插件版本更早）退回按 `exginfo` 当前在交易的 symbol 过滤。`get_exginfo` 始终只反映当前在交易的合约。按 `underlying_type` 细分（`PREMARKET`、`COIN`、`EQUITY` 等）时，类型在重采样周期中途变化的那一根 K 线两边都凑不满，不会返回。
 
 ### 8.3 Airport 扩展直连（可选）
 

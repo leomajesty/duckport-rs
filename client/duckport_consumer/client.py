@@ -78,11 +78,16 @@ _ASSET_CLASS_MARKETS_ERROR = (
 )
 
 
+_ASSET_COLUMNS = ("contract_type", "underlying_type")
+
+
 def _asset_class_clause(asset_class: str) -> str:
-    """Extra exginfo predicate for a perp market's asset_class value.
+    """Predicate on ``contract_type`` / ``underlying_type`` for an asset_class value.
 
     ``crypto`` / ``tradifi`` select contract types. ``EQUITY`` also includes
     HK, KR and CN equity. Any other value matches ``underlying_type`` exactly.
+    The two columns have the same names and values in ``data.exginfo`` and on
+    the rows of a perp kline table, so the clause serves both.
     """
     if not _ASSET_CLASS_RE.fullmatch(asset_class):
         raise ValueError(f"Invalid asset_class: {asset_class!r}")
@@ -136,10 +141,21 @@ def _resample_extra_predicate(
     schema: str,
     market: str,
     asset_class: Optional[str],
+    row_columns: bool = False,
 ) -> Optional[str]:
-    """Symbol predicate shared by the resample and its symbol-count query."""
+    """asset_class predicate shared by the resample and its symbol-count query.
+
+    ``row_columns``: the kline table carries ``contract_type`` /
+    ``underlying_type`` on every row (binance-ingestor >= 0.7.0), so the rows are
+    filtered directly. This covers delisted symbols and gives each row the class
+    it had at its own time. Without the columns the symbols come from
+    ``data.exginfo``, which only knows what trades now.
+    """
     if asset_class is None:
         return None
+    where = perp_asset_where(market, asset_class)       # also validates market and value
+    if row_columns:
+        return f"({where.split(' AND ', 1)[1]})"
     return (
         "symbol IN ("
         f"SELECT symbol FROM {schema}.exginfo "
@@ -161,8 +177,10 @@ def build_market_kline_sql(
     asset_class: Optional[str] = None,
     *,
     end_inclusive: bool = True,
+    row_columns: bool = False,
 ) -> str:
-    """Resample SQL. asset_class filters a perp market's symbols via exginfo.
+    """Resample SQL. asset_class filters a perp market, on the rows' own asset
+    columns when ``row_columns`` is set and through exginfo otherwise.
 
     ``end_inclusive`` is False on every chunk except the last. Those chunks
     stop on a resample-bucket boundary so a bucket is not split in half.
@@ -177,7 +195,7 @@ def build_market_kline_sql(
         end,
         kline_interval_minutes,
         symbol,
-        extra_predicate=_resample_extra_predicate(schema, market, asset_class),
+        extra_predicate=_resample_extra_predicate(schema, market, asset_class, row_columns),
         end_inclusive=end_inclusive,
     )
 
@@ -222,6 +240,7 @@ class DuckportConsumer:
         self._pqt_path = pqt_path
         self._redundancy_hours = redundancy_hours
         self._plan_a_hybrid_warned = False
+        self._asset_columns: dict[str, bool] = {}
         logger.info("DuckportConsumer connected to %s", self._location)
         if pqt_path is not None or redundancy_hours != 1:
             self._log_plan_a_deprecation()
@@ -392,8 +411,9 @@ class DuckportConsumer:
             end = pd.to_datetime(end)
             end = end.tz_convert(timezone.utc) if end.tzinfo is not None else end.tz_localize(timezone.utc)
 
+        row_columns = asset_class is not None and self._has_asset_columns(market)
         symbol_count = self._count_resample_symbols(
-            market, begin, end, symbol, asset_class,
+            market, begin, end, symbol, asset_class, row_columns,
         )
         ranges = plan_resample_ranges(begin, end, interval, offset, symbol_count)
         logger.info(
@@ -404,12 +424,38 @@ class DuckportConsumer:
         tables = [
             self._query_resample_range(
                 market, interval, offset, lo, hi, inclusive, symbol, asset_class,
+                row_columns=row_columns,
             )
             for lo, hi, inclusive in ranges
         ]
         if len(tables) == 1:
             return tables[0]
         return pa.concat_tables(tables)
+
+    def _has_asset_columns(self, market: str) -> bool:
+        """Whether ``market``'s kline table has the per-row asset columns.
+
+        Tables written by binance-ingestor < 0.7.0 do not; asset_class then goes
+        through exginfo as before. The answer is kept for this client's lifetime.
+        """
+        known = self._asset_columns.get(market)
+        if known is not None:
+            return known
+        if market not in _PERP_MARKETS:
+            return False
+        names = ", ".join(f"'{name}'" for name in _ASSET_COLUMNS)
+        try:
+            table = self.query(
+                "SELECT count(*) AS n FROM information_schema.columns "
+                f"WHERE table_schema = '{self._schema}' "
+                f"AND table_name = '{market}{self._suffix}' AND column_name IN ({names})"
+            )
+            found = int(table.column("n")[0].as_py() or 0) == len(_ASSET_COLUMNS)
+        except Exception as e:
+            logger.warning("asset column check failed for %s, using exginfo: %s", market, e)
+            return False
+        self._asset_columns[market] = found
+        return found
 
     def _count_resample_symbols(
         self,
@@ -418,6 +464,7 @@ class DuckportConsumer:
         end: datetime,
         symbol: Optional[str],
         asset_class: Optional[str],
+        row_columns: bool = False,
     ) -> int:
         if symbol is not None:
             return 1
@@ -426,7 +473,7 @@ class DuckportConsumer:
             begin,
             end,
             extra_predicate=_resample_extra_predicate(
-                self._schema, market, asset_class,
+                self._schema, market, asset_class, row_columns,
             ),
         )
         table = self.query(sql)
@@ -446,6 +493,8 @@ class DuckportConsumer:
         symbol: Optional[str],
         asset_class: Optional[str],
         depth: int = 0,
+        *,
+        row_columns: bool = False,
     ) -> pa.Table:
         sql = build_market_kline_sql(
             self._schema,
@@ -459,6 +508,7 @@ class DuckportConsumer:
             symbol,
             asset_class,
             end_inclusive=end_inclusive,
+            row_columns=row_columns,
         )
         try:
             return self.query(sql)
@@ -476,11 +526,11 @@ class DuckportConsumer:
             return pa.concat_tables([
                 self._query_resample_range(
                     market, interval, offset, left[0], left[1], left[2],
-                    symbol, asset_class, depth + 1,
+                    symbol, asset_class, depth + 1, row_columns=row_columns,
                 ),
                 self._query_resample_range(
                     market, interval, offset, right[0], right[1], right[2],
-                    symbol, asset_class, depth + 1,
+                    symbol, asset_class, depth + 1, row_columns=row_columns,
                 ),
             ])
 
