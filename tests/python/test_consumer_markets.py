@@ -71,6 +71,66 @@ def test_asset_class_on_the_rows_own_columns():
     raises(lambda: kline_sql("usdt_perp", asset_class="a'b", row_columns=True), "Invalid asset_class")
 
 
+def chunked_consumer(answers):
+    """A consumer whose chunk queries get ``answers`` in order (a table, or an error to raise)."""
+    import pyarrow as pa
+    from duckport_consumer.client import DuckportConsumer
+    consumer = DuckportConsumer.__new__(DuckportConsumer)
+    consumer._schema, consumer._suffix, consumer._kline_interval_minutes = "data", "_1m", 1
+    consumer._pqt_path, consumer._redundancy_hours, consumer._asset_columns = None, 1, {}
+    pending = list(answers)
+
+    def query(sql):
+        if "count(DISTINCT symbol)" in sql:
+            return pa.table({"n": [900]})
+        answer = pending.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    consumer.query = query
+    return consumer, pending
+
+
+def test_a_chunk_without_rows_does_not_fail_the_others():
+    """A long range is read in chunks; the server answers a zero-row chunk with an error."""
+    import pyarrow as pa
+    from pyarrow import flight
+    from duckport_consumer.client import plan_resample_ranges
+    begin, end = datetime(2021, 1, 1), datetime(2026, 11, 1)
+    chunks = len(plan_resample_ranges(begin, end, 60, 0, 900))
+    assert chunks >= 3, chunks
+    empty = flight.FlightInternalError("Server never sent a data message")
+    row = pa.table({"symbol": ["BTCUSDT"]})
+
+    consumer, pending = chunked_consumer([empty, empty] + [row] * (chunks - 2))
+    assert consumer.get_market("usdt_perp", 60, 0, begin, end).num_rows == chunks - 2
+    assert not pending
+
+    # an out-of-memory chunk is read in two halves; one of them may be empty too
+    oom = flight.FlightInternalError("Out of Memory Error: failed to allocate")
+    consumer, pending = chunked_consumer([oom, empty, row] + [row] * (chunks - 1))
+    assert consumer.get_market("usdt_perp", 60, 0, begin, end).num_rows == chunks
+    assert not pending
+
+    # no rows at all: the error the server gives for a single empty query
+    consumer, _ = chunked_consumer([empty] * chunks)
+    try:
+        consumer.get_market("usdt_perp", 60, 0, begin, end)
+    except flight.FlightInternalError as e:
+        assert "never sent a data message" in str(e)
+    else:
+        raise AssertionError("expected the empty-result error")
+
+    # any other error still fails the call
+    consumer, _ = chunked_consumer([row, flight.FlightInternalError("Binder Error: boom")])
+    try:
+        consumer.get_market("usdt_perp", 60, 0, begin, end)
+    except flight.FlightInternalError as e:
+        assert "Binder Error" in str(e)
+    else:
+        raise AssertionError("expected the Binder Error")
+
+
 def test_asset_class_is_refused_on_spot():
     raises(lambda: kline_sql("usdt_spot", asset_class="crypto"), "only supported for perp markets")
     raises(lambda: build_exginfo_sql("data", "usdt_spot", "crypto"), "only supported for perp markets")

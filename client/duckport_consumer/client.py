@@ -200,6 +200,10 @@ def build_market_kline_sql(
     )
 
 
+# A duckport.query DoGet whose result has no rows fails with this message.
+_EMPTY_RESULT = "Server never sent a data message"
+
+
 def _is_oom(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "out of memory" in text or "could not allocate block" in text
@@ -422,12 +426,17 @@ class DuckportConsumer:
             symbol_count, len(ranges),
         )
         tables = [
-            self._query_resample_range(
-                market, interval, offset, lo, hi, inclusive, symbol, asset_class,
-                row_columns=row_columns,
-            )
-            for lo, hi, inclusive in ranges
+            table for table in (
+                self._query_resample_range(
+                    market, interval, offset, lo, hi, inclusive, symbol, asset_class,
+                    row_columns=row_columns,
+                )
+                for lo, hi, inclusive in ranges
+            ) if table is not None
         ]
+        if not tables:
+            # what the server answers for a query without rows
+            raise flight.FlightInternalError(f"{_EMPTY_RESULT} (no rows in the range)")
         if len(tables) == 1:
             return tables[0]
         return pa.concat_tables(tables)
@@ -495,7 +504,13 @@ class DuckportConsumer:
         depth: int = 0,
         *,
         row_columns: bool = False,
-    ) -> pa.Table:
+    ) -> Optional[pa.Table]:
+        """One chunk of a resample; None when it has no rows.
+
+        The server answers a zero-row query with an error, not an empty table. A chunk
+        without rows (before a listing, an asset class that did not exist yet) must not
+        fail the chunks that have them.
+        """
         sql = build_market_kline_sql(
             self._schema,
             self._suffix,
@@ -517,22 +532,23 @@ class DuckportConsumer:
             if _is_oom(exc) and depth < 16:
                 halves = halve_range(begin, end, end_inclusive, interval, offset)
             if halves is None:
+                if _EMPTY_RESULT in str(exc):
+                    return None
                 logger.error("resample query failed: %s", exc)
                 raise
             logger.warning(
                 "resample chunk out of memory, halving %s .. %s", begin, end,
             )
-            left, right = halves
-            return pa.concat_tables([
-                self._query_resample_range(
-                    market, interval, offset, left[0], left[1], left[2],
-                    symbol, asset_class, depth + 1, row_columns=row_columns,
-                ),
-                self._query_resample_range(
-                    market, interval, offset, right[0], right[1], right[2],
-                    symbol, asset_class, depth + 1, row_columns=row_columns,
-                ),
-            ])
+            parts = [
+                part for part in (
+                    self._query_resample_range(
+                        market, interval, offset, lo, hi, inclusive,
+                        symbol, asset_class, depth + 1, row_columns=row_columns,
+                    )
+                    for lo, hi, inclusive in halves
+                ) if part is not None
+            ]
+            return pa.concat_tables(parts) if parts else None
 
     def close(self):
         """Close the Flight client connection."""
