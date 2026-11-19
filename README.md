@@ -299,12 +299,14 @@ crypto = c.get_market("usdt_perp", interval=60, asset_class="crypto")
 tradfi = c.get_market("usdt_perp", interval=60, asset_class="tradifi")
 # EQUITY 包含 EQUITY、HK_EQUITY、KR_EQUITY、CN_EQUITY。
 equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
-# 其他值按 exginfo.underlying_type 精确匹配，例如 COMMODITY、FX、PREMARKET、COIN。
+# 其他值按 underlying_type 精确匹配，例如 COMMODITY、FX、PREMARKET、COIN。
 gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
 info = c.get_exginfo("usdt_perp", asset_class="tradifi")
 ```
 
-`asset_class` 只对 `usdt_perp` 生效，`get_market`、`get_symbol`、`get_exginfo` 共用。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`usdt_spot` 不能传这个参数。直接 `query()` 读 `usdt_perp_5m` 或 `usdt_perp_funding` 不会套用该过滤。
+`asset_class` 只对合约市场（`usdt_perp`、`others_perp`）生效，`get_market`、`get_symbol`、`get_exginfo` 共用。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`usdt_spot` 不能传这个参数。直接 `query()` 读 `usdt_perp_5m` 或 `usdt_perp_funding` 不会套用该过滤。
+
+合约 K 线表（`usdt_perp_*`、`others_perp_*`）自 binance-ingestor 0.7.0 起每行带 `contract_type` 和 `underlying_type` 两列，`get_market` / `get_symbol` 的 `asset_class` 直接按这两列过滤：已下架的合约也在结果里，同一个 symbol 先后挂过不同合约时（如 ANTUSDT，2024-04 前是 Crypto，2026-11 起是 TradFi）各段归各自的类别，盘前阶段的行是 `PREMARKET`。表上没有这两列时（插件版本更早）退回按 `exginfo` 当前在交易的 symbol 过滤。`get_exginfo` 始终只反映当前在交易的合约。按 `underlying_type` 细分（`PREMARKET`、`COIN`、`EQUITY` 等）时，类型在重采样周期中途变化的那一根 K 线两边都凑不满，不会返回。
 
 ---
 
